@@ -4,6 +4,16 @@ Turn a real-world heightmap into a hand-drawn style fantasy mountain map, right 
 
 You load a heightmap (PNG or GeoTIFF). The app works out rivers, lakes, snow lines and biomes from the terrain, then paints it as an illustrated map: inked mountain faces, charcoal-style river and shore lines, forest stands, wetlands and wash colors. The look is visually inspired by Mike Schley's regional maps. No artwork from his maps is included, and this project is not affiliated with or endorsed by him or any publisher.
 
+![A mountain valley with snow, forest and river junctions](screenshots/mountain-valley.jpg)
+
+<table>
+  <tr>
+    <td><img src="screenshots/range-overview.jpg" alt="Snow-capped range above forested foothills and a coastline"></td>
+    <td><img src="screenshots/river-plain.jpg" alt="Rivers and lakes across a wide coastal plain"></td>
+    <td><img src="screenshots/coast-closeup.jpg" alt="Close-up of a coast with ocean waves, rivers and forest stands"></td>
+  </tr>
+</table>
+
 ## Features
 
 - **Heightmap in, map out**: 16-bit PNG, or single-band uncompressed TIFF/GeoTIFF. A sample New Zealand DEM is bundled.
