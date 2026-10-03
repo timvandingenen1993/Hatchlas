@@ -14,6 +14,8 @@ You load a heightmap (PNG or GeoTIFF). The app works out rivers, lakes, snow lin
   </tr>
 </table>
 
+[View an 8K export (8117×8192, 12 MB WebP)](screenshots/export-8k.webp)
+
 ## Features
 
 - **Heightmap in, map out**: 16-bit PNG, or single-band uncompressed TIFF/GeoTIFF. A sample New Zealand DEM is bundled.
