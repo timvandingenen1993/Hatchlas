@@ -25,7 +25,7 @@ export interface RiverSiltOptions {
 
 export const DEFAULT_SILT_REACH_M = 2500;
 export const DEFAULT_SILT_TOP_REMOVED = 1;
-export const DEFAULT_SILT_LAYERS = 4;
+export const DEFAULT_SILT_LAYERS = 3;
 
 /** Radius of the smoothed floor that old channels are measured against. */
 const RELIEF_RADIUS_M = 600;
@@ -37,10 +37,12 @@ const MIN_RELIEF_SCALE_M = 0.5;
 const MAX_HEIGHT_ABOVE_RIVER_M = 25;
 /** Fill thickness (in typical channel depths) that maps to full silt depth. */
 const FULL_FILL_DEPTH = 2;
-/** Hollows narrower than about this are smoothed out of the crease lines. */
-const CREASE_SMOOTH_M = 300;
-/** Crease lines drawn through each silted channel. */
-const CREASE_LINES = 2;
+/** Smoothing of the crease lines; kept small so they stay inside the silt. */
+const CREASE_SMOOTH_M = 150;
+/** Band edges are inked where their noise is above this (about 55% of their length). */
+const CREASE_INKED_ABOVE = 0.47;
+/** Inked stretches are dotted where their noise is below this (about 25% of them). */
+const CREASE_DOTTED_BELOW = 0.337;
 
 function smoothstep(edge0: number, edge1: number, value: number): number {
   const t = Math.max(0, Math.min(1, (value - edge0) / (edge1 - edge0)));
@@ -152,13 +154,12 @@ export function buildRiverSiltDepth(
 }
 
 /**
- * Field the crease lines are traced from: the silt depth blurred together
- * with the bare ground around it, so small isolated hollows fade below the
- * line levels and only the main channel shapes keep their creases.
+ * Field the crease lines are traced from: the silt depth lightly smoothed so
+ * the lines run cleanly, but not so far that they drift out of the silt.
  */
 export function buildRiverSiltCreaseField(depth: Float32Array, dem: MountainDEMData): Float32Array {
   const cellM = Math.max(1e-6, Math.min(dem.dxMeters, dem.dyMeters));
-  const radius = Math.max(1, Math.min(8, Math.round(CREASE_SMOOTH_M / cellM)));
+  const radius = Math.max(1, Math.min(2, Math.round(CREASE_SMOOTH_M / cellM)));
   return blurMasked(depth, new Uint8Array(depth.length).fill(1), dem.width, dem.height, radius, 2);
 }
 
@@ -207,12 +208,40 @@ function valueNoise(x: number, y: number, scale: number, salt: number): number {
   return top * (1 - ty) + bottom * ty;
 }
 
+/** Ground-pattern pen the silt lines are drawn with. */
+export interface RiverSiltLineStyle {
+  /** Pen radius in output pixels (ground pattern stroke thickness). */
+  radiusPx: number;
+  /** Ground pattern stroke length times the output pixel scale; sizes the marks. */
+  dashScale: number;
+  /** Output pixel scale alone; gaps stay this long however short the stroke length is. */
+  gapScale: number;
+  /** Chance of a dry-ink skip per pixel. */
+  drySkipProbability: number;
+  /** Silt passes; band edges between them are the candidate lines. */
+  layers: number;
+}
+
 /**
- * Crease lines inside silted channels: a couple of iso-lines of the smoothed
- * silt fill (`buildRiverSiltCreaseField`), so they run along each channel and
- * nest toward its deepest crease. Drawn with the vegetation flow pen: the
- * same charcoal radius, soft 0.65 px edge and per-pixel grain, broken into
- * dashes of varying pressure.
+ * Signed pixels from (gx, gy) to where a value noise field crosses `level`:
+ * positive above it, negative below.
+ */
+function noiseLevelDistancePx(gx: number, gy: number, scale: number, salt: number, level: number): number {
+  const slope = Math.hypot(
+    valueNoise(gx + 1, gy, scale, salt) - valueNoise(gx - 1, gy, scale, salt),
+    valueNoise(gx, gy + 1, scale, salt) - valueNoise(gx, gy - 1, scale, salt),
+  ) * 0.5;
+  return (valueNoise(gx, gy, scale, salt) - level) / Math.max(1e-5, slope);
+}
+
+/**
+ * Charcoal lines inside silted channels, traced on the smoothed fill
+ * (`buildRiverSiltCreaseField`) along the band edges, so they run along each
+ * channel. Each edge is only inked along some stretches, which thins the
+ * lines out and varies how many cross any one spot. Drawn with the ground
+ * pattern pen: the same charcoal radius, soft 0.65 px edge, grain and dry
+ * skips, in broken marks of the ground pattern's stroke length that taper to
+ * a point at both ends, some of them dotted.
  *
  * `x`/`y` are local pixels in `depth`; `offsetX`/`offsetY` place them in the
  * global output so the dash pattern lines up across export tiles.
@@ -225,7 +254,7 @@ export function riverSiltCreaseAlpha(
   y: number,
   offsetX: number,
   offsetY: number,
-  radiusPx: number,
+  style: RiverSiltLineStyle,
 ): number {
   const index = y * width + x;
   const value = depth[index];
@@ -236,25 +265,53 @@ export function riverSiltCreaseAlpha(
   const down = depth[Math.min(height - 1, y + 1) * width + x];
   const slope = Math.hypot(right - left, down - up) * 0.5;
   if (slope < 1e-4) return 0;
-  // Distance to the nearest line level ((k + 0.5) / CREASE_LINES), converted
-  // to pixels with the local gradient so every line keeps the same pen width.
-  const position = value * CREASE_LINES - 0.5;
+  // Distance to the nearest band edge (k / layers), in pixels via the local
+  // gradient so every line keeps the same pen width.
+  const lines = Math.max(1, Math.round(style.layers));
+  const position = value * lines;
   const level = Math.round(position);
-  if (level < 0 || level >= CREASE_LINES) return 0;
-  const distancePx = Math.abs(position - level) / (CREASE_LINES * slope);
+  if (level < 1 || level >= lines) return 0;
+  const distancePx = Math.abs(position - level) / (lines * slope);
+  if (distancePx > style.radiusPx * 1.5 + 0.65) return 0;
   const gx = x + offsetX;
   const gy = y + offsetY;
+  if (hash01(gx, gy, 317) < style.drySkipProbability) return 0;
   // Same brush as paintInkSegment: pressure-scaled radius with per-pixel
   // tooth, a 0.65 px soft edge and 0.78..1 grain.
-  const pressure = 0.55 + 0.45 * valueNoise(gx, gy, 40, 11);
+  const markScale = Math.max(0.25, style.dashScale);
+  const pressure = 0.55 + 0.45 * valueNoise(gx, gy, 40 * markScale, 11);
   const tooth = (hash01(gx, gy, 541) - 0.5) * 0.35 + (hash01(gx, gy, 733) - 0.5) * 0.2;
-  const localRadius = radiusPx * pressure * (0.85 + hash01(gx, gy, 13) * 0.3 + tooth * 0.3);
-  const coverage = Math.max(0, Math.min(1, localRadius - distancePx + 0.65));
-  if (coverage <= 0) return 0;
-  // Break the pen into dashes like the vegetation flow strokes.
-  const dash = smoothstep(0.38, 0.55, valueNoise(gx, gy, 28, 7));
-  return coverage * dash * (0.78 + 0.22 * hash01(gx, gy, 991));
+  const localRadius = style.radiusPx * pressure * (0.85 + hash01(gx, gy, 13) * 0.3 + tooth * 0.3);
+  const grain = 0.78 + 0.22 * hash01(gx, gy, 991);
+  // Everything below uses smooth noise with its own salt per band edge, never
+  // a grid, so neighbouring lines start, stop and break in different places.
+  const pixelScale = Math.max(0.25, style.gapScale);
+  const salt = 400 + level * 31;
+  const taperPx = 3 * pixelScale;
+  // Each band edge is inked along some stretches and bare along others; the
+  // pen tapers in over `taperPx` wherever a stretch starts or ends.
+  const fromStretchEndPx = noiseLevelDistancePx(gx, gy, 70 * pixelScale, salt, CREASE_INKED_ABOVE);
+  if (fromStretchEndPx <= 0) return 0;
+  if (valueNoise(gx, gy, 60 * pixelScale, salt + 1) < CREASE_DOTTED_BELOW) {
+    // Dotted stretch: round dots right at the crossings of a fine noise field.
+    const dotHalfPx = Math.max(1, localRadius * 1.2);
+    const fromDotPx = Math.abs(noiseLevelDistancePx(gx, gy, 6 * pixelScale, salt + 2, 0.5));
+    const dot = Math.max(0, Math.min(1, dotHalfPx - fromDotPx + 0.5));
+    return Math.max(0, Math.min(1, localRadius - distancePx + 0.65)) * grain * dot;
+  }
+  // Broken dash: 7..14 px gaps where the line crosses the mid level of a
+  // noise field; longer stroke lengths space them a little further apart.
+  const strokeLength = markScale / pixelScale;
+  const markPx = 13 * pixelScale * (0.75 + 0.25 * Math.min(3, strokeLength));
+  const gapHalfPx = (3.5 + 3.5 * valueNoise(gx, gy, 50 * pixelScale, salt + 3)) * pixelScale;
+  const fromGapPx = Math.abs(noiseLevelDistancePx(gx, gy, markPx, salt + 4, 0.5)) - gapHalfPx;
+  if (fromGapPx <= 0) return 0;
+  // Taper: the pen (and its soft edge) narrows to a point at both dash ends.
+  const taper = Math.min(1, fromGapPx / taperPx, fromStretchEndPx / taperPx);
+  const shaped = Math.sqrt(taper);
+  return Math.max(0, Math.min(1, (localRadius + 0.65) * shaped - distancePx)) * grain;
 }
+
 /**
  * Colours a land pixel with `depth` of silt, sliced into `layers` passes:
  * each pass alternates tone slightly. The outermost edge stays soft.

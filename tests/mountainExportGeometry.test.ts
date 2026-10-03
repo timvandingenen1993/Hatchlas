@@ -3,6 +3,7 @@ import { processMountainBaseDEM } from '../src/terrain/mountainBaseDEM';
 import { getMountainPatternOptions, type MountainRenderOptions } from '../src/rendering/mountainDetailRenderer';
 import { renderMountainPatternOverlay } from '../src/rendering/mountainPatternRenderer';
 import { mapMountainPatternToExportTile, renderMountainExportTile } from '../src/rendering/mountainExportRenderer';
+import { buildRiverSplinesForExport } from '../src/rendering/waterRenderer';
 
 function makeContext(width = 128, height = 96, scale = 4) {
   const luminance = Float32Array.from({ length: width * height }, (_, i) => {
@@ -112,3 +113,41 @@ it('matches the continuous mountain render across an interior export tile bounda
     expect(differences).toBe(0);
   }
 }, 30000);
+
+it('draws the same rivers whether the map is exported as one tile or several', () => {
+  const width = 160, height = 128, scale = 4;
+  const luminance = Float32Array.from({ length: width * height }, (_, i) => {
+    const x = i % width, y = Math.floor(i / width);
+    const centre = 80 + 20 * Math.sin(y / 15) + 6 * Math.sin(y / 4.5);
+    return 0.15 + 0.25 * (1 - y / height) + 0.35 * Math.min(1, Math.abs(x - centre) / 40)
+      + 0.03 * Math.sin(x * 0.37 + y * 0.21) * Math.sin(y * 0.13);
+  });
+  const dem = processMountainBaseDEM(luminance, width, height, {
+    domainWidthKm: 30, minElevationM: 0, maxElevationM: 1500, riverThresholdKm2: 2, erosionStrength: 1,
+  });
+  const render = {
+    layer: 'swiss_relief', palette: 'swiss_topo', sunAzimuthDeg: 315, sunAltitudeDeg: 45,
+    verticalExaggeration: 3.8, ambientOcclusionStrength: 0.45, showRivers: true, riverThresholdKm2: 2,
+    showWaterDetails: true, showContours: false, contourIntervalM: 100,
+  } as unknown as MountainRenderOptions;
+  const context = {
+    dem, source: { width, height, luminance }, render,
+    outputWidth: width * scale, outputHeight: height * scale,
+    riverSplines: buildRiverSplinesForExport(dem, { riverThresholdKm2: 2 }),
+  };
+  const outputWidth = width * scale, outputHeight = height * scale, tileSize = 256, halo = 32;
+  const full = renderMountainExportTile(context, { x: 0, y: 0, width: outputWidth, height: outputHeight, halo });
+  let differences = 0;
+  for (let y = 0; y < outputHeight; y += tileSize) {
+    for (let x = 0; x < outputWidth; x += tileSize) {
+      const w = Math.min(tileSize, outputWidth - x), h = Math.min(tileSize, outputHeight - y);
+      const tile = renderMountainExportTile(context, { x, y, width: w, height: h, halo });
+      for (let row = 0; row < h; row++) {
+        for (let i = 0; i < w * 4; i++) {
+          if (Math.abs(tile.data[row * w * 4 + i] - full.data[((y + row) * outputWidth + x) * 4 + i]) > 8) differences++;
+        }
+      }
+    }
+  }
+  expect(differences).toBe(0);
+});

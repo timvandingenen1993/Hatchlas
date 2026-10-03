@@ -7,6 +7,7 @@ import {
   DEFAULT_SILT_LAYERS,
   riverSiltCoverage,
   riverSiltCreaseAlpha,
+  type RiverSiltLineStyle,
   shadeRiverSilt,
 } from './riverSilt';
 import {
@@ -587,6 +588,7 @@ export function buildMountainWaterStageInputs(
     paintWindow: options.waterPaintWindow,
     riverSplinesOverride: options.riverSplinesOverride,
     oceanPixelScale: options.oceanPixelScale,
+    riverCellPx: options.mountainPatternPixelScale,
     oceanCoordinateOffsetX: options.oceanCoordinateOffsetX,
     oceanCoordinateOffsetY: options.oceanCoordinateOffsetY,
     oceanCoordinateStride: options.oceanCoordinateStride,
@@ -2110,9 +2112,22 @@ export function renderMountainDetailDEMWithCache(
   const showWaterDetails = (options.showWaterDetails ?? true) &&
     options.showOceanDetails !== false;
   const siltLayerActive = layer === 'vegetation_patterns';
-  const siltLineOpacity = Math.max(0, Math.min(1, options.vegetation?.strokeOpacity ?? 0.85));
-  // Vegetation flow strokes use radius = path width (avg 0.93) x strokeThickness.
-  const siltLineRadiusPx = 0.93 * Math.max(0.1, Math.min(3, options.vegetation?.strokeThickness ?? 1));
+  // Silt lines use the ground pattern pen; defaults match vegetationRenderer.
+  const siltLineOpacity = Math.max(0, Math.min(1, options.vegetation?.strokeOpacity ?? 0.72));
+  // In export, patternScale carries the output upscale (see vegetationRenderer).
+  const siltLinePixelScale = Math.max(
+    0.25,
+    (options.vegetation?.patternScale ?? 1) /
+      Math.max(0.5, options.vegetation?.coordinatePatternScale ?? options.vegetation?.patternScale ?? 1),
+  );
+  const siltLineStyle: RiverSiltLineStyle = {
+    // Vegetation flow strokes use radius = path width (avg 0.93) x strokeThickness.
+    radiusPx: 0.93 * Math.max(0.1, Math.min(3, options.vegetation?.strokeThickness ?? 1)) * siltLinePixelScale,
+    dashScale: Math.max(0.4, options.vegetation?.strokeLength ?? 1) * siltLinePixelScale,
+    gapScale: siltLinePixelScale,
+    drySkipProbability: Math.max(0, Math.min(1, options.vegetation?.drySkipProbability ?? 0.05)),
+    layers: siltLayers,
+  };
   const siltLineOffsetX = options.textureCoordinateOffsetX ?? 0;
   const siltLineOffsetY = options.textureCoordinateOffsetY ?? 0;
   const compositionWindow = options.compositionWindow;
@@ -2727,7 +2742,7 @@ export function renderMountainDetailDEMWithCache(
         Math.floor(i / width),
         siltLineOffsetX,
         siltLineOffsetY,
-        siltLineRadiusPx,
+        siltLineStyle,
       ) * siltCoverage * siltLineOpacity * (1 - waterCover);
       if (crease > 0) {
         r = blendContourColor(r, vegetationInkColor[0], crease);

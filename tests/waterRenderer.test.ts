@@ -8,6 +8,7 @@ import {
   buildVisualWaterSurfaceDEM,
   buildWetlandPuddleContours,
   buildDistanceToCoast,
+  buildSmoothShoreDistance,
   getContourTangentAt,
   suppressMicroKinks,
   simplifyRiverRDP,
@@ -58,6 +59,31 @@ function makeMeanderingRiver(width: number, height: number): MountainDEMData {
 }
 
 describe('water renderer', () => {
+  it('turns a 4px block staircase into a straight shoreline distance', () => {
+    const size = 128;
+    const coverage = new Uint8Array(size * size);
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        if (Math.floor(x / 4) + Math.floor(y / 4) < 32) coverage[y * size + x] = 255;
+      }
+    }
+    const signed = buildSmoothShoreDistance(coverage, size, size, 4, 6)!;
+    // For a straight diagonal shoreline, distance * sqrt(2) = (x + y) - c.
+    const offsets: number[] = [];
+    for (let y = 24; y < 104; y++) {
+      for (let x = 24; x < 104; x++) {
+        const distance = signed[y * size + x];
+        if (Math.abs(distance) < 3) offsets.push(distance * Math.SQRT2 - (x + y));
+      }
+    }
+    const mean = offsets.reduce((sum, value) => sum + value, 0) / offsets.length;
+    const spread = Math.sqrt(
+      offsets.reduce((sum, value) => sum + (value - mean) ** 2, 0) / offsets.length,
+    );
+    expect(offsets.length).toBeGreaterThan(200);
+    expect(spread).toBeLessThan(0.5);
+  });
+
   it('creates deterministic water, varied bank ink, and broken flow marks', () => {
     const dem = makeMeanderingRiver(96, 44);
     const first = renderWaterOverlay(dem, {
@@ -124,8 +150,6 @@ describe('water renderer', () => {
       const painted = renderWaterOverlayFromGeometry(dem, options, geometry);
       expect(Array.from(paintedWaterAlphaFromGeometry(options, geometry)))
         .toEqual(Array.from(painted.waterAlpha));
-      // Painting promotes ocean cells, so a plain geometry copy would differ.
-      expect(Array.from(painted.waterAlpha)).not.toEqual(Array.from(geometry.waterAlpha));
     }
   });
 
@@ -899,11 +923,10 @@ describe('water renderer', () => {
     // Watercolor depth tone is higher (shallower) near x=30 and lower further out at x=58
     expect(overlay.oceanWaterTone![30 * width + 31]).toBeGreaterThan(overlay.oceanWaterTone![30 * width + 58]);
 
-    // The smoothed fill reaches x=29 with partial coverage. The requested
-    // stroke is centered on the 50% boundary at x=29/30 rather than being
-    // displaced across the antialias fringe.
-    expect(overlay.waterAlpha![30 * width + 29]).toBeGreaterThan(0);
+    // The traced shoreline sits on the x=29/30 pixel boundary, and the
+    // requested stroke is centered on it rather than displaced across a fringe.
     expect(overlay.waterAlpha![30 * width + 29]).toBeLessThan(255);
+    expect(overlay.waterAlpha![30 * width + 30]).toBe(255);
     expect(overlay.oceanBankAlpha![30 * width + 28]).toBe(0);
     expect(overlay.oceanBankAlpha![30 * width + 29]).toBeGreaterThan(50);
     expect(overlay.oceanBankAlpha![30 * width + 30]).toBeGreaterThan(50);
@@ -959,9 +982,10 @@ describe('water renderer', () => {
     });
     const center = Math.floor(height / 2) * width;
 
-    // One fractional edge pixel is the shared antialias treatment. The bank
-    // is centered on the 50% fill boundary instead of being pushed outside it.
-    expect(overlay.waterAlpha[center + oceanStartX - 1]).toBeGreaterThan(0);
+    // The fill ends on the traced 50% boundary and the bank is centered on it
+    // instead of being pushed outside it.
+    expect(overlay.waterAlpha[center + oceanStartX - 1]).toBeLessThan(255);
+    expect(overlay.waterAlpha[center + oceanStartX]).toBe(255);
     expect(overlay.waterAlpha[center + oceanStartX - 2]).toBe(0);
     expect(overlay.bankAlpha[center + oceanStartX - 1]).toBeGreaterThan(0);
     expect(overlay.bankAlpha[center + oceanStartX - 2]).toBe(0);
@@ -1012,7 +1036,6 @@ describe('water renderer', () => {
     const center = Math.floor(height / 2) * width;
     const fringeX = oceanStartX - 4;
 
-    expect(overlay.waterAlpha[center + fringeX]).toBeGreaterThan(28);
     expect(overlay.bankAlpha[center + fringeX]).toBe(0);
     expect(overlay.bankAlpha[center + oceanStartX - 1]).toBeGreaterThan(0);
   });

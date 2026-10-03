@@ -172,9 +172,15 @@ export function getMountainExportTileDimensions(
   const poolCoverage = global.wetlandPoolCoverage ?? global.wetlandPoolMask;
   const poolRingHalo = poolCoverage && exportTileTouchesMask(context, tile, poolCoverage, poolSupport)
     ? poolSupport : 0;
+  // The water renderer smooths each shoreline over about 1.5 source cells and
+  // pins it at the tile border, so a tile needs that reach of context for
+  // neighbouring tiles to trace the same curve.
+  const shoreHalo = context.render.showWaterDetails !== false
+    ? Math.ceil(6 * Math.max(1, presentationScale)) + 8
+    : 0;
   const compositeHalo = illustrated
-    ? Math.max(requestedHalo, 32, forestHalo, biomeWashHalo, poolRingHalo)
-    : Math.max(requestedHalo, poolRingHalo);
+    ? Math.max(requestedHalo, 32, forestHalo, biomeWashHalo, poolRingHalo, shoreHalo)
+    : Math.max(requestedHalo, poolRingHalo, shoreHalo);
   const detailHalo = Math.max(compositeHalo, oceanWaveHalo);
   // Support the mountain illustration needs around the core. The terrain
   // arrays cover the larger of this and the compositor's detail region.
@@ -549,9 +555,11 @@ function createMappedRiverSplines(
       maxRadius = Math.max(maxRadius, radius);
       return { ...sample, x, y, radius };
     });
-    // Keep only splines whose segment bounds can touch this tile. The extra
-    // margin covers the raster brush and halo while retaining a single global
-    // vector source for every tile.
+    // `tileWidth`/`tileHeight` are the size of the whole mapped region (core
+    // plus halo) measured from `tileX`/`tileY`. Keep only splines whose
+    // segment bounds can touch it; the extra margin covers the raster brush.
+    // Passing the core size here dropped every spline in the last halo-width
+    // of a tile's right and bottom edge and left a seam of fallback water.
     const margin = maxRadius + 2;
     if (
       maxX < -margin ||
@@ -1064,8 +1072,8 @@ export function prepareMountainExportTile(
         outputHeight,
         tileX,
         tileY,
-        tile.width,
-        tile.height,
+        width,
+        height,
       );
   const mappedVegetationGeometry = !illustrated && context.vegetationGeometry
     ? mapVegetationGeometryToTile(
@@ -1295,8 +1303,8 @@ export function prepareMountainExportTile(
           outputHeight,
           detailTileX,
           detailTileY,
-          tile.width,
-          tile.height,
+          detailWidth,
+          detailHeight,
         ),
         vegetationGeometry: context.vegetationGeometry && !waterOnly
           ? mapVegetationGeometryToTile(

@@ -87,6 +87,8 @@ export interface WaterRendererOptions {
   paintWindow?: WaterPaintWindow;
   /** Procedural wetland geometry scale in output pixels (1 for preview). */
   wetlandPuddleCoordinateScale?: number;
+  /** Output pixels per source DEM cell (1 for preview); sizes the river fallback smoothing. */
+  riverCellPx?: number;
   /** Global output-pixel origin for tiled wetland geometry. */
   wetlandPuddleCoordinateOffsetX?: number;
   wetlandPuddleCoordinateOffsetY?: number;
@@ -234,6 +236,8 @@ export interface WaterOverlayGeometry {
   bankWaterMask: Uint8Array;
   distanceToWater: Float32Array;
   distanceToLand: Float32Array;
+  /** Signed distance (negative in water) to the smoothed shoreline; absent for raw water. */
+  shoreSignedDistance?: Float32Array;
   oceanBankWaterMask: Uint8Array;
   oceanDistanceToWater: Float32Array;
   oceanDistanceToLand: Float32Array;
@@ -1563,6 +1567,270 @@ export function buildSubpixelShoreDistance(
     }
   }
   return smoothFieldSeparable(signed, width, height, 1, 1);
+}
+
+/** Marks pixels the smooth shoreline distance did not reach. */
+const SHORE_UNREACHED = 1e6;
+
+interface ShorePolyline {
+  xs: Float32Array;
+  ys: Float32Array;
+  closed: boolean;
+}
+
+/**
+ * Marching squares at the 50% level of a coverage field. Segments are linked
+ * through the grid edges they cross, with water on the left of each one, so
+ * every shoreline comes out as an oriented polyline. Shorelines that run off
+ * the grid stay open and end on its border.
+ */
+function traceShorelines(
+  coverage: Uint8Array,
+  width: number,
+  height: number,
+): ShorePolyline[] {
+  const total = width * height;
+  const segFrom: number[] = [];
+  const segTo: number[] = [];
+  const inside = (index: number): boolean => coverage[index] >= 128;
+  const crossings = [0, 0, 0, 0];
+  const enters = [false, false, false, false];
+  for (let y = 0; y < height - 1; y++) {
+    for (let x = 0; x < width - 1; x++) {
+      const a = y * width + x;
+      const b = a + 1;
+      const d = a + width;
+      const c = d + 1;
+      const ia = inside(a);
+      const ib = inside(b);
+      const ic = inside(c);
+      const id = inside(d);
+      if (ia === ib && ib === ic && ic === id) continue;
+      // Clockwise around the cell: top, right, bottom, left. A crossing
+      // "enters" water when the corner it leads to is water.
+      let count = 0;
+      if (ia !== ib) { crossings[count] = a; enters[count++] = ib; }
+      if (ib !== ic) { crossings[count] = total + b; enters[count++] = ic; }
+      if (ic !== id) { crossings[count] = d; enters[count++] = id; }
+      if (id !== ia) { crossings[count] = total + a; enters[count++] = ia; }
+      if (count === 2) {
+        const enter = enters[0] ? 0 : 1;
+        segFrom.push(crossings[enter]);
+        segTo.push(crossings[1 - enter]);
+      } else {
+        // Saddle: water joins through the middle when the average is water.
+        const connected =
+          coverage[a] + coverage[b] + coverage[c] + coverage[d] >= 510;
+        for (let k = 0; k < 4; k++) {
+          if (!enters[k]) continue;
+          const partner = connected ? (k + 3) & 3 : (k + 1) & 3;
+          segFrom.push(crossings[k]);
+          segTo.push(crossings[partner]);
+        }
+      }
+    }
+  }
+  if (segFrom.length === 0) return [];
+
+  const outgoing = new Map<number, number>();
+  const hasIncoming = new Set<number>();
+  for (let s = 0; s < segFrom.length; s++) {
+    outgoing.set(segFrom[s], s);
+    hasIncoming.add(segTo[s]);
+  }
+  const position = (edge: number, out: number[]): void => {
+    if (edge < total) {
+      const x = edge % width;
+      const y = (edge - x) / width;
+      const lo = coverage[edge];
+      out.push(x + (127.5 - lo) / (coverage[edge + 1] - lo), y);
+    } else {
+      const index = edge - total;
+      const x = index % width;
+      const y = (index - x) / width;
+      const lo = coverage[index];
+      out.push(x, y + (127.5 - lo) / (coverage[index + width] - lo));
+    }
+  };
+
+  const polylines: ShorePolyline[] = [];
+  const used = new Uint8Array(segFrom.length);
+  const emit = (points: number[], closed: boolean): void => {
+    const count = points.length >> 1;
+    const xs = new Float32Array(count);
+    const ys = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
+      xs[i] = points[i * 2];
+      ys[i] = points[i * 2 + 1];
+    }
+    polylines.push({ xs, ys, closed });
+  };
+  // Open shorelines start where nothing leads into the first crossing.
+  for (let s = 0; s < segFrom.length; s++) {
+    if (used[s] || hasIncoming.has(segFrom[s])) continue;
+    const points: number[] = [];
+    position(segFrom[s], points);
+    let current: number | undefined = s;
+    while (current !== undefined && !used[current]) {
+      used[current] = 1;
+      position(segTo[current], points);
+      current = outgoing.get(segTo[current]);
+    }
+    emit(points, false);
+  }
+  for (let s = 0; s < segFrom.length; s++) {
+    if (used[s]) continue;
+    const points: number[] = [];
+    let current = s;
+    do {
+      used[current] = 1;
+      position(segFrom[current], points);
+      current = outgoing.get(segTo[current])!;
+    } while (!used[current]);
+    emit(points, true);
+  }
+  return polylines;
+}
+
+/**
+ * Laplacian smoothing of the shoreline vertices; `passes` half-steps act like
+ * a Gaussian of sigma = sqrt(passes / 2) pixels along the curve. Taubin's
+ * lambda/mu filter avoids the shrinkage but leaves anything wider than ~13
+ * vertices alone, which is exactly the width of a stair step. Open shorelines
+ * keep their end points on the grid border.
+ */
+function smoothShorelines(polylines: ShorePolyline[], passes: number): void {
+  for (const line of polylines) {
+    const count = line.xs.length;
+    // Tiny shorelines are below the grid's resolution; smoothing them would
+    // only erase them.
+    if (count < 8) continue;
+    let xs = line.xs;
+    let ys = line.ys;
+    let nextXs: Float32Array = new Float32Array(count);
+    let nextYs: Float32Array = new Float32Array(count);
+    for (let pass = 0; pass < passes; pass++) {
+      for (let i = 0; i < count; i++) {
+        if (!line.closed && (i === 0 || i === count - 1)) {
+          nextXs[i] = xs[i];
+          nextYs[i] = ys[i];
+          continue;
+        }
+        const prev = i === 0 ? count - 1 : i - 1;
+        const next = i === count - 1 ? 0 : i + 1;
+        nextXs[i] = (xs[prev] + xs[next]) * 0.25 + xs[i] * 0.5;
+        nextYs[i] = (ys[prev] + ys[next]) * 0.25 + ys[i] * 0.5;
+      }
+      const swapX = xs;
+      xs = nextXs;
+      nextXs = swapX;
+      const swapY = ys;
+      ys = nextYs;
+      nextYs = swapY;
+    }
+    line.xs = xs;
+    line.ys = ys;
+  }
+}
+
+/**
+ * Signed distance (negative in water) to the smoothed shorelines within
+ * `band` pixels of them; every other pixel is `SHORE_UNREACHED`. The sign
+ * comes from the water-side normal of the nearest segment, or the averaged
+ * normal of the nearest vertex, so it needs no inside/outside fill and works
+ * for shorelines that leave the grid.
+ */
+function shorelineBandDistance(
+  polylines: ShorePolyline[],
+  width: number,
+  height: number,
+  band: number,
+): Float32Array {
+  const signed = new Float32Array(width * height).fill(SHORE_UNREACHED);
+  for (const { xs, ys, closed } of polylines) {
+    const count = xs.length;
+    const segments = closed ? count : count - 1;
+    const segNx = new Float32Array(segments);
+    const segNy = new Float32Array(segments);
+    for (let i = 0; i < segments; i++) {
+      const j = i + 1 === count ? 0 : i + 1;
+      const dx = xs[j] - xs[i];
+      const dy = ys[j] - ys[i];
+      const length = Math.hypot(dx, dy);
+      if (length > 1e-6) {
+        segNx[i] = dy / length;
+        segNy[i] = -dx / length;
+      }
+    }
+    const vertexNormal = (i: number): [number, number] => {
+      let nx = 0;
+      let ny = 0;
+      const before = i === 0 ? (closed ? segments - 1 : -1) : i - 1;
+      if (before >= 0) { nx += segNx[before]; ny += segNy[before]; }
+      if (i < segments) { nx += segNx[i]; ny += segNy[i]; }
+      const length = Math.hypot(nx, ny);
+      return length > 1e-6 ? [nx / length, ny / length] : [0, 0];
+    };
+    for (let i = 0; i < segments; i++) {
+      const j = i + 1 === count ? 0 : i + 1;
+      const ax = xs[i];
+      const ay = ys[i];
+      const abx = xs[j] - ax;
+      const aby = ys[j] - ay;
+      const lengthSq = abx * abx + aby * aby;
+      const minX = Math.max(0, Math.floor(Math.min(ax, xs[j]) - band));
+      const maxX = Math.min(width - 1, Math.ceil(Math.max(ax, xs[j]) + band));
+      const minY = Math.max(0, Math.floor(Math.min(ay, ys[j]) - band));
+      const maxY = Math.min(height - 1, Math.ceil(Math.max(ay, ys[j]) + band));
+      let startNormal: [number, number] | null = null;
+      let endNormal: [number, number] | null = null;
+      for (let y = minY; y <= maxY; y++) {
+        for (let x = minX; x <= maxX; x++) {
+          const t = lengthSq > 1e-12
+            ? Math.max(0, Math.min(1, ((x - ax) * abx + (y - ay) * aby) / lengthSq))
+            : 0;
+          const qx = ax + abx * t;
+          const qy = ay + aby * t;
+          const distance = Math.hypot(x - qx, y - qy);
+          const index = y * width + x;
+          if (distance >= band || distance >= Math.abs(signed[index])) continue;
+          let nx = segNx[i];
+          let ny = segNy[i];
+          if (t <= 0) {
+            startNormal ??= vertexNormal(i);
+            [nx, ny] = startNormal;
+          } else if (t >= 1) {
+            endNormal ??= vertexNormal(j);
+            [nx, ny] = endNormal;
+          }
+          signed[index] = (x - qx) * nx + (y - qy) * ny > 0 ? -distance : distance;
+        }
+      }
+    }
+  }
+  return signed;
+}
+
+/**
+ * Traces the 50% shoreline of `coverage`, smooths it over about one source
+ * cell (`cellPx` output pixels), and returns the signed distance to it within
+ * `band` pixels (other pixels hold `SHORE_UNREACHED`), or null when the field
+ * has no shoreline. The raster threshold only picks where the shoreline is;
+ * its stair steps never reach the result.
+ */
+export function buildSmoothShoreDistance(
+  coverage: Uint8Array,
+  width: number,
+  height: number,
+  cellPx: number,
+  band: number,
+): Float32Array | null {
+  const polylines = traceShorelines(coverage, width, height);
+  if (polylines.length === 0) return null;
+  // Smooth over about one and a half source cells, and never under 2 px.
+  const sigma = Math.max(2, 1.5 * Math.max(1, cellPx));
+  smoothShorelines(polylines, Math.min(300, Math.ceil(2 * sigma * sigma)));
+  return shorelineBandDistance(polylines, width, height, band);
 }
 
 function cumulativeLengths(samples: RiverPoint[]): Float32Array {
@@ -6340,6 +6608,7 @@ function renderWaterOverlayInternal(
   let oceanCoverage: Uint8Array;
   let cleanWaterMask: Uint8Array;
   let bankWaterMask: Uint8Array;
+  let smoothShore: Float32Array | null = null;
   if (geometryOverride) {
     oceanCoverage = geometryOverride.oceanCoverage;
     cleanWaterMask = geometryOverride.cleanWaterMask;
@@ -6404,6 +6673,27 @@ function renderWaterOverlayInternal(
     for (let index = 0; index < totalCells; index++) {
       if (waterAlpha[index] >= 128) bankWaterMask[index] = 1;
     }
+
+    // The raster fill and every mask above end on source-cell boundaries, and
+    // blurring them cannot remove steps wider than the blur. Trace the 50%
+    // shoreline instead, smooth that curve over about one source cell, and
+    // derive the fill edge, bank mask and outline distance from the curve.
+    smoothShore = buildSmoothShoreDistance(
+      waterAlpha,
+      width,
+      height,
+      options.riverCellPx ?? 1,
+      outlineThickness * 0.5 + 2.5 + 2 * Math.max(1, options.riverCellPx ?? 1),
+    );
+    if (smoothShore) {
+      for (let index = 0; index < totalCells; index++) {
+        const distance = smoothShore[index];
+        if (Math.abs(distance) >= SHORE_UNREACHED) continue;
+        waterAlpha[index] = Math.round(clamp01(0.5 - distance) * 255);
+        bankWaterMask[index] = distance < 0 ? 1 : 0;
+        cleanWaterMask[index] = waterAlpha[index] > 28 ? 1 : 0;
+      }
+    }
   }
   unionStop?.();
 
@@ -6439,9 +6729,20 @@ function renderWaterOverlayInternal(
     geometryOverride?.distanceToLand ??
     buildDistanceToCoast(bankWaterMask, width, height);
   // Sub-pixel shoreline shared by the outline ring and inland contours.
+  let smoothShoreSigned: Float32Array | null =
+    geometryOverride?.shoreSignedDistance ?? null;
+  if (!smoothShoreSigned && smoothShore) {
+    smoothShoreSigned = smoothShore;
+    for (let index = 0; index < totalCells; index++) {
+      if (Math.abs(smoothShoreSigned[index]) < SHORE_UNREACHED) continue;
+      smoothShoreSigned[index] = bankWaterMask[index] === 1
+        ? -(distanceToLand[index] - 0.5)
+        : distanceToWater[index] - 0.5;
+    }
+  }
   const shoreSignedDistance = mode === "geometry"
     ? null
-    : buildSubpixelShoreDistance(
+    : smoothShoreSigned ?? buildSubpixelShoreDistance(
         waterAlpha,
         bankWaterMask,
         distanceToWater,
@@ -6882,6 +7183,7 @@ function renderWaterOverlayInternal(
       bankWaterMask,
       distanceToWater,
       distanceToLand,
+      shoreSignedDistance: smoothShoreSigned ?? undefined,
       oceanBankWaterMask,
       oceanDistanceToWater,
       oceanDistanceToLand,
@@ -7044,7 +7346,10 @@ function renderWaterOverlayInternal(
     // every source ocean cell back to opaque.  Interior cells remain fully
     // covered, while the fractional edge survives into the final PNG and
     // removes the hard staircase that a binary 2048 mask would introduce.
-    if (options.oceanMaskCoverageOverride?.length === totalCells) {
+    // Next to the traced shoreline the fill already follows the smooth curve.
+    if (smoothShoreSigned && Math.abs(smoothShoreSigned[index]) < 1.5) {
+      // keep the traced edge
+    } else if (options.oceanMaskCoverageOverride?.length === totalCells) {
     waterAlpha[index] = Math.max(
         waterAlpha[index],
         Math.round(sourceOceanCoverage[index] * 255),
@@ -7166,8 +7471,10 @@ export function paintedWaterAlphaFromGeometry(
   const totalCells = geometry.width * geometry.height;
   const waterAlpha = geometry.waterAlpha.slice();
   const keepCoverage = options.oceanMaskCoverageOverride?.length === totalCells;
+  const shore = geometry.shoreSignedDistance;
   for (let index = 0; index < totalCells; index++) {
     if (geometry.oceanDetailMask[index] !== 1) continue;
+    if (shore && Math.abs(shore[index]) < 1.5) continue;
     waterAlpha[index] = keepCoverage
       ? Math.max(waterAlpha[index], Math.round(geometry.sourceOceanCoverage[index] * 255))
       : 255;
