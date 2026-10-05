@@ -1,7 +1,7 @@
 /**
  * Draws forest stands to a canvas and holds the forest render settings.
  */
-import { INSPECTOR_BOUNDS } from "../config/inspectorBounds";
+import { MIN_POSITIVE_SCALE as P } from "../config/inspectorBounds";
 import { buildForestLightField, getForestLightTextureCanvas } from "./forestPropLighting";
 import {
   buildForestPropStandGeometry,
@@ -149,30 +149,35 @@ export function forestRenderSettingsSignature(
   return JSON.stringify({ ...DEFAULT_FOREST_RENDER_SETTINGS, ...settings });
 }
 
+/**
+ * Validity limits for forest settings. Inspector sliders cover a narrower
+ * range, but typed values may use anything inside these limits.
+ */
+export const FOREST_SETTING_LIMITS: Partial<Record<keyof ForestRenderSettings, readonly [number, number]>> = {
+  seed: [0, 2147483647], density: [0, Infinity], clustering: [0, 1], canopyMerging: [0, Infinity],
+  canopyEdgeNoiseSize: [P, Infinity], canopyWashNoiseSize: [P, Infinity], canopyWashStrength: [0, Infinity],
+  outlineShadowStrength: [0, 1], outlineInsetStrength: [0, 1], outlineInsetBlurRadius: [0, Infinity],
+  lightStrength: [0, 1], sunAzimuthDeg: [0, 360], lightEdgeDepth: [0, 1],
+  lightSoftness: [P, 1], lightNoise: [0, 1], centerLightGradientMultiplier: [-Infinity, -P],
+  charcoalThickness: [P, Infinity], charcoalInterruptionProbability: [0, 1],
+  centerInterruptionAmountBoost: [0, 1], centerInterruptionLengthMultiplier: [1, Infinity],
+  centerDepthThreshold: [0, 1], minCenterOutlineChance: [0, 1], centerSegmentRemoval: [0, 1],
+  overlapLowerInterruptionMultiplier: [1, Infinity], charcoalInterruptionLength: [P, Infinity],
+  propCharcoalAlpha: [0, 1], hueVariance: [0, 360], saturationVariance: [0, 1],
+  valueVariance: [0, 1], terrainShadeStrength: [0, 1],
+  standMarkSpacing: [0.05, Infinity], standEdgeTrees: [0, Infinity], standInteriorTrees: [0, Infinity],
+  standMeadowTrees: [0, Infinity], standAccentTrees: [0, Infinity], standInkWeight: [0, Infinity], standWashStrength: [0, 1],
+  standWashVariation: [0, Infinity], standWashSoftness: [0, 1], standLightStrength: [0, Infinity],
+};
+
 export function normalizeForestRenderSettings(
   value: unknown,
   fallback: ForestRenderSettings = DEFAULT_FOREST_RENDER_SETTINGS,
 ): ForestRenderSettings {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return fallback;
   const saved = value as Record<string, unknown>;
-  const ranges: Partial<Record<keyof ForestRenderSettings, readonly [number, number]>> = {
-    seed: [0, 2147483647], density: [0, INSPECTOR_BOUNDS.propDensity], clustering: [0, 1], canopyMerging: [0, 100],
-    canopyEdgeNoiseSize: [0.5, 2], canopyWashNoiseSize: [0.5, 2], canopyWashStrength: [0, INSPECTOR_BOUNDS.canopyWash],
-    outlineShadowStrength: [0, 1], outlineInsetStrength: [0, 1], outlineInsetBlurRadius: [0, 8],
-    lightStrength: [0, 1], sunAzimuthDeg: [0, 360], lightEdgeDepth: [0.02, 0.18],
-    lightSoftness: [0.1, 1], lightNoise: [0, 1], centerLightGradientMultiplier: [-4, -0.25],
-    charcoalThickness: [0.1, 2], charcoalInterruptionProbability: [0, 1],
-    centerInterruptionAmountBoost: [0, 0.95], centerInterruptionLengthMultiplier: [1, 12],
-    centerDepthThreshold: [0, 0.9], minCenterOutlineChance: [0, 0.1], centerSegmentRemoval: [0, 1],
-    overlapLowerInterruptionMultiplier: [1, 3], charcoalInterruptionLength: [0.5, 2.5],
-    propCharcoalAlpha: [0, 1], hueVariance: [0, 60], saturationVariance: [0, 0.5],
-    valueVariance: [0, 0.5], terrainShadeStrength: [0, 1],
-    standMarkSpacing: [0.25, 1.5], standEdgeTrees: [0, 1.5], standInteriorTrees: [0, 0.6],
-    standMeadowTrees: [0, 1.5], standAccentTrees: [0, 0.6], standInkWeight: [0, 2], standWashStrength: [0, 1],
-    standWashVariation: [0, 2], standWashSoftness: [0, 1], standLightStrength: [0, 1.5],
-  };
   const normalized = { ...fallback };
-  for (const [key, range] of Object.entries(ranges) as Array<[keyof ForestRenderSettings, readonly [number, number]]>) {
+  for (const [key, range] of Object.entries(FOREST_SETTING_LIMITS) as Array<[keyof ForestRenderSettings, readonly [number, number]]>) {
     const candidate = saved[key];
     if (typeof candidate !== "number" || !Number.isFinite(candidate)) continue;
     (normalized as unknown as Record<string, unknown>)[key] = Math.max(range[0], Math.min(range[1], candidate));

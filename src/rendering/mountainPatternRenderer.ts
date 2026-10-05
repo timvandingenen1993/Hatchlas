@@ -4,20 +4,15 @@
 import { SimplexNoise } from '../core/noise';
 import type { MountainDEMData } from '../terrain/mountainBaseDEM';
 import { clamp01, hash01, paintInkSegment, sampleScalarField, createCharcoalInterruptionPattern, isCharcoalInkActiveAtDistance } from './cartographicStrokeRenderer';
+import { MIN_POSITIVE_SCALE } from '../config/inspectorBounds';
 import type { MountainProfiler } from './mountainProfiler';
 import {
   MOUNTAIN_BIOME_DETAIL_MULTIPLIER_DEFAULT,
-  MOUNTAIN_BIOME_DETAIL_MULTIPLIER_MAX,
   MOUNTAIN_BIOME_DETAIL_MULTIPLIER_MIN,
   MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_DEFAULT,
-  MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_MAX,
   MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_MIN,
-  MOUNTAIN_HATCH_DENSITY_MAX,
   MOUNTAIN_LOCAL_DETAIL_DENSITY_DEFAULT,
-  MOUNTAIN_LOCAL_DETAIL_DENSITY_MAX,
   MOUNTAIN_LOCAL_DETAIL_DENSITY_MIN,
-  MOUNTAIN_RIDGE_DENSITY_MAX,
-  MOUNTAIN_RIDGE_THICKNESS_MAX,
 } from './mountainProjection';
 
 export interface MountainPatternOverlay {
@@ -65,6 +60,7 @@ function mountainBiomeDetailBoost(biome: number): number {
     case 3: return 0.08; // Subalpine conifer forest
     case 4: return 0.08; // Montane broadleaf woodland
     case 5: return 0.05; // Riparian canyon & shrubland
+    case 20: return 0.08; // Montane meadow
     default: return 0;
   }
 }
@@ -388,7 +384,7 @@ function selectStructuralRidgeChains(
   scale: number,
   ridgeDensity = 1,
 ): MountainLinePoint[][] {
-  const density = Math.max(0, Math.min(MOUNTAIN_RIDGE_DENSITY_MAX, ridgeDensity));
+  const density = Math.max(0, ridgeDensity);
   if (density <= 0) return [];
   const candidates = chains
     .map(points => ({
@@ -461,6 +457,8 @@ export interface MountainPatternOptions {
   hatchThickness?: number;
   /** Independent structural ridge density multiplier. */
   ridgeDensity?: number;
+  /** Biomes that get no mountain linework (ridges, creases, hatching). */
+  lineworkExcludedBiomeIds?: readonly number[];
   /** Independent structural ridge thickness multiplier. */
   ridgeThickness?: number;
   /** Resolved primary-ridge pen multiplier after linework presentation scale. */
@@ -682,6 +680,7 @@ export function renderMountainPatternOverlay(
   // so a lowland cliff can be inked even when its biome contributes no rock
   // material to the mountain footprint.
   const lineworkCoverage = new Uint8Array(width * height);
+  const lineworkExcludedBiomes = new Set(options.lineworkExcludedBiomeIds ?? []);
   const lineworkFeatureStrength = new Float32Array(width * height);
   const crestSupportCoverage = new Uint8Array(width * height);
   let snow: Float32Array = new Float32Array(width * height);
@@ -694,29 +693,22 @@ export function renderMountainPatternOverlay(
   const horizontalHatchOpacity = clamp01(options.horizontalHatchOpacity ?? hatchOpacity);
   const verticalHatchOpacity = clamp01(options.verticalHatchOpacity ?? hatchOpacity);
   const drySkip = clamp01(options.drySkipProbability ?? 0.05);
-  const hatchDensity = Math.max(0, Math.min(MOUNTAIN_HATCH_DENSITY_MAX, options.hatchDensity ?? 1));
-  const localDetailDensityMax = Math.max(
-    MOUNTAIN_LOCAL_DETAIL_DENSITY_MIN,
-    Math.min(MOUNTAIN_LOCAL_DETAIL_DENSITY_MAX,
-      options.localDetailDensityMax ?? MOUNTAIN_LOCAL_DETAIL_DENSITY_DEFAULT),
-  );
-  const foothillDetailMultiplier = Math.max(
-    MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_MIN,
-    Math.min(MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_MAX,
-      options.foothillDetailMultiplier ?? MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_DEFAULT),
-  );
-  const biomeDetailMultiplier = Math.max(
-    MOUNTAIN_BIOME_DETAIL_MULTIPLIER_MIN,
-    Math.min(MOUNTAIN_BIOME_DETAIL_MULTIPLIER_MAX,
-      options.biomeDetailMultiplier ?? MOUNTAIN_BIOME_DETAIL_MULTIPLIER_DEFAULT),
-  );
+  // Typed inspector overrides may exceed the slider maxima; only the 1x
+  // baseline floors of the additive detail boosts are enforced.
+  const hatchDensity = Math.max(0, options.hatchDensity ?? 1);
+  const localDetailDensityMax = Math.max(MOUNTAIN_LOCAL_DETAIL_DENSITY_MIN,
+    options.localDetailDensityMax ?? MOUNTAIN_LOCAL_DETAIL_DENSITY_DEFAULT);
+  const foothillDetailMultiplier = Math.max(MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_MIN,
+    options.foothillDetailMultiplier ?? MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_DEFAULT);
+  const biomeDetailMultiplier = Math.max(MOUNTAIN_BIOME_DETAIL_MULTIPLIER_MIN,
+    options.biomeDetailMultiplier ?? MOUNTAIN_BIOME_DETAIL_MULTIPLIER_DEFAULT);
   // `sideRidgeDensity` is retained for direct legacy callers. Once the new
   // hatch-density control is present it is the sole secondary-mark density;
   // main-ridge density must not silently change hatch counts.
-  const sideRidgeDensity = Math.max(0, Math.min(MOUNTAIN_HATCH_DENSITY_MAX,
-    options.hatchDensity === undefined ? options.sideRidgeDensity ?? 1 : 1));
-  const mainRidgeThickness = Math.max(0.25, Math.min(MOUNTAIN_RIDGE_THICKNESS_MAX,
-    options.ridgeThickness ?? options.mainRidgeThickness ?? 0.75));
+  const sideRidgeDensity = Math.max(0,
+    options.hatchDensity === undefined ? options.sideRidgeDensity ?? 1 : 1);
+  const mainRidgeThickness = Math.max(MIN_POSITIVE_SCALE,
+    options.ridgeThickness ?? options.mainRidgeThickness ?? 0.75);
   const ridgePenThickness = Math.max(0,
     options.ridgeStrokeThickness
       ?? (options.ridgeThickness !== undefined
@@ -1067,7 +1059,7 @@ export function renderMountainPatternOverlay(
   // neutral setting lower the curvature/support gates as well as admitting
   // shorter chains later, so a broad summit can acquire a structural line;
   // density below one still only keeps the strongest detected crests.
-  const ridgeDensity = Math.max(0, Math.min(MOUNTAIN_RIDGE_DENSITY_MAX, options.ridgeDensity ?? 1));
+  const ridgeDensity = Math.max(0, options.ridgeDensity ?? 1);
   const ridgeSensitivity = ridgeDensity > 1
     ? 1 / Math.sqrt(Math.max(1, ridgeDensity))
     : 1;
@@ -1153,11 +1145,12 @@ export function renderMountainPatternOverlay(
       const i = rowOffset + x;
       const biome = dem.biomeType[i];
       if (waterMask[i]) continue;
-      // Every dry terrain cell is available to the geometric linework pass.
+      // Every dry terrain cell is available to the geometric linework pass,
+      // except biomes drawn by their own linework (sand desert dunes).
       // Material coverage below may still be zero for a meadow, floodplain,
       // or other non-mountain biome.
-      lineworkCoverage[i] = 255;
-      const materialSlope = staleSlopeOnFlatTerrain && (biome === 3 || biome === 4 || biome === 5)
+      lineworkCoverage[i] = lineworkExcludedBiomes.has(biome) ? 0 : 255;
+      const materialSlope = staleSlopeOnFlatTerrain && (biome === 3 || biome === 4 || biome === 5 || biome >= 15)
         ? 0
         : slopes[i];
       // Bare alpine rock and glaciers, with a soft transition into steep tundra.
@@ -1190,11 +1183,14 @@ export function renderMountainPatternOverlay(
           ? clamp01(alpineProminence * 0.18 + alpineSlope * 0.62 + broadProminence * 0.16)
           : biome === 2
             ? clamp01(tundraElevation * 0.12 + tundraSlope * 0.52 + broadProminence * 0.12)
-            : biome === 3 || biome === 4
+            : biome === 3 || biome === 4 || biome === 15 || biome === 17 || biome === 18 || biome === 20
               ? clamp01(woodlandSlope * 0.72 + broadProminence * 0.18)
-              : biome === 5
+              : biome === 5 || biome === 19
                 ? clamp01(woodlandSlope * 0.78 + broadProminence * 0.2)
-                : 0;
+                // Desert hamada reads as broken rock on its slopes.
+                : biome === 16
+                  ? clamp01(alpineProminence * 0.12 + alpineSlope * 0.62 + broadProminence * 0.16)
+                  : 0;
       // The hatch/ridge layer follows the physical heightmap across every
       // land biome. There is deliberately no highland/elevation gate here:
       // elevation only changes the strength of a local face, while slope and

@@ -2,6 +2,7 @@
  * Hand-drawn style mountain illustration: roughness, snow transport and wind fields turned into ink and wash.
  */
 import type { MountainDEMData } from '../terrain/mountainBaseDEM';
+import { MIN_POSITIVE_SCALE } from '../config/inspectorBounds';
 import {
   clamp01,
   createCharcoalInterruptionPattern,
@@ -26,7 +27,6 @@ import { SimplexNoise } from '../core/noise';
 import { tintMountainLand, type TintRGB } from './mountainTerrainTint';
 import { sampleCartographicGrain,sampleCartographicWashNoise, sampleCartographicPatchNoise, filterCartographicGradient, filterCartographicSignedGradient } from './cartographicWash';
 import {
-  MOUNTAIN_RIDGE_THICKNESS_MAX,
   mountainProjectionLift,
   mountainProjectionLiftCoefficient,
   normalizeMountainProjectionSettings,
@@ -987,7 +987,7 @@ function renderMountainIllustrationInternal(
   // The primary crest is the map's structural pen. Its actual default control
   // value is 0.75, while its terrain-relative line scale grows linearly from
   // 1x at the bottom of the terrain to 2x at the top.
-  const userMainRidgeThickness = Math.max(0.25, Math.min(MOUNTAIN_RIDGE_THICKNESS_MAX, options.mainRidgeThickness ?? 0.75));
+  const userMainRidgeThickness = Math.max(MIN_POSITIVE_SCALE, options.mainRidgeThickness ?? 0.75);
   const mainRidgeThickness = userMainRidgeThickness;
   const ridgeStrokeThickness = Math.max(0,
     options.ridgeStrokeThickness ?? options.strokeThickness * mainRidgeThickness);

@@ -17,7 +17,7 @@
 
 ## About
 
-Load a heightmap (PNG or GeoTIFF) and Hatchlas works out rivers, lakes, snow lines and biomes from the terrain. It then paints the result as an illustrated map, with inked mountain faces, charcoal-style river and shore lines, forest stands, wetlands and wash colors.
+Load a heightmap (PNG or GeoTIFF) and Hatchlas works out rivers, lakes, snow lines and biomes (including deserts and dry steppe) from the terrain. It then paints the result as an illustrated map, with inked mountain faces, charcoal-style river and shore lines, forest stands, wetlands and wash colors.
 
 Everything runs client-side. There is nothing to install, and your heightmaps never leave your machine. A desktop browser works best.
 
@@ -28,14 +28,16 @@ Everything runs client-side. There is nothing to install, and your heightmaps ne
 
 <table>
   <tr>
-    <td width="33%"><img src="screenshots/mountain-valley.jpg" alt="A mountain valley with snow, forest and river junctions"></td>
-    <td width="33%"><img src="screenshots/river-plain.jpg" alt="Rivers and lakes across a wide coastal plain"></td>
-    <td width="33%"><img src="screenshots/coast-closeup.jpg" alt="Close-up of a coast with ocean waves, rivers and forest stands"></td>
+    <td width="25%"><img src="screenshots/mountain-valley.jpg" alt="A mountain valley with snow, forest and river junctions"></td>
+    <td width="25%"><img src="screenshots/river-plain.jpg" alt="Rivers and lakes across a wide coastal plain"></td>
+    <td width="25%"><img src="screenshots/coast-closeup.jpg" alt="Close-up of a coast with ocean waves, rivers and forest stands"></td>
+    <td width="25%"><img src="screenshots/desert-dunes.jpg" alt="Procedural pen-and-ink dunes in a desert basin beside a green, rain-fed mountain range"></td>
   </tr>
   <tr>
     <td align="center"><sub>Mountain valley</sub></td>
     <td align="center"><sub>River plain</sub></td>
     <td align="center"><sub>Coast close-up</sub></td>
+    <td align="center"><sub>Desert dunes</sub></td>
   </tr>
 </table>
 
@@ -50,10 +52,11 @@ Everything runs client-side. There is nothing to install, and your heightmaps ne
 | Feature | Details |
 |---|---|
 | **Heightmap in, map out** | 16-bit PNG, or single-band uncompressed TIFF/GeoTIFF. A sample New Zealand DEM is bundled. |
-| **Terrain analysis** | Drainage, river order, floodplain silt, lakes, slope, snow line and biomes, all derived from the elevation data. Each layer can be inspected. |
+| **Terrain analysis** | Drainage, river order, floodplain silt, lakes, slope, snow line, orographic rainfall and biomes, all derived from the elevation data. Biomes follow Holdridge life zones. Each layer can be inspected. |
 | **Illustrated mountains** | Ridge-aware mountain faces with ink lines, hatching, snow and wash, plus a tilted full-terrain camera view. |
 | **Water** | Rivers, shorelines, wave marks and wetland pools drawn as ink strokes. |
 | **Vegetation** | Forest stands, shrubs and reeds placed by biome suitability, drawn from the SVG props in `src/assets/`. |
+| **Deserts** | Procedural dunes for sand deserts, with adjustable spacing, crest shape, shading and ripples. Rocky deserts use flow-line marks. |
 | **Contours and palettes** | Contour lines with index lines, and several relief palettes. |
 | **High-resolution export** | PNG up to 16K, optionally as 4 strips or a selected region. |
 | **Optional WebGPU** | Speeds up the preparation step when your browser supports it. Everything works without it. |

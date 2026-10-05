@@ -1,11 +1,13 @@
 import {
-  MOUNTAIN_BIOME_LABELS,
+  getMountainBiomeLabel,
+  getMountainClimateZoneLabel,
   MOUNTAIN_WATER_EVOLUTION_STEPS,
   getHeightmapFitResolution,
   processMountainBaseDEM,
   rebuildMountainEvolutionStep,
   recomputeMountainLighting,
   resampleHeightmapLuminance,
+  DEFAULT_RIVER_THRESHOLD_KM2,
   resampleHeightmapMask,
   sampleMountainElevationProfile,
   smoothHeightmapLuminance,
@@ -1215,7 +1217,7 @@ function analyze(request: Extract<MountainPreviewRequest, { type: "analyze" }>):
         domainHeightKm: dem.domainHeightKm,
         minElevationM: dem.minElevationM,
         maxElevationM: dem.maxElevationM,
-        riverThresholdKm2: request.options.riverThresholdKm2 ?? 0.8,
+        riverThresholdKm2: request.options.riverThresholdKm2 ?? DEFAULT_RIVER_THRESHOLD_KM2,
       },
     };
   if (coreChanged) {
@@ -2056,7 +2058,9 @@ self.onmessage = (event: MessageEvent<MountainPreviewRequest>) => {
             precipMm: dem.precipitationMmYr[index],
             tempC: dem.temperatureC[index],
             solarFlux: dem.solarInsolation[index],
-            biomeName: MOUNTAIN_BIOME_LABELS[dem.biomeType[index]] || "Alpine",
+            biomeName: getMountainBiomeLabel(dem.biomeType[index]),
+            climateZone: getMountainClimateZoneLabel(dem, index),
+            heightAboveRiverM: dem.heightAboveDrainageM?.[index] ?? Number.POSITIVE_INFINITY,
           },
         });
         return;

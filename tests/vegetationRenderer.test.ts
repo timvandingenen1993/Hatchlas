@@ -12,6 +12,7 @@ import {
 import { renderMountainDetailDEM } from "../src/rendering/mountainDetailRenderer";
 import { encodeRgbaPngRows } from "../src/utils/pngEncoding";
 import {
+  aridMotifNeedsLeeMirror,
   buildVegetationGeometry,
   mergeVegetationGeometry,
   mergeVegetationOverlay,
@@ -380,13 +381,14 @@ describe("procedural vegetation flow renderer", () => {
     ).toBe(0.1);
     expect(
       resolveVegetationPatternOptions({ strokeThickness: 0 }).strokeThickness,
-    ).toBe(0.1);
-    const extended = resolveVegetationPatternOptions({ density: 3, patternScale: 3, strokeLength: 4,
-      flowWashNoiseScale: 4, wetlandDryDistanceEnd: 240, motifShadowSoftness: 10,
-      washShadowDistance: 12, washShadowGap: 10 });
-    expect(extended).toMatchObject({ density: 3, patternScale: 3, strokeLength: 4,
-      flowWashNoiseScale: 4, wetlandDryDistanceEnd: 240, motifShadowSoftness: 10,
-      washShadowDistance: 12, washShadowGap: 10 });
+    ).toBe(0.01);
+    // Typed inspector values may exceed the slider maxima.
+    const extended = resolveVegetationPatternOptions({ density: 8, patternScale: 6, strokeLength: 9,
+      flowWashNoiseScale: 7, wetlandDryDistanceEnd: 500, motifShadowSoftness: 20,
+      washShadowDistance: 30, washShadowGap: 25 });
+    expect(extended).toMatchObject({ density: 8, patternScale: 6, strokeLength: 9,
+      flowWashNoiseScale: 7, wetlandDryDistanceEnd: 500, motifShadowSoftness: 20,
+      washShadowDistance: 30, washShadowGap: 25 });
   });
 
   it("applies density, scale, flow, length, thickness, and motif controls independently", () => {
@@ -579,6 +581,37 @@ describe("procedural vegetation flow renderer", () => {
     const wetlandMotifs = geometry.motifs.filter((motif) => motif.biomeId === 7);
     expect(wetlandMotifs.length).toBeGreaterThan(0);
     expect(wetlandMotifs.every((motif) => motif.assetKey === reedsAsset.key)).toBe(true);
+  });
+
+  it("uses arid marks in deserts and falls back to line and dot marks without them", () => {
+    const dem = makeVegetationDem();
+    // Keep the frame and river; turn every vegetated band into desert.
+    dem.biomeType = dem.biomeType.map((biome) => (biome === 2 || biome === 5 || biome === 7 ? 15 : biome));
+    const universalAssets = [
+      makeAuditMotif("dots-01", "universal"),
+      makeAuditMotif("line-01", "universal"),
+    ];
+    // Flow marks only draw sand desert when the procedural dunes are off.
+    const baseOptions = { seed: 916, density: 2, motifDensity: 1.2, preset: "adaptive" as const, desertDunes: false };
+    const shrubAsset = makeAuditMotif("shrub-01", "shrub");
+
+    const fallback = buildVegetationGeometry(dem, {
+      ...baseOptions,
+      motifAssets: [...grassDotAssets, shrubAsset, ...universalAssets],
+    });
+    const fallbackDesert = fallback.motifs.filter((motif) => motif.biomeId === 15);
+    expect(fallbackDesert.length).toBeGreaterThan(0);
+    const universalKeys = new Set(universalAssets.map((asset) => asset.key));
+    expect(fallbackDesert.every((motif) => universalKeys.has(motif.assetKey))).toBe(true);
+
+    const aridAsset = makeAuditMotif("arid-ripple", "arid");
+    const arid = buildVegetationGeometry(dem, {
+      ...baseOptions,
+      motifAssets: [...grassDotAssets, shrubAsset, ...universalAssets, aridAsset],
+    });
+    const aridDesert = arid.motifs.filter((motif) => motif.biomeId === 15);
+    expect(aridDesert.length).toBeGreaterThan(0);
+    expect(aridDesert.every((motif) => motif.assetKey === aridAsset.key)).toBe(true);
   });
 
   it("renders a single supplied SVG motif with a partial manifest", () => {
@@ -864,6 +897,136 @@ describe("procedural vegetation flow renderer", () => {
       motifShadowStrength: 0,
     });
     expect(rendered.alpha[30 * dem.width + 52]).toBe(0);
+  });
+
+  it("inks desert marks with the desert ink colour and other biomes with the global ink", () => {
+    const asset: VegetationMotifAsset = {
+      key: "arid-test-ink",
+      family: "arid",
+      width: 64,
+      height: 40,
+      data: new Uint8ClampedArray(),
+      vectorPaths: [{ strokeWidth: 4, points: [{ x: 2, y: 20 }, { x: 62, y: 20 }] }],
+    };
+    const grassAsset: VegetationMotifAsset = { ...asset, key: "grass-test-ink", family: "grass" };
+    const inkOf = (biome: number): [number, number, number] => {
+      const dem = makeVegetationDem(240, 180);
+      // Flat ground keeps mountain ridge and hatch ink out of the comparison.
+      dem.elevation.fill(500);
+      dem.slopeDeg.fill(1);
+      dem.biomeType.fill(biome);
+      dem.isRiverChannel.fill(0);
+      dem.visualWaterMask?.fill(0);
+      dem.visualWaterCoverage?.fill(0);
+      const plain = renderMountainDetailDEM(dem, {
+        layer: "vegetation_patterns", palette: "swiss_topo", sunAzimuthDeg: 315, sunAltitudeDeg: 45,
+        verticalExaggeration: 2, ambientOcclusionStrength: 0.35, showRivers: false, riverThresholdKm2: 1,
+        showWaterDetails: false, showContours: false, contourIntervalM: 80, contourOpacity: 0.35,
+        vegetation: { density: 0, motifAssets: [asset, grassAsset] },
+      });
+      const inked = renderMountainDetailDEM(dem, {
+        layer: "vegetation_patterns", palette: "swiss_topo", sunAzimuthDeg: 315, sunAltitudeDeg: 45,
+        verticalExaggeration: 2, ambientOcclusionStrength: 0.35, showRivers: false, riverThresholdKm2: 1,
+        showWaterDetails: false, showContours: false, contourIntervalM: 80, contourOpacity: 0.35,
+        vegetation: {
+          density: 3, motifAssets: [asset, grassAsset], strokeOpacity: 1, strokeThickness: 2,
+          inkColor: "#0000ff", aridInkColor: "#ff0000",
+        },
+      });
+      // Strongest ink = the pixel that moved furthest from the un-inked wash.
+      let best = 0;
+      let colour: [number, number, number] = [0, 0, 0];
+      for (let i = 0; i < inked.data.length; i += 4) {
+        const delta = Math.abs(inked.data[i] - plain.data[i]) +
+          Math.abs(inked.data[i + 1] - plain.data[i + 1]) +
+          Math.abs(inked.data[i + 2] - plain.data[i + 2]);
+        if (delta > best) {
+          best = delta;
+          colour = [inked.data[i], inked.data[i + 1], inked.data[i + 2]];
+        }
+      }
+      return colour;
+    };
+    const desert = inkOf(15);
+    expect(desert[0]).toBeGreaterThan(desert[2] + 60);
+    const grass = inkOf(18);
+    expect(grass[2]).toBeGreaterThan(grass[0] + 60);
+  });
+
+  it("mirrors arid dune marks so their ticks face the shadow side", () => {
+    // Shadow direction convention is (-sin az, cos az) in screen space; the
+    // SVG's +y side lies along (sin r, -cos r) after rotating by r.
+    for (const azimuth of [0, 45, 135, 225, 315]) {
+      for (let step = 0; step < 24; step++) {
+        const rotation = (step / 24) * Math.PI * 2;
+        const mirrored = aridMotifNeedsLeeMirror(rotation, azimuth);
+        const side = (mirrored ? -1 : 1);
+        const az = (azimuth * Math.PI) / 180;
+        const tickX = side * Math.sin(rotation);
+        const tickY = side * -Math.cos(rotation);
+        expect(tickX * -Math.sin(az) + tickY * Math.cos(az)).toBeGreaterThanOrEqual(-1e-9);
+      }
+    }
+
+    const dem = makeVegetationDem();
+    const asset: VegetationMotifAsset = {
+      key: "arid-test-dune",
+      family: "arid",
+      width: 64,
+      height: 40,
+      data: new Uint8ClampedArray(),
+      vectorPaths: [
+        { strokeWidth: 3, points: [{ x: 4, y: 20 }, { x: 60, y: 20 }] },
+        { strokeWidth: 3, points: [{ x: 32, y: 20 }, { x: 32, y: 38 }] },
+      ],
+    };
+    const path = {
+      key: 7303,
+      biomeId: 5,
+      width: 1,
+      dashPhase: 0,
+      points: [{ x: 12, y: 30 }, { x: 88, y: 30 }],
+    };
+    const inkExtent = (sunAzimuthDeg: number): { above: number; below: number } => {
+      const rendered = renderVegetationOverlay(dem, {
+        width: dem.width,
+        height: dem.height,
+        paths: [path],
+        motifs: [{
+          x: 50,
+          y: 30,
+          rotation: 0,
+          size: 20,
+          opacity: 1,
+          biomeId: 5,
+          assetKey: asset.key,
+          pathKey: path.key,
+          pathT: 0.5,
+        }],
+      }, {
+        motifAssets: [asset],
+        strokeOpacity: 1,
+        lineInterruptionProbability: 0,
+        motifShadowStrength: 0,
+      }, sunAzimuthDeg);
+      let minY = dem.height;
+      let maxY = -1;
+      for (let y = 0; y < dem.height; y++) {
+        for (let x = 0; x < dem.width; x++) {
+          if (rendered.alpha[y * dem.width + x] === 0) continue;
+          minY = Math.min(minY, y);
+          maxY = Math.max(maxY, y);
+        }
+      }
+      return { above: 30 - minY, below: maxY - 30 };
+    };
+
+    // At 315 degrees the shadow points down-right, so the tick hangs below
+    // the crest; at 135 degrees it points up-left and the tick flips above.
+    const shadowDown = inkExtent(315);
+    expect(shadowDown.below).toBeGreaterThan(shadowDown.above + 3);
+    const shadowUp = inkExtent(135);
+    expect(shadowUp.above).toBeGreaterThan(shadowUp.below + 3);
   });
 
   it("keeps parent-path charcoal gaps empty across overlapping vector motifs", () => {

@@ -1,4 +1,7 @@
-/** Limits used by the inspector, saved-setting loading, and renderers. */
+/**
+ * Inspector slider ranges. Values typed into a control may go beyond them, so
+ * saved-setting loading and renderers only enforce validity floors.
+ */
 export const INSPECTOR_BOUNDS = {
   groundDensity: 3,
   propDensity: 3,
@@ -15,3 +18,6 @@ export const INSPECTOR_BOUNDS = {
   oceanTurbulence: 6,
   poolSizeMin: 0.02,
 } as const;
+
+/** Smallest positive multiplier renderers accept from a typed override. */
+export const MIN_POSITIVE_SCALE = 0.01;

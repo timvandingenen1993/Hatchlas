@@ -1,6 +1,8 @@
 /**
  * Renders the mountain DEM into layered output (terrain, water, vegetation) with a staged cache.
  */
+import { MIN_POSITIVE_SCALE } from "../config/inspectorBounds";
+import { DESERT_DUNE_BIOME_ID, desertDuneSignature, isDesertDunePixel, resolveDesertDuneOptions, shadeDuneSand } from "./desertDunes";
 import { biomeEdgeNoise, DEFAULT_BIOME_EDGE_NOISE_SCALE_M } from "../terrain/biomeEdgeNoise";
 import type { MountainDEMData } from '../terrain/mountainBaseDEM';
 import {
@@ -71,8 +73,10 @@ import {
 } from './waterRenderer';
 import {
   buildVegetationGeometry,
+  propStandColorPartition,
   renderVegetationOverlay,
   sampleAlpineForestTerrainSuitability,
+  type RasterPropBiomeSettings,
   type VegetationGeometry,
   type VegetationOverlayStageCache,
   type VegetationPatternOptions,
@@ -461,6 +465,13 @@ export function waterPaintStageKey(
   ]);
 }
 
+function rasterPropBiomeSettingsWithoutColors(settings: RasterPropBiomeSettings | undefined) {
+  return settings && Object.fromEntries(Object.entries(settings).map(([biome, entry]) => {
+    const { treeColor: _treeColor, shrubColor: _shrubColor, ...placement } = entry ?? {};
+    return [biome, placement];
+  }));
+}
+
 export function vegetationGeometryStageKey(options: MountainRenderOptions): string {
   const vegetation = options.vegetation;
   return JSON.stringify([
@@ -481,9 +492,13 @@ export function vegetationGeometryStageKey(options: MountainRenderOptions): stri
     vegetation?.motifSize,
     vegetation?.wetlandShrubDensity,
     vegetation?.wetlandImagePropDrynessBias,
+    // Dunes replace sand-desert flow lines, so toggling them changes seeding.
+    vegetation?.desertDunes,
     vegetationMotifAssetSignature(vegetation?.motifAssets),
     vegetationRasterPropAssetSignature(vegetation?.rasterPropAssets),
-    vegetation?.rasterPropBiomeSettings,
+    // Biome colours only repaint, unless they change which biomes share a stand.
+    rasterPropBiomeSettingsWithoutColors(vegetation?.rasterPropBiomeSettings),
+    propStandColorPartition(vegetation),
     vegetation?.rasterPropDensity,
     vegetation?.mountainBoulderDensity,
     vegetation?.mountainBoulderSize,
@@ -536,9 +551,13 @@ export function vegetationOverlayStageKey(
     vegetation?.washShadowGap,
     vegetation?.washShadowGrain,
     forestRenderSettingsSignature(vegetation?.forestSettings),
+    vegetation?.rasterPropBiomeSettings,
     vegetation?.forestRenderScale,
     vegetationMotifAssetSignature(vegetation?.motifAssets),
     vegetationRasterPropAssetSignature(vegetation?.rasterPropAssets),
+    desertDuneSignature(resolveDesertDuneOptions(vegetation)),
+    vegetation?.aridInkColor,
+    vegetation?.desertSpotColor,
   ]);
 }
 
@@ -745,6 +764,12 @@ export const MOUNTAIN_REFERENCE_BIOME_COLORS: Readonly<Record<number, string>> =
   12: "#d0b784", // Silty beach / river mouth
   13: "#918673", // Rocky shore
   14: "#5d5d52", // Coastal cliff
+  15: "#f4e2c2", // Sand desert / dunes (pale cream: blue near 80% of red, green a little under red)
+  16: "#b09a78", // Rocky desert / hamada
+  17: "#aaa46a", // Dry steppe
+  18: "#8fa35a", // Grassland / prairie
+  19: "#4f7a3a", // Desert oasis
+  20: "#6a974e", // Montane meadow; also the green the land tint gives flat ground
 };
 
 export const MOUNTAIN_REFERENCE_WATER_COLORS = {
@@ -771,13 +796,18 @@ function resolveMountainBiomeWashColors(
   const colors: Record<number, RGB> = { ...MOUNTAIN_BIOME_WASH_COLORS };
   for (const [biomeIdText, color] of Object.entries(overrides)) {
     const biomeId = Number(biomeIdText);
-    if (!Number.isInteger(biomeId) || biomeId < 0 || biomeId > 14) continue;
+    if (!Number.isInteger(biomeId) || !(biomeId in MOUNTAIN_BIOME_WASH_COLORS)) continue;
     colors[biomeId] = parseHexColor(
       color,
       colors[biomeId] ?? DEFAULT_MOUNTAIN_BIOME_RGB,
     );
   }
   return colors;
+}
+
+/** Sand Desert & Dunes (15) and Rocky Desert & Hamada (16). */
+function isAridBiome(biomeId: number): boolean {
+  return biomeId === 15 || biomeId === 16;
 }
 
 function getVegetationWashRGB(
@@ -1220,7 +1250,7 @@ function getBiomeRGB(
 ): RGB {
   if (biomeId === 6) return waterShallowColor;
   if (biomeId === 8) return waterDeepColor;
-  if (biomeId >= 0 && biomeId <= 14) {
+  if (biomeId in MOUNTAIN_BIOME_WASH_COLORS) {
     return getVegetationWashRGB(biomeId, biomeColors);
   }
   return [100, 100, 100];
@@ -1339,6 +1369,12 @@ export function getMountainPatternOptions(
     drySkipProbability: options.vegetation?.drySkipProbability ?? 0.05,
     sideRidgeDensity: linework.ridgeDensity,
     mainRidgeThickness: linework.ridgeThickness,
+    // Sand desert under procedural dunes carries the dune linework only;
+    // ridge, crease and hatch strokes there read as a second kind of line.
+    lineworkExcludedBiomeIds:
+      options.layer === 'vegetation_patterns' && resolveDesertDuneOptions(options.vegetation).enabled
+        ? [DESERT_DUNE_BIOME_ID]
+        : undefined,
   };
 }
 
@@ -1498,8 +1534,8 @@ export function buildMountainIllustrationStageInputs(
     washLightStrength: options.vegetation?.flowWashLightStrength ?? 0.12,
     washNoiseStrength: options.vegetation?.flowWashNoiseStrength ?? 0.45,
     washNoiseScale: options.vegetation?.flowWashNoiseScale ?? 1,
-    // Flat, low rock faces pick up the palette's woodland green.
-    landGreenColor: getVegetationWashRGB(4, resolveMountainBiomeWashColors(options.vegetationBiomeColors)),
+    // Flat, low rock faces pick up the palette's meadow green.
+    landGreenColor: getVegetationWashRGB(20, resolveMountainBiomeWashColors(options.vegetationBiomeColors)),
   };
   const mountainProjection = normalizeMountainProjectionSettings(
     options.mountainViewAngleDeg,
@@ -1830,10 +1866,7 @@ export function renderMountainDetailDEMWithCache(
   );
   const siltColor = getVegetationWashRGB(9, vegetationBiomeColors);
   const siltLayers = options.siltLayers ?? DEFAULT_SILT_LAYERS;
-  const vegetationBiomeTransitionStrength = Math.max(
-    0,
-    Math.min(3, options.vegetationBiomeTransitionStrength ?? 1),
-  );
+  const vegetationBiomeTransitionStrength = Math.max(0, options.vegetationBiomeTransitionStrength ?? 1);
   const vegetationWashField = layer === 'vegetation_patterns'
     ? createVegetationWashField(
         dem,
@@ -2027,6 +2060,9 @@ export function renderMountainDetailDEMWithCache(
     if (!hasVegetationOverlayOverride) cache.stats.vegetationOverlayBuilds++;
   }
   const vegetationInkColor = parseHexColor(options.vegetation?.inkColor, [47, 74, 45]);
+  const aridInkColor = parseHexColor(options.vegetation?.aridInkColor, [58, 43, 30]);
+  const desertDuneOptions = resolveDesertDuneOptions(options.vegetation);
+  const desertSpotColor = parseHexColor(options.vegetation?.desertSpotColor, [196, 133, 90]);
   // Every prop (forest canopy, deciduous tree, shrub, boulder) shares one
   // outline color; vegetation ink stays for the non-prop linework.
   const propOutlineColor = parseHexColor(
@@ -2122,7 +2158,7 @@ export function renderMountainDetailDEMWithCache(
   );
   const siltLineStyle: RiverSiltLineStyle = {
     // Vegetation flow strokes use radius = path width (avg 0.93) x strokeThickness.
-    radiusPx: 0.93 * Math.max(0.1, Math.min(3, options.vegetation?.strokeThickness ?? 1)) * siltLinePixelScale,
+    radiusPx: 0.93 * Math.max(MIN_POSITIVE_SCALE, options.vegetation?.strokeThickness ?? 1) * siltLinePixelScale,
     dashScale: Math.max(0.4, options.vegetation?.strokeLength ?? 1) * siltLinePixelScale,
     gapScale: siltLinePixelScale,
     drySkipProbability: Math.max(0, Math.min(1, options.vegetation?.drySkipProbability ?? 0.05)),
@@ -2362,8 +2398,12 @@ export function renderMountainDetailDEMWithCache(
           0,
           Math.min(1, baseFlowPosition + washNoise * washNoiseStrength * 0.26),
         );
-        const washColor =
-          flowPosition < 0.5
+        // Dune sand uses its own wash: the overlay tone here is the dune
+        // highlight/shade, and the shared wash stops would push pale sand
+        // towards olive (their dark stop cuts red hardest).
+        const washColor: RGB = isDesertDunePixel(desertDuneOptions, dem.biomeType[i])
+          ? shadeDuneSand([cr, cg, cb], flowTone, desertDuneOptions, washNoise, desertSpotColor)
+          : flowPosition < 0.5
             ? mixRGB(outer, middle, flowPosition * 2)
             : mixRGB(middle, centre, (flowPosition - 0.5) * 2);
         // Keep the vegetation wash readable while letting the DEM's sun and
@@ -2371,14 +2411,14 @@ export function renderMountainDetailDEMWithCache(
         // tinting the flow field by a barely perceptible amount.
         const washShade = 0.55 + 0.45 * effectiveShade;
         const biomeId = dem.biomeType[i];
-        const tinted = biomeId >= 1 && biomeId <= 5
+        const tinted = biomeId >= 1 && biomeId <= 5 || biomeId === 20
           ? tintMountainLand(washColor, {
             slopeDeg: dem.slopeDeg[i],
             normElev,
             tpi: dem.tpi?.[i] ?? 0,
             insolation: dem.solarInsolation?.[i] ?? 0.5,
             noise: washNoise,
-          }, getVegetationWashRGB(4, vegetationBiomeColors))
+          }, getVegetationWashRGB(20, vegetationBiomeColors))
           : washColor;
         r = Math.max(0, Math.min(255, Math.round(tinted[0] * washShade)));
         g = Math.max(0, Math.min(255, Math.round(tinted[1] * washShade)));
@@ -2535,8 +2575,11 @@ export function renderMountainDetailDEMWithCache(
     // cartographic line details are composited. This uses the same sun angle
     // as terrain hillshade and stays clipped to dry vegetation land.
     if (layer === 'vegetation_patterns') {
-      const washShadowAlpha =
-        (vegetationOverlay?.washShadowAlpha[i] ?? 0) / 255;
+      // Dunes are lit by their own sun shading; a wash shadow cast from
+      // their tone edges would add offset grey copies of every crest.
+      const washShadowAlpha = isDesertDunePixel(desertDuneOptions, dem.biomeType[i])
+        ? 0
+        : (vegetationOverlay?.washShadowAlpha[i] ?? 0) / 255;
       if (washShadowAlpha > 0) {
         const shadowFactor = 1 - washShadowAlpha * 0.52;
         r = Math.round(r * shadowFactor);
@@ -2767,13 +2810,19 @@ export function renderMountainDetailDEMWithCache(
     // Grainy motif/guide shadows sit below the actual ink and are clipped to
     // the same dry-land mask. Their displacement follows the detail renderer's
     // sun, while the renderer breaks the footprint into printed specks.
-    const vegetationShadowAlpha =
-      (vegetationOverlay?.shadowAlpha[i] ?? 0) / 255 * vegetationSiltClip;
+    const flowInkColor = isAridBiome(dem.biomeType[i])
+      ? aridInkColor
+      : vegetationInkColor;
+    // The motif shadow is cast from all ink, dune lines included. On dunes it
+    // reads as thick untapered strokes beside each crest, so skip it there.
+    const vegetationShadowAlpha = isDesertDunePixel(desertDuneOptions, dem.biomeType[i])
+      ? 0
+      : (vegetationOverlay?.shadowAlpha[i] ?? 0) / 255 * vegetationSiltClip;
     if (vegetationShadowAlpha > 0) {
       const shadow = [
-        Math.max(0, Math.round(vegetationInkColor[0] * 0.62)),
-        Math.max(0, Math.round(vegetationInkColor[1] * 0.62)),
-        Math.max(0, Math.round(vegetationInkColor[2] * 0.62)),
+        Math.max(0, Math.round(flowInkColor[0] * 0.62)),
+        Math.max(0, Math.round(flowInkColor[1] * 0.62)),
+        Math.max(0, Math.round(flowInkColor[2] * 0.62)),
       ];
       r = blendContourColor(r, shadow[0], vegetationShadowAlpha);
       g = blendContourColor(g, shadow[1], vegetationShadowAlpha);
@@ -2785,9 +2834,9 @@ export function renderMountainDetailDEMWithCache(
     // are still composited last so shorelines remain authoritative.
     const vegetationAlpha = (vegetationOverlay?.alpha[i] ?? 0) / 255 * vegetationSiltClip;
     if (vegetationAlpha > 0) {
-      r = blendContourColor(r, vegetationInkColor[0], vegetationAlpha);
-      g = blendContourColor(g, vegetationInkColor[1], vegetationAlpha);
-      b = blendContourColor(b, vegetationInkColor[2], vegetationAlpha);
+      r = blendContourColor(r, flowInkColor[0], vegetationAlpha);
+      g = blendContourColor(g, flowInkColor[1], vegetationAlpha);
+      b = blendContourColor(b, flowInkColor[2], vegetationAlpha);
     }
 
     // Water boundaries and coastal ink retain their configured styles; the
@@ -3029,7 +3078,7 @@ export function renderMountainDetailDEMWithCache(
     fieldOfViewDeg: 35,
     heightExaggeration:
       (options.fullTerrainCameraHeightExaggeration ?? 1) *
-      Math.max(0.25, options.verticalExaggeration ?? 1),
+      Math.max(0, options.verticalExaggeration ?? 1),
     // The stage resolves the same surface for cached and uncached renders;
     // raw DEM elevation remains the fallback for diagnostic layers.
     elevationField:

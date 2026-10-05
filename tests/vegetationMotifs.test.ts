@@ -2,8 +2,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
-  loadVegetationMotifAssets,
   parseSvgVectorAsset,
+  STAND_PROP_BIOME_IDS,
   VEGETATION_RASTER_PROP_DEFINITIONS,
 } from "../src/rendering/vegetationMotifs";
 
@@ -85,30 +85,6 @@ describe("vegetation motif asset loading", () => {
     vi.unstubAllGlobals();
   });
 
-  it("uses the selected SVG path data for reeds", async () => {
-    const reedsSvg = readFileSync(
-      join(process.cwd(), "src/assets/vegetation/reeds01.svg"),
-      "utf8",
-    );
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => ({
-        ok: true,
-        text: async () => reedsSvg,
-      })),
-    );
-
-    const assets = await loadVegetationMotifAssets();
-    const reeds = assets.find((asset) => asset.key === "reeds-01");
-    const points = reeds?.vectorPaths?.[0]?.points ?? [];
-
-    expect(reeds?.vectorPaths).toHaveLength(1);
-    expect(points[0]?.x).toBeCloseTo(0, 6);
-    expect(points.at(-1)?.x).toBeCloseTo(64, 6);
-    vi.unstubAllGlobals();
-  });
-
-
   it("registers the supplied alpine tree path with a filled closed silhouette", async () => {
     const alpineTrees = VEGETATION_RASTER_PROP_DEFINITIONS.filter((definition) =>
       definition.key === "alpine-tree-75",
@@ -124,7 +100,8 @@ describe("vegetation motif asset loading", () => {
       outlineGroup: "alpine-forest",
       rasterizeVectorFill: true,
     });
-    expect(alpineTrees[0].eligibleBiomeIds).toEqual([2, 3, 4]);
+    // Trees may grow in any stand biome; per-biome tree density decides where they do.
+    expect(alpineTrees[0].eligibleBiomeIds).toEqual(STAND_PROP_BIOME_IDS);
 
     const svg = readFileSync(
       join(

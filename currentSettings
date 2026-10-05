@@ -8,6 +8,21 @@
     "vegetationPatternScale": 1.8,
     "vegetationSwirlStrength": 0.45,
     "vegetationTerrainFollowing": 0.2,
+    "vegetationDesertDunes": true,
+    "vegetationDesertDuneSpacingKm": 2.5,
+    "vegetationDesertHighlight": 0.4,
+    "vegetationDesertWashShadow": 0.3,
+    "vegetationDesertLineBreaks": 0.35,
+    "vegetationDesertDots": 0.5,
+    "vegetationDesertColorVariation": 0.12,
+    "vegetationDesertColorScaleKm": 8,
+    "vegetationDesertSpotColor": "#c4855a",
+    "vegetationDesertCrestScallop": 0.8,
+    "vegetationDesertTerrainFollowing": 1,
+    "vegetationDesertShadowLength": 0.36,
+    "vegetationDesertShadowStrength": 0.5,
+    "vegetationDesertHatchDensity": 1,
+    "vegetationDesertRippleLines": 1,
     "vegetationStrokeLength": 2.5,
     "vegetationStrokeThickness": 0.15,
     "vegetationStrokeOpacity": 0.85,
@@ -16,10 +31,44 @@
     "vegetationMotifDensity": 0.9,
     "vegetationMotifSize": 0.3,
     "vegetationRasterPropBiomeSettings": {
-        "2": { "density": 1.6, "clustering": 0.55 },
-        "3": { "density": 1.8, "clustering": 0.7 },
-        "4": { "density": 2, "clustering": 0.8 },
-        "7": { "density": 2, "clustering": 0.95 }
+        "2": {
+            "density": 1.6,
+            "clustering": 0.55
+        },
+        "3": {
+            "density": 1.8,
+            "clustering": 0.7
+        },
+        "4": {
+            "density": 2,
+            "clustering": 0.8
+        },
+        "5": {
+            "shrubDensity": 1.15,
+            "shrubTreeShare": 0.05
+        },
+        "7": {
+            "density": 2,
+            "clustering": 0.95
+        },
+        "17": {
+            "density": 0.4,
+            "treeDensity": 0,
+            "clustering": 0.55,
+            "shrubColor": "#d1d595"
+        },
+        "18": {
+            "shrubDensity": 0.55,
+            "shrubTreeShare": 0
+        },
+        "19": {
+            "shrubDensity": 1.45,
+            "shrubTreeShare": 0.07
+        },
+        "20": {
+            "shrubDensity": 1.45,
+            "shrubTreeShare": 0.07
+        }
     },
     "vegetationRasterPropDensity": 1.55,
     "vegetationMountainBoulderDensity": 0,
@@ -31,8 +80,8 @@
     "vegetationRasterPropPlacementNoiseScale": 0.45,
     "forestSettings": {
         "seed": 23817,
-        "density": 2,
-        "clustering": 0.8,
+        "density": 0,
+        "clustering": 0.55,
         "canopyMerging": 35,
         "canopyEdgeNoiseSize": 1.1,
         "canopyWashNoiseSize": 1.7,
@@ -81,6 +130,7 @@
     },
     "forestSourceZoom": 1,
     "vegetationInkColor": "#000000",
+    "vegetationAridInkColor": "#000000",
     "forestOutlineColor": "#000000",
     "mountainHatchColor": "#000000",
     "mountainRidgeColor": "#000000",
@@ -99,7 +149,13 @@
         "11": "#e7cf96",
         "12": "#d0b784",
         "13": "#918673",
-        "14": "#5d5d52"
+        "14": "#5d5d52",
+        "15": "#e9d9a9",
+        "16": "#b09a78",
+        "17": "#bbb286",
+        "18": "#8fa35a",
+        "19": "#4f7a3a",
+        "20": "#779452"
     },
     "vegetationBiomeTransitionStrength": 3,
     "biomeEdgeNoiseScaleM": 800,
@@ -155,7 +211,7 @@
     "hillshadeStrength": 1,
     "showHeightmapWater": false,
     "showRivers": true,
-    "riverThresholdKm2": 2.5,
+    "riverThresholdKm2": 16,
     "showWaterDetails": true,
     "showOceanDetails": true,
     "siltReachM": 2500,
@@ -194,15 +250,15 @@
     "waterFlowColor": "#000000",
     "wetlandElevationThresholdM": 454,
     "biomeRegionScaleKm": 0.01,
-    "waterStageScale": 1.4,
+    "waterStageScale": 0.8,
     "flowRateScale": 0.9,
     "waterLandscapeImpact": 1,
     "waterEvolutionStep": 0,
     "rainOverlayOpacity": 0,
     "windAzimuthDeg": 225,
     "windSpeedMs": 16,
-    "basePrecipMm": 1100,
-    "baseTemperatureC": 13,
+    "basePrecipMm": 1500,
+    "baseTemperatureC": 17,
     "showContours": false,
     "contourIntervalM": 100,
     "contourSmoothingPasses": 4,
@@ -214,9 +270,9 @@
     "contourColor": "#3c3c3c",
     "contourIndexColor": "#282828",
     "animateWater": false,
-    "zoom": 0.9410835769228078,
+    "zoom": 0.8183335451502665,
     "pan": {
-        "x": -30,
-        "y": 32
+        "x": 116,
+        "y": 66
     }
 }

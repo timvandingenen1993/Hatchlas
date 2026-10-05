@@ -2,22 +2,34 @@
  * Controls for the forest stand renderer.
  */
 import { INSPECTOR_BOUNDS } from "../config/inspectorBounds";
-import type { ForestRenderSettings } from "../rendering/forestCanvasRenderer";
+import { FOREST_SETTING_LIMITS, type ForestRenderSettings } from "../rendering/forestCanvasRenderer";
 import { NumericControl } from "./NumericControl";
 import { InspectorColor, InspectorFold, InspectorNote, InspectorSelect, InspectorToggle } from "./InspectorParts";
 
 interface ForestRenderControlsProps {
   settings: ForestRenderSettings;
   defaults?: ForestRenderSettings;
-  biomeDensityDefault?: number;
+  treeDensityDefault?: number;
+  shrubDensityDefault?: number;
   biomeClusteringDefault?: number;
-  wetlandShrubDensityDefault?: number;
   propScaleDefault?: number;
   standSizeDefault?: number;
   placementNoiseScaleDefault?: number;
   onSettingsChange: (settings: ForestRenderSettings) => void;
-  density: number;
-  onDensityChange: (density: number) => void;
+  /** Densities of the selected biome's tree and shrub stands. */
+  treeDensity: number;
+  onTreeDensityChange: (density: number) => void;
+  shrubDensity: number;
+  onShrubDensityChange: (density: number) => void;
+  /** Share of the selected biome's shrub-stand plants drawn as trees. */
+  shrubTreeShare: number;
+  onShrubTreeShareChange: (share: number) => void;
+  shrubTreeShareDefault?: number;
+  /** Colours of the selected biome's tree and shrub stands. */
+  treeColor: string;
+  onTreeColorChange: (color: string) => void;
+  shrubColor: string;
+  onShrubColorChange: (color: string) => void;
   clustering: number;
   onClusteringChange: (clustering: number) => void;
   placementNoiseScale: number;
@@ -32,9 +44,6 @@ interface ForestRenderControlsProps {
   sourceZoom: number;
   onSourceZoomChange: (zoom: number) => void;
   sourceUrls: readonly string[];
-  /** Density of the wetland shrubs that form the wetland shrub stands. */
-  wetlandShrubDensity: number;
-  onWetlandShrubDensityChange: (value: number) => void;
   disabled?: boolean;
 }
 
@@ -78,7 +87,7 @@ const numericControls: Array<{
 
 /** Alpine forest stands (hand-drawn stand style, as tuned in /forest-lab). */
 const standControls: Array<{
-  key: "standMarkSpacing" | "standEdgeTrees" | "standInteriorTrees" | "standMeadowTrees" | "standAccentTrees" |
+  key: "standMarkSpacing" | "standEdgeTrees" | "standInteriorTrees" | "standMeadowTrees" |
     "standInkWeight" | "standWashStrength" | "standWashVariation" | "standWashSoftness" | "standLightStrength";
   label: string;
   min: number;
@@ -89,7 +98,6 @@ const standControls: Array<{
   { key: "standEdgeTrees", label: "Edge trees (top + bottom)", min: 0, max: 1.5, step: 0.05 },
   { key: "standInteriorTrees", label: "Interior trees", min: 0, max: 0.6, step: 0.01 },
   { key: "standMeadowTrees", label: "Meadow trees", min: 0, max: 1.5, step: 0.05 },
-  { key: "standAccentTrees", label: "Wetland trees among shrubs", min: 0, max: 0.6, step: 0.01 },
   { key: "standInkWeight", label: "Ink weight", min: 0, max: 2, step: 0.05 },
   { key: "standWashStrength", label: "Stand wash", min: 0, max: 1, step: 0.05 },
   { key: "standWashVariation", label: "Wash variation", min: 0, max: 2, step: 0.05 },
@@ -100,15 +108,24 @@ const standControls: Array<{
 export function ForestRenderControls({
   settings,
   defaults,
-  biomeDensityDefault,
+  treeDensityDefault,
+  shrubDensityDefault,
   biomeClusteringDefault,
-  wetlandShrubDensityDefault,
   propScaleDefault,
   standSizeDefault,
   placementNoiseScaleDefault,
   onSettingsChange,
-  density,
-  onDensityChange,
+  treeDensity,
+  onTreeDensityChange,
+  shrubDensity,
+  onShrubDensityChange,
+  treeColor,
+  onTreeColorChange,
+  shrubColor,
+  onShrubColorChange,
+  shrubTreeShare,
+  onShrubTreeShareChange,
+  shrubTreeShareDefault,
   clustering,
   onClusteringChange,
   placementNoiseScale,
@@ -123,17 +140,16 @@ export function ForestRenderControls({
   sourceZoom,
   onSourceZoomChange,
   sourceUrls,
-  wetlandShrubDensity,
-  onWetlandShrubDensityChange,
   disabled = false,
 }: ForestRenderControlsProps) {
   const update = (key: keyof ForestRenderSettings, value: number | boolean | string) => {
     onSettingsChange({ ...settings, [key]: value });
   };
   const slider = (label: string, value: number, min: number, max: number, step: number,
-    change: (value: number) => void, defaultValue?: number, unit = max <= 1 && min >= 0 ? "%" : "×") => (
+    change: (value: number) => void, defaultValue?: number, unit = max <= 1 && min >= 0 ? "%" : "×",
+    limits?: readonly [number, number]) => (
     <NumericControl key={label} label={label} value={value} min={min} max={max} step={step}
-      onChange={change} defaultValue={defaultValue} disabled={disabled}
+      onChange={change} defaultValue={defaultValue} disabled={disabled} limits={limits}
       logarithmic={unit !== "%" && min > 0 && max / min >= 8} unit={unit} />
   );
 
@@ -146,17 +162,22 @@ export function ForestRenderControls({
       <div className="mt-1 flex flex-col gap-1.5 rounded bg-black/15 p-2">
         <InspectorSelect label="Biome" value={biome} onChange={onBiomeChange}
           options={biomeOptions.map((option) => [option.id, option.label] as const)} />
-        {slider("Prop density", density, 0, INSPECTOR_BOUNDS.propDensity, 0.05, onDensityChange, biomeDensityDefault, "×")}
+        {slider("Alpine tree density", treeDensity, 0, INSPECTOR_BOUNDS.propDensity, 0.05, onTreeDensityChange, treeDensityDefault, "×")}
+        {slider("Shrub density", shrubDensity, 0, INSPECTOR_BOUNDS.propDensity, 0.05, onShrubDensityChange, shrubDensityDefault, "×")}
+        {slider("Trees among shrubs", shrubTreeShare, 0, 0.6, 0.01, onShrubTreeShareChange, shrubTreeShareDefault)}
         {slider("Clustering", clustering, 0, 1, 0.05, onClusteringChange, biomeClusteringDefault)}
-        {biome === 7 && slider("Shrub density", wetlandShrubDensity, 0, INSPECTOR_BOUNDS.propDensity, 0.05, onWetlandShrubDensityChange, wetlandShrubDensityDefault, "×")}
+        <InspectorColor label="Tree color" value={treeColor} disabled={disabled} onChange={onTreeColorChange} />
+        <InspectorColor label="Shrub color" value={shrubColor} disabled={disabled} onChange={onShrubColorChange} />
+        <InspectorNote>Tree color also paints the trees among the shrubs.</InspectorNote>
       </div>
       <InspectorFold title="Forest stands">
         {standControls.map(({ key, label, min, max, step }) => slider(label, settings[key], min, max, step,
-          (value) => update(key, value), defaults?.[key], "×"))}
+          (value) => update(key, value), defaults?.[key], "×", FOREST_SETTING_LIMITS[key]))}
       </InspectorFold>
       <InspectorFold title="Advanced wash, shading and ink">
         {numericControls.map(({ key, label, min, max, step }) => slider(label, settings[key], min, max, step,
-          (value) => update(key, value), defaults?.[key], key === "hueVariance" ? "°" : key === "canopyMerging" ? "" : undefined))}
+          (value) => update(key, value), defaults?.[key], key === "hueVariance" ? "°" : key === "canopyMerging" ? "" : undefined,
+          FOREST_SETTING_LIMITS[key]))}
         <InspectorColor label="Cone light color" value={settings.lightColor} disabled={disabled} onChange={(color) => update("lightColor", color)} />
         <InspectorToggle label="Center-depth debug" checked={settings.showCenterDebug} disabled={disabled} onChange={(checked) => update("showCenterDebug", checked)} />
         <InspectorToggle label="Ground reservations" checked={settings.showFootprints} disabled={disabled} onChange={(checked) => update("showFootprints", checked)} />

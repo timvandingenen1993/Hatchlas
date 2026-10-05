@@ -117,8 +117,11 @@ afterEach(() => {
 
 describe("mountain forest canvas settings and layer", () => {
   it("normalizes saved ranges and keeps appearance changes in the render signature", () => {
+    // Typed values may exceed the slider range; only validity limits apply.
     const settings = normalizeForestRenderSettings({ canopyMerging: 180, lightColor: "bad", showFootprints: true });
-    expect(settings.canopyMerging).toBe(100);
+    expect(settings.canopyMerging).toBe(180);
+    expect(normalizeForestRenderSettings({ canopyMerging: -5, lightStrength: 2 }))
+      .toMatchObject({ canopyMerging: 0, lightStrength: 1 });
     expect(settings.lightColor).toBe(DEFAULT_FOREST_RENDER_SETTINGS.lightColor);
     expect(settings.showFootprints).toBe(true);
     expect(normalizeForestRenderSettings({ density: 3, canopyWashStrength: 3 })).toMatchObject({ density: 3, canopyWashStrength: 3 });

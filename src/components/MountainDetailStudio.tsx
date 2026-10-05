@@ -2,6 +2,7 @@
  * Mountain Studio: loads a heightmap, previews it, and exports high-resolution mountain maps.
  */
 import { INSPECTOR_BOUNDS } from "../config/inspectorBounds";
+import { DESERT_DEFAULT_SPOT_COLOR, DESERT_DUNE_DEFAULTS } from "../rendering/desertDunes";
 import {
   useEffect,
   useRef,
@@ -10,6 +11,8 @@ import {
 } from "react";
 import {
   MOUNTAIN_BIOME_LABELS,
+  getMountainBiomeLabel,
+  getMountainClimateZoneLabel,
   loadHeightmapFile,
   loadHeightmapImage,
   getHeightmapFitResolution,
@@ -44,11 +47,13 @@ import { ForestRenderControls } from "./ForestRenderControls";
 import { NumericControl } from "./NumericControl";
 import { InspectorColor, InspectorFold, InspectorNote, InspectorSection, InspectorSeed, InspectorSelect, InspectorToggle } from "./InspectorParts";
 import { Check, ChevronDown, Crop, Download, Hand, Minus, PanelRightClose, PanelRightOpen, Plus, RotateCcw, Ruler, X } from "lucide-react";
-import type {
-  RasterPropBiomeSettings,
-  VegetationMotifAsset,
-  VegetationRasterPropAsset,
-  VegetationPatternPreset,
+import {
+  propStandStyleForBiome,
+  rasterPropSettingsForBiome,
+  type RasterPropBiomeSettings,
+  type VegetationMotifAsset,
+  type VegetationRasterPropAsset,
+  type VegetationPatternPreset,
 } from "../rendering/vegetationRenderer";
 import {
   buildVisualWaterSurfaceDEM,
@@ -121,6 +126,15 @@ import { downloadGrayscale16BitPng } from "../utils/heightmapExport";
 import defaultHeightmapUrl from "../assets/nz-linz-dem.tif";
 import currentSettingsText from "../../currentSettings?raw";
 const baselineSettings = JSON.parse(currentSettingsText) as Record<string, unknown>;
+/** Default tree, shrub and clustering values of one biome, for the inspector's reset. */
+function baselineRasterPropSettings(biome: number) {
+  return rasterPropSettingsForBiome({
+    rasterPropDensity: baselineSettings.vegetationRasterPropDensity as number | undefined,
+    rasterPropClustering: baselineSettings.vegetationRasterPropClustering as number | undefined,
+    rasterPropBiomeSettings: baselineSettings.vegetationRasterPropBiomeSettings as RasterPropBiomeSettings | undefined,
+    wetlandShrubDensity: baselineSettings.vegetationWetlandShrubDensity as number | undefined,
+  }, biome);
+}
 import { calibrateBundledMountainHeightmap } from "../terrain/mountainHeightmapCalibration";
 
 const EPICENTER_WAVES_ENABLED = false;
@@ -250,12 +264,24 @@ const MOUNTAIN_PALETTE_BIOME_IDS = Array.from(
 );
 const MOUNTAIN_REFERENCE_LINE_COLORS = {
   vegetationInk: "#2b3842",
+  aridInk: "#3a2b1e",
   forestOutline: "#283b29",
   mountainHatch: "#2b3842",
   mountainRidge: "#2b3842",
   waterOutline: "#173a58",
   waterFlow: "#1f405a",
 } as const;
+
+/** Biome colours that used to be the default, kept so saved copies of them upgrade. */
+const RETIRED_BIOME_DEFAULT_COLORS: Readonly<Record<number, string>> = {
+  15: "#d8b878",
+};
+
+/** Eight-point compass name for a bearing in degrees. */
+function compassLabel(degrees: number): string {
+  const names = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+  return names[Math.round((((degrees % 360) + 360) % 360) / 45) % 8];
+}
 
 function createReferenceBiomeColorState(): Record<number, string> {
   return MOUNTAIN_PALETTE_BIOME_IDS.reduce<Record<number, string>>(
@@ -277,6 +303,21 @@ interface MountainDetailSettingsSnapshot {
   vegetationPatternScale: number;
   vegetationSwirlStrength: number;
   vegetationTerrainFollowing: number;
+  vegetationDesertDunes: boolean;
+  vegetationDesertDuneSpacingKm: number;
+  vegetationDesertHighlight: number;
+  vegetationDesertWashShadow: number;
+  vegetationDesertLineBreaks: number;
+  vegetationDesertDots: number;
+  vegetationDesertColorVariation: number;
+  vegetationDesertColorScaleKm: number;
+  vegetationDesertSpotColor: string;
+  vegetationDesertCrestScallop: number;
+  vegetationDesertTerrainFollowing: number;
+  vegetationDesertShadowLength: number;
+  vegetationDesertShadowStrength: number;
+  vegetationDesertHatchDensity: number;
+  vegetationDesertRippleLines: number;
   vegetationStrokeLength: number;
   vegetationStrokeThickness: number;
   vegetationStrokeOpacity: number;
@@ -296,6 +337,7 @@ interface MountainDetailSettingsSnapshot {
   forestSettings: ForestRenderSettings;
   forestSourceZoom: number;
   vegetationInkColor: string;
+  vegetationAridInkColor: string;
   forestOutlineColor: string;
   mountainHatchColor: string;
   mountainRidgeColor: string;
@@ -421,16 +463,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+/**
+ * Reads a saved number. [min, max] is the control's slider range, which typed values may exceed,
+ * so an unsigned range only rejects negatives; `hard` clamps to [min, max] for true limits.
+ */
 function readStoredNumber(
   source: Record<string, unknown>,
   key: string,
   fallback: number,
   min: number,
   max: number,
+  hard = false,
 ): number {
   const value = source[key];
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
-  return Math.max(min, Math.min(max, value));
+  if (hard) return Math.max(min, Math.min(max, value));
+  return min >= 0 ? Math.max(0, value) : value;
 }
 
 function readStoredBoolean(
@@ -590,6 +638,21 @@ export function MountainDetailStudio({
   const [vegetationPatternScale, setVegetationPatternScale] = useState<number>(1);
   const [vegetationSwirlStrength, setVegetationSwirlStrength] = useState<number>(0.65);
   const [vegetationTerrainFollowing, setVegetationTerrainFollowing] = useState<number>(0.35);
+  const [vegetationDesertDunes, setVegetationDesertDunes] = useState<boolean>(DESERT_DUNE_DEFAULTS.enabled);
+  const [vegetationDesertDuneSpacingKm, setVegetationDesertDuneSpacingKm] = useState<number>(DESERT_DUNE_DEFAULTS.spacingKm);
+  const [vegetationDesertHighlight, setVegetationDesertHighlight] = useState<number>(DESERT_DUNE_DEFAULTS.highlight);
+  const [vegetationDesertWashShadow, setVegetationDesertWashShadow] = useState<number>(DESERT_DUNE_DEFAULTS.washShadow);
+  const [vegetationDesertLineBreaks, setVegetationDesertLineBreaks] = useState<number>(DESERT_DUNE_DEFAULTS.lineBreaks);
+  const [vegetationDesertDots, setVegetationDesertDots] = useState<number>(DESERT_DUNE_DEFAULTS.dots);
+  const [vegetationDesertColorVariation, setVegetationDesertColorVariation] = useState<number>(DESERT_DUNE_DEFAULTS.colorVariation);
+  const [vegetationDesertColorScaleKm, setVegetationDesertColorScaleKm] = useState<number>(DESERT_DUNE_DEFAULTS.colorScaleKm);
+  const [vegetationDesertSpotColor, setVegetationDesertSpotColor] = useState<string>(DESERT_DEFAULT_SPOT_COLOR);
+  const [vegetationDesertCrestScallop, setVegetationDesertCrestScallop] = useState<number>(DESERT_DUNE_DEFAULTS.crestScallop);
+  const [vegetationDesertTerrainFollowing, setVegetationDesertTerrainFollowing] = useState<number>(DESERT_DUNE_DEFAULTS.terrainFollowing);
+  const [vegetationDesertShadowLength, setVegetationDesertShadowLength] = useState<number>(DESERT_DUNE_DEFAULTS.shadowLength);
+  const [vegetationDesertShadowStrength, setVegetationDesertShadowStrength] = useState<number>(DESERT_DUNE_DEFAULTS.shadowStrength);
+  const [vegetationDesertHatchDensity, setVegetationDesertHatchDensity] = useState<number>(DESERT_DUNE_DEFAULTS.hatchDensity);
+  const [vegetationDesertRippleLines, setVegetationDesertRippleLines] = useState<number>(DESERT_DUNE_DEFAULTS.rippleLines);
   const [vegetationStrokeLength, setVegetationStrokeLength] = useState<number>(1);
   const [vegetationStrokeThickness, setVegetationStrokeThickness] = useState<number>(1);
   const [vegetationStrokeOpacity, setVegetationStrokeOpacity] = useState<number>(0.72);
@@ -617,15 +680,29 @@ export function MountainDetailStudio({
     useState<number>(VEGETATION_RASTER_PROP_PLACEMENT_NOISE_SCALE);
   const [forestSettings, setForestSettings] = useState<ForestRenderSettings>(readInitialForestRenderSettings);
   const [forestSourceZoom, setForestSourceZoom] = useState(1);
-  const selectedRasterDensity = vegetationRasterPropBiomeSettings[rasterPropBiome]?.density ?? vegetationRasterPropDensity;
-  const selectedRasterClustering = vegetationRasterPropBiomeSettings[rasterPropBiome]?.clustering ?? vegetationRasterPropClustering;
-  const updateRasterBiome = (setting: "density" | "clustering", value: number) => {
+  const selectedRasterSettings = rasterPropSettingsForBiome({
+    rasterPropDensity: vegetationRasterPropDensity,
+    rasterPropClustering: vegetationRasterPropClustering,
+    rasterPropBiomeSettings: vegetationRasterPropBiomeSettings,
+    wetlandShrubDensity: vegetationWetlandShrubDensity,
+  }, rasterPropBiome);
+  const baselineRasterSettings = baselineRasterPropSettings(rasterPropBiome);
+  const selectedStandStyle = propStandStyleForBiome(
+    forestSettings, vegetationRasterPropBiomeSettings, rasterPropBiome,
+  );
+  const updateRasterBiome = <K extends keyof NonNullable<RasterPropBiomeSettings[number]>>(
+    setting: K,
+    value: NonNullable<RasterPropBiomeSettings[number]>[K],
+  ) => {
     setVegetationRasterPropBiomeSettings(previous => ({
       ...previous, [rasterPropBiome]: { ...previous[rasterPropBiome], [setting]: value },
     }));
   };
   const [vegetationInkColor, setVegetationInkColor] = useState<string>(
     MOUNTAIN_REFERENCE_LINE_COLORS.vegetationInk,
+  );
+  const [vegetationAridInkColor, setVegetationAridInkColor] = useState<string>(
+    MOUNTAIN_REFERENCE_LINE_COLORS.aridInk,
   );
   const [forestOutlineColor, setForestOutlineColor] = useState<string>(
     MOUNTAIN_REFERENCE_LINE_COLORS.forestOutline,
@@ -699,7 +776,7 @@ export function MountainDetailStudio({
   // Hydrology & Micro-climate Controls
   const [showHeightmapWater, setShowHeightmapWater] = useState(false);
   const [showRivers, setShowRivers] = useState<boolean>(true);
-  const [riverThresholdKm2, setRiverThresholdKm2] = useState<number>(4);
+  const [riverThresholdKm2, setRiverThresholdKm2] = useState<number>(16);
   const [showWaterDetails, setShowWaterDetails] = useState<boolean>(true);
   const [showOceanDetails, setShowOceanDetails] = useState<boolean>(true);
   const [showWetlandPuddleContours, setShowWetlandPuddleContours] =
@@ -751,17 +828,17 @@ export function MountainDetailStudio({
     MOUNTAIN_REFERENCE_LINE_COLORS.waterFlow,
   );
   const [wetlandElevationThresholdM, setWetlandElevationThresholdM] =
-    useState<number>(400);
-  const [biomeRegionScaleKm, setBiomeRegionScaleKm] = useState<number>(1.0);
-  const [waterStageScale, setWaterStageScale] = useState<number>(1.2);
-  const [flowRateScale, setFlowRateScale] = useState<number>(0.45);
-  const [waterLandscapeImpact, setWaterLandscapeImpact] = useState<number>(0.7);
+    useState<number>(454);
+  const [biomeRegionScaleKm, setBiomeRegionScaleKm] = useState<number>(0.01);
+  const [waterStageScale, setWaterStageScale] = useState<number>(0.8);
+  const [flowRateScale, setFlowRateScale] = useState<number>(0.9);
+  const [waterLandscapeImpact, setWaterLandscapeImpact] = useState<number>(1);
   const [waterEvolutionStep, setWaterEvolutionStep] = useState<number>(0);
   const [rainOverlayOpacity, setRainOverlayOpacity] = useState<number>(0.0);
   const [windAzimuthDeg, setWindAzimuthDeg] = useState<number>(225);
   const [windSpeedMs, setWindSpeedMs] = useState<number>(16);
-  const [basePrecipMm, setBasePrecipMm] = useState<number>(1400);
-  const [baseTemperatureC, setBaseTemperatureC] = useState<number>(18);
+  const [basePrecipMm, setBasePrecipMm] = useState<number>(1500);
+  const [baseTemperatureC, setBaseTemperatureC] = useState<number>(17);
 
   // Contours
   const [showContours, setShowContours] = useState<boolean>(false);
@@ -888,6 +965,8 @@ export function MountainDetailStudio({
     tempC: number;
     solarFlux: number;
     biomeName: string;
+    climateZone: string;
+    heightAboveRiverM: number;
   } | null>(null);
   const [settingsReady, setSettingsReady] = useState<boolean>(false);
   const waterSnapshotResolversRef = useRef(
@@ -1141,11 +1220,26 @@ export function MountainDetailStudio({
           ["adaptive", "grass", "reeds", "shrub", "universal"] as const,
         ),
       );
-      setVegetationSeed(readStoredNumber(stored, "vegetationSeed", 23817, 0, 2147483647));
+      setVegetationSeed(readStoredNumber(stored, "vegetationSeed", 23817, 0, 2147483647, true));
       setVegetationDensity(readStoredNumber(stored, "vegetationDensity", 1, 0, INSPECTOR_BOUNDS.groundDensity));
       setVegetationPatternScale(readStoredNumber(stored, "vegetationPatternScale", 1, 0.5, INSPECTOR_BOUNDS.patternScale));
       setVegetationSwirlStrength(readStoredNumber(stored, "vegetationSwirlStrength", 0.65, 0, 1));
       setVegetationTerrainFollowing(readStoredNumber(stored, "vegetationTerrainFollowing", 0.35, 0, 1));
+      setVegetationDesertDunes(readStoredBoolean(stored, "vegetationDesertDunes", DESERT_DUNE_DEFAULTS.enabled));
+      setVegetationDesertDuneSpacingKm(readStoredNumber(stored, "vegetationDesertDuneSpacingKm", DESERT_DUNE_DEFAULTS.spacingKm, 0.05, 50));
+      setVegetationDesertHighlight(readStoredNumber(stored, "vegetationDesertHighlight", DESERT_DUNE_DEFAULTS.highlight, 0, 1));
+      setVegetationDesertWashShadow(readStoredNumber(stored, "vegetationDesertWashShadow", DESERT_DUNE_DEFAULTS.washShadow, 0, 1));
+      setVegetationDesertLineBreaks(readStoredNumber(stored, "vegetationDesertLineBreaks", DESERT_DUNE_DEFAULTS.lineBreaks, 0, 1));
+      setVegetationDesertDots(readStoredNumber(stored, "vegetationDesertDots", DESERT_DUNE_DEFAULTS.dots, 0, 1));
+      setVegetationDesertColorVariation(readStoredNumber(stored, "vegetationDesertColorVariation", DESERT_DUNE_DEFAULTS.colorVariation, 0, 1));
+      setVegetationDesertColorScaleKm(readStoredNumber(stored, "vegetationDesertColorScaleKm", DESERT_DUNE_DEFAULTS.colorScaleKm, 0.2, 200));
+      setVegetationDesertSpotColor(readStoredColor(stored, "vegetationDesertSpotColor", DESERT_DEFAULT_SPOT_COLOR));
+      setVegetationDesertCrestScallop(readStoredNumber(stored, "vegetationDesertCrestScallop", DESERT_DUNE_DEFAULTS.crestScallop, 0, 1));
+      setVegetationDesertTerrainFollowing(readStoredNumber(stored, "vegetationDesertTerrainFollowing", DESERT_DUNE_DEFAULTS.terrainFollowing, 0, 1));
+      setVegetationDesertShadowLength(readStoredNumber(stored, "vegetationDesertShadowLength", DESERT_DUNE_DEFAULTS.shadowLength, 0.05, 0.45));
+      setVegetationDesertShadowStrength(readStoredNumber(stored, "vegetationDesertShadowStrength", DESERT_DUNE_DEFAULTS.shadowStrength, 0, 1));
+      setVegetationDesertHatchDensity(readStoredNumber(stored, "vegetationDesertHatchDensity", DESERT_DUNE_DEFAULTS.hatchDensity, 0.25, 3));
+      setVegetationDesertRippleLines(readStoredNumber(stored, "vegetationDesertRippleLines", DESERT_DUNE_DEFAULTS.rippleLines, 0, 3));
       setVegetationStrokeLength(readStoredNumber(stored, "vegetationStrokeLength", 1, 0.4, INSPECTOR_BOUNDS.strokeLength));
       setVegetationStrokeThickness(readStoredNumber(stored, "vegetationStrokeThickness", 1, 0.1, 3));
       setVegetationStrokeOpacity(readStoredNumber(stored, "vegetationStrokeOpacity", 0.72, 0, 1));
@@ -1165,9 +1259,17 @@ export function MountainDetailStudio({
           if (!isRecord(entry)) continue;
           restored[biome] = {};
           if (typeof entry.density === "number" && Number.isFinite(entry.density))
-            restored[biome]!.density = Math.max(0, Math.min(INSPECTOR_BOUNDS.propDensity, entry.density));
+            restored[biome]!.density = Math.max(0, entry.density);
+          for (const key of ["treeDensity", "shrubDensity", "shrubTreeShare"] as const) {
+            const value = entry[key];
+            if (typeof value === "number" && Number.isFinite(value)) restored[biome]![key] = Math.max(0, value);
+          }
           if (typeof entry.clustering === "number" && Number.isFinite(entry.clustering))
             restored[biome]!.clustering = Math.max(0, Math.min(1, entry.clustering));
+          for (const key of ["treeColor", "shrubColor"] as const) {
+            const value = entry[key];
+            if (typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value)) restored[biome]![key] = value;
+          }
         }
         setVegetationRasterPropBiomeSettings(restored);
       }
@@ -1203,7 +1305,7 @@ export function MountainDetailStudio({
       );
       const storedForestScale = stored.vegetationRasterPropScale;
       if (typeof storedForestScale === "number" && Number.isFinite(storedForestScale)) {
-        setVegetationRasterPropScale(Math.max(INSPECTOR_BOUNDS.propScaleMin, Math.min(4, storedForestScale)));
+        setVegetationRasterPropScale(storedForestScale > 0 ? storedForestScale : 1);
       } else {
         // Migrate the former pixel-valued control once. A legacy value of 16
         // becomes the map-relative 1× reference crown.
@@ -1213,6 +1315,7 @@ export function MountainDetailStudio({
           FOREST_TREE_REFERENCE_CELL_SIZE,
           4,
           64,
+          true,
         );
         setVegetationRasterPropScale(
           Math.max(0.25, Math.min(4, legacyCellSize / FOREST_TREE_REFERENCE_CELL_SIZE)),
@@ -1252,6 +1355,13 @@ export function MountainDetailStudio({
           MOUNTAIN_REFERENCE_LINE_COLORS.vegetationInk,
         ),
       );
+      setVegetationAridInkColor(
+        readStoredColor(
+          stored,
+          "vegetationAridInkColor",
+          MOUNTAIN_REFERENCE_LINE_COLORS.aridInk,
+        ),
+      );
       setForestOutlineColor(
         readStoredColor(
           stored,
@@ -1281,7 +1391,14 @@ export function MountainDetailStudio({
         const restored = createReferenceBiomeColorState();
         for (const biomeId of MOUNTAIN_PALETTE_BIOME_IDS) {
           const savedColor = savedBiomeColors[String(biomeId)];
-          if (isHexColor(savedColor)) restored[biomeId] = savedColor;
+          // A saved value equal to a retired default was never a deliberate
+          // choice, so it takes the current default instead.
+          if (
+            isHexColor(savedColor) &&
+            RETIRED_BIOME_DEFAULT_COLORS[biomeId] !== savedColor.toLowerCase()
+          ) {
+            restored[biomeId] = savedColor;
+          }
         }
         setVegetationBiomeColors(restored);
       }
@@ -1333,17 +1450,18 @@ export function MountainDetailStudio({
           MOUNTAIN_DEFAULT_OUTPUT_LONG_EDGE,
           MIN_MOUNTAIN_RENDER_RESOLUTION,
           MAX_MOUNTAIN_RENDER_RESOLUTION,
+          true,
         ),
       );
       setHeightmapSmoothingPasses(
-        readStoredNumber(stored, "heightmapSmoothingPasses", 1, 0, 4),
+        readStoredNumber(stored, "heightmapSmoothingPasses", 1, 0, 4, true),
       );
       setSunAzimuthDeg(readStoredNumber(stored, "sunAzimuthDeg", MOUNTAIN_DEFAULT_SUN_AZIMUTH_DEG, 0, 360));
-      setSunAltitudeDeg(readStoredNumber(stored, "sunAltitudeDeg", 45, 10, 90));
+      setSunAltitudeDeg(readStoredNumber(stored, "sunAltitudeDeg", 45, 0, 90, true));
       setMountainLightingMode(
         readStoredEnum(stored, "mountainLightingMode", "two-tone", ["two-tone", "three-tone", "continuous"] as const),
       );
-      setMountainViewAngleDeg(readStoredNumber(stored, "mountainViewAngleDeg", 78, 75, 90));
+      setMountainViewAngleDeg(readStoredNumber(stored, "mountainViewAngleDeg", 78, 1, 90, true));
       setMountainHeightExaggeration(
         readStoredNumber(stored, "mountainHeightExaggeration", 1, 1, 2),
       );
@@ -1408,7 +1526,7 @@ export function MountainDetailStudio({
         readStoredBoolean(stored, "fullTerrainCameraEnabled", true),
       );
       setFullTerrainCameraElevationDeg(
-        readStoredNumber(stored, "fullTerrainCameraElevationDeg", 75, 30, 85),
+        readStoredNumber(stored, "fullTerrainCameraElevationDeg", 75, 1, 89, true),
       );
       setFullTerrainCameraHeightExaggeration(
         readStoredNumber(stored, "fullTerrainCameraHeightExaggeration", 1, 0.25, 3),
@@ -1431,7 +1549,7 @@ export function MountainDetailStudio({
       setShowHeightmapWater(readStoredBoolean(stored, "showHeightmapWater", false));
       setShowRivers(readStoredBoolean(stored, "showRivers", true));
       setRiverThresholdKm2(
-        readStoredNumber(stored, "riverThresholdKm2", 4, 0.25, 20),
+        readStoredNumber(stored, "riverThresholdKm2", 16, 1, 200),
       );
       setShowWaterDetails(readStoredBoolean(stored, "showWaterDetails", true));
       setShowOceanDetails(readStoredBoolean(stored, "showOceanDetails", true));
@@ -1445,7 +1563,7 @@ export function MountainDetailStudio({
         readStoredNumber(stored, "siltTopRemoved", DEFAULT_SILT_TOP_REMOVED, 0, 4),
       );
       setSiltLayers(
-        readStoredNumber(stored, "siltLayers", DEFAULT_SILT_LAYERS, 1, 10),
+        readStoredNumber(stored, "siltLayers", DEFAULT_SILT_LAYERS, 1, Infinity, true),
       );
       setWetlandPuddleDensity(
         readStoredNumber(stored, "wetlandPuddleDensity", 0.85, 0, 2),
@@ -1468,9 +1586,9 @@ export function MountainDetailStudio({
         ),
       );
       setWetlandPuddleSeed(
-        readStoredNumber(stored, "wetlandPuddleSeed", 23817, 0, 2147483647),
+        readStoredNumber(stored, "wetlandPuddleSeed", 23817, 0, 2147483647, true),
       );
-      setOceanRippleCount(readStoredNumber(stored, "oceanRippleCount", 5, 1, 12));
+      setOceanRippleCount(readStoredNumber(stored, "oceanRippleCount", 5, 1, 12, true));
       setDeepOceanSwells(readStoredBoolean(stored, "deepOceanSwells", true));
       setDeepOceanSwellDensity(readStoredNumber(stored, "deepOceanSwellDensity", 0.18, 0, 1.0));
       setLakeFullDepthM(readStoredNumber(stored, "lakeFullDepthM", 15, 1, 200));
@@ -1518,7 +1636,7 @@ export function MountainDetailStudio({
         setCustomEpicenters(loaded);
       }
       setWaterFillSmoothing(
-        readStoredNumber(stored, "waterFillSmoothing", 1, 0, 4),
+        readStoredNumber(stored, "waterFillSmoothing", 1, 0, 4, true),
       );
       setWaterTerrainShadeStrength(
         readStoredNumber(stored, "waterTerrainShadeStrength", 0.7, 0, 1),
@@ -1530,7 +1648,7 @@ export function MountainDetailStudio({
         readStoredNumber(stored, "waterOutlineLength", 1, 0.2, 10),
       );
       setWaterOutlineSmoothing(
-        readStoredNumber(stored, "waterOutlineSmoothing", 1, 0, 4),
+        readStoredNumber(stored, "waterOutlineSmoothing", 1, 0, 4, true),
       );
       setWaterOutlineOpacity(
         readStoredNumber(stored, "waterOutlineOpacity", 0.92, 0, 1),
@@ -1545,7 +1663,7 @@ export function MountainDetailStudio({
         readStoredNumber(stored, "waterFlowThickness", 1.0, 0.2, 3),
       );
       setWaterFlowSmoothing(
-        readStoredNumber(stored, "waterFlowSmoothing", 1, 0, 4),
+        readStoredNumber(stored, "waterFlowSmoothing", 1, 0, 4, true),
       );
       setWaterFlowOpacity(
         readStoredNumber(stored, "waterFlowOpacity", 0.82, 0, 1),
@@ -1565,20 +1683,20 @@ export function MountainDetailStudio({
         ),
       );
       setWetlandElevationThresholdM(
-        readStoredNumber(stored, "wetlandElevationThresholdM", 400, 0, 3000),
+        readStoredNumber(stored, "wetlandElevationThresholdM", 454, 0, 3000),
       );
       setBiomeRegionScaleKm(
-        readStoredNumber(stored, "biomeRegionScaleKm", 1.0, 0.01, 1),
+        readStoredNumber(stored, "biomeRegionScaleKm", 0.01, 0.01, 1),
       );
       setWaterStageScale(
-        readStoredNumber(stored, "waterStageScale", 1.2, 0.3, 3),
+        readStoredNumber(stored, "waterStageScale", 0.8, 0.3, 3),
       );
-      setFlowRateScale(readStoredNumber(stored, "flowRateScale", 0.45, 0.2, 1));
+      setFlowRateScale(readStoredNumber(stored, "flowRateScale", 0.9, 0.2, 1));
       setWaterLandscapeImpact(
-        readStoredNumber(stored, "waterLandscapeImpact", 0.7, 0.1, 1),
+        readStoredNumber(stored, "waterLandscapeImpact", 1, 0.1, 1),
       );
       setWaterEvolutionStep(
-        readStoredNumber(stored, "waterEvolutionStep", 0, 0, MOUNTAIN_WATER_EVOLUTION_STEPS),
+        readStoredNumber(stored, "waterEvolutionStep", 0, 0, MOUNTAIN_WATER_EVOLUTION_STEPS, true),
       );
       setRainOverlayOpacity(
         readStoredNumber(stored, "rainOverlayOpacity", 0, 0, 1),
@@ -1588,17 +1706,17 @@ export function MountainDetailStudio({
       );
       setWindSpeedMs(readStoredNumber(stored, "windSpeedMs", 16, 0, 60));
       setBasePrecipMm(
-        readStoredNumber(stored, "basePrecipMm", 1400, 300, 4000),
+        readStoredNumber(stored, "basePrecipMm", 1500, 100, 4000),
       );
       setBaseTemperatureC(
-        readStoredNumber(stored, "baseTemperatureC", 18, -10, 30),
+        readStoredNumber(stored, "baseTemperatureC", 17, -10, 30),
       );
       setShowContours(readStoredBoolean(stored, "showContours", false));
       setContourIntervalM(
-        readStoredNumber(stored, "contourIntervalM", 100, 1, 1000),
+        readStoredNumber(stored, "contourIntervalM", 100, 1, 1000, true),
       );
       setContourSmoothingPasses(
-        readStoredNumber(stored, "contourSmoothingPasses", 0, 0, 4),
+        readStoredNumber(stored, "contourSmoothingPasses", 0, 0, 4, true),
       );
       setContourThicknessM(
         readStoredNumber(stored, "contourThicknessM", 4, 1, 16),
@@ -1610,7 +1728,7 @@ export function MountainDetailStudio({
         readStoredBoolean(stored, "showIndexContours", true),
       );
       setContourIndexEvery(
-        readStoredNumber(stored, "contourIndexEvery", 5, 2, 10),
+        readStoredNumber(stored, "contourIndexEvery", 5, 2, 10, true),
       );
       setContourOpacity(readStoredNumber(stored, "contourOpacity", 1, 0, 1));
       setContourColor(readStoredString(stored, "contourColor", "#3c3c3c"));
@@ -1618,12 +1736,12 @@ export function MountainDetailStudio({
         readStoredString(stored, "contourIndexColor", "#282828"),
       );
       setAnimateWater(readStoredBoolean(stored, "animateWater", false));
-      setZoom(readStoredNumber(stored, "zoom", MOUNTAIN_DEFAULT_VIEW_ZOOM, 0.4, 6));
+      setZoom(readStoredNumber(stored, "zoom", MOUNTAIN_DEFAULT_VIEW_ZOOM, 0.4, 6, true));
 
       if (isRecord(stored.pan)) {
         setPan({
-          x: readStoredNumber(stored.pan, "x", 0, -10000, 10000),
-          y: readStoredNumber(stored.pan, "y", 0, -10000, 10000),
+          x: readStoredNumber(stored.pan, "x", 0, -10000, 10000, true),
+          y: readStoredNumber(stored.pan, "y", 0, -10000, 10000, true),
         });
       }
     }
@@ -1646,6 +1764,21 @@ export function MountainDetailStudio({
       vegetationPatternScale,
       vegetationSwirlStrength,
       vegetationTerrainFollowing,
+      vegetationDesertDunes,
+      vegetationDesertDuneSpacingKm,
+      vegetationDesertHighlight,
+      vegetationDesertWashShadow,
+      vegetationDesertLineBreaks,
+      vegetationDesertDots,
+      vegetationDesertColorVariation,
+      vegetationDesertColorScaleKm,
+      vegetationDesertSpotColor,
+      vegetationDesertCrestScallop,
+      vegetationDesertTerrainFollowing,
+      vegetationDesertShadowLength,
+      vegetationDesertShadowStrength,
+      vegetationDesertHatchDensity,
+      vegetationDesertRippleLines,
       vegetationStrokeLength,
       vegetationStrokeThickness,
       vegetationStrokeOpacity,
@@ -1665,6 +1798,7 @@ export function MountainDetailStudio({
       forestSettings,
       forestSourceZoom,
       vegetationInkColor,
+      vegetationAridInkColor,
       forestOutlineColor,
       mountainHatchColor,
       mountainRidgeColor,
@@ -1811,6 +1945,21 @@ export function MountainDetailStudio({
     vegetationPatternScale,
     vegetationSwirlStrength,
     vegetationTerrainFollowing,
+    vegetationDesertDunes,
+    vegetationDesertDuneSpacingKm,
+    vegetationDesertHighlight,
+    vegetationDesertWashShadow,
+    vegetationDesertLineBreaks,
+    vegetationDesertDots,
+    vegetationDesertColorVariation,
+    vegetationDesertColorScaleKm,
+    vegetationDesertSpotColor,
+    vegetationDesertCrestScallop,
+    vegetationDesertTerrainFollowing,
+    vegetationDesertShadowLength,
+    vegetationDesertShadowStrength,
+    vegetationDesertHatchDensity,
+    vegetationDesertRippleLines,
     vegetationStrokeLength,
     vegetationStrokeThickness,
     vegetationStrokeOpacity,
@@ -1819,6 +1968,7 @@ export function MountainDetailStudio({
     vegetationMotifDensity,
     vegetationMotifSize,
     vegetationInkColor,
+    vegetationAridInkColor,
     forestOutlineColor,
     mountainHatchColor,
     mountainRidgeColor,
@@ -2280,6 +2430,23 @@ export function MountainDetailStudio({
         patternScale: vegetationPatternScale,
         swirlStrength: vegetationSwirlStrength,
         terrainFollowing: vegetationTerrainFollowing,
+        desertDunes: vegetationDesertDunes,
+        desertDuneSpacingKm: vegetationDesertDuneSpacingKm,
+        // Crests run across the climate wind (Rivers and climate > Wind direction).
+        desertWindFromDeg: windAzimuthDeg,
+        desertHighlight: vegetationDesertHighlight,
+        desertWashShadow: vegetationDesertWashShadow,
+        desertLineBreaks: vegetationDesertLineBreaks,
+        desertDots: vegetationDesertDots,
+        desertColorVariation: vegetationDesertColorVariation,
+        desertColorScaleKm: vegetationDesertColorScaleKm,
+        desertSpotColor: vegetationDesertSpotColor,
+        desertCrestScallop: vegetationDesertCrestScallop,
+        desertTerrainFollowing: vegetationDesertTerrainFollowing,
+        desertShadowLength: vegetationDesertShadowLength,
+        desertShadowStrength: vegetationDesertShadowStrength,
+        desertHatchDensity: vegetationDesertHatchDensity,
+        desertRippleLines: vegetationDesertRippleLines,
         strokeLength: vegetationStrokeLength,
         strokeThickness: vegetationStrokeThickness,
         strokeOpacity: vegetationStrokeOpacity,
@@ -2305,6 +2472,7 @@ export function MountainDetailStudio({
         outlineColor: forestOutlineColor,
       },
         inkColor: vegetationInkColor,
+        aridInkColor: vegetationAridInkColor,
         flowWashStrength: vegetationFlowWashStrength,
         flowWashDarkStrength: vegetationFlowWashDarkStrength,
         flowWashLightStrength: vegetationFlowWashLightStrength,
@@ -2599,6 +2767,22 @@ export function MountainDetailStudio({
     vegetationPatternScale,
     vegetationSwirlStrength,
     vegetationTerrainFollowing,
+    vegetationDesertDunes,
+    vegetationDesertDuneSpacingKm,
+    windAzimuthDeg,
+    vegetationDesertHighlight,
+    vegetationDesertWashShadow,
+    vegetationDesertLineBreaks,
+    vegetationDesertDots,
+    vegetationDesertColorVariation,
+    vegetationDesertColorScaleKm,
+    vegetationDesertSpotColor,
+    vegetationDesertCrestScallop,
+    vegetationDesertTerrainFollowing,
+    vegetationDesertShadowLength,
+    vegetationDesertShadowStrength,
+    vegetationDesertHatchDensity,
+    vegetationDesertRippleLines,
     vegetationStrokeLength,
     vegetationStrokeThickness,
     vegetationStrokeOpacity,
@@ -2607,6 +2791,7 @@ export function MountainDetailStudio({
     vegetationMotifDensity,
     vegetationMotifSize,
     vegetationInkColor,
+    vegetationAridInkColor,
     forestOutlineColor,
     vegetationFlowWashStrength,
     vegetationFlowWashDarkStrength,
@@ -2801,24 +2986,6 @@ export function MountainDetailStudio({
     const { px, py } = getCanvasRelativeCoords(e);
     const idx = py * demData.width + px;
 
-    const biomeLabels = [
-      "Glacier & Permanent Snow",
-      "Alpine Bare Rock & Arête Scree",
-      "Alpine Tundra & Meadow",
-      "Subalpine Conifer Forest",
-      "Montane Broadleaf Woodland",
-      "Riparian Canyon Shrubland",
-      "Braided River Fan & Channels",
-      "Valley Floodplain & Wetland",
-      "Ocean",
-      "River Silt & Alluvial Soil",
-      "River Rock & Scree Bank",
-      "Sandy Beach",
-      "Silty Beach & River Mouth",
-      "Rocky Shore",
-      "Coastal Cliff",
-    ];
-
     setHoverInfo({
       x: px,
       y: py,
@@ -2834,7 +3001,9 @@ export function MountainDetailStudio({
       precipMm: demData.precipitationMmYr[idx],
       tempC: demData.temperatureC[idx],
       solarFlux: demData.solarInsolation[idx],
-      biomeName: biomeLabels[demData.biomeType[idx]] || "Alpine",
+      biomeName: getMountainBiomeLabel(demData.biomeType[idx]),
+      climateZone: getMountainClimateZoneLabel(demData, idx),
+      heightAboveRiverM: demData.heightAboveDrainageM?.[idx] ?? Number.POSITIVE_INFINITY,
     });
 
     if (isDrawingProfile && profileA) {
@@ -3207,6 +3376,23 @@ export function MountainDetailStudio({
           patternScale: vegetationPatternScale,
           swirlStrength: vegetationSwirlStrength,
           terrainFollowing: vegetationTerrainFollowing,
+        desertDunes: vegetationDesertDunes,
+        desertDuneSpacingKm: vegetationDesertDuneSpacingKm,
+        // Crests run across the climate wind (Rivers and climate > Wind direction).
+        desertWindFromDeg: windAzimuthDeg,
+        desertHighlight: vegetationDesertHighlight,
+        desertWashShadow: vegetationDesertWashShadow,
+        desertLineBreaks: vegetationDesertLineBreaks,
+        desertDots: vegetationDesertDots,
+        desertColorVariation: vegetationDesertColorVariation,
+        desertColorScaleKm: vegetationDesertColorScaleKm,
+        desertSpotColor: vegetationDesertSpotColor,
+        desertCrestScallop: vegetationDesertCrestScallop,
+        desertTerrainFollowing: vegetationDesertTerrainFollowing,
+        desertShadowLength: vegetationDesertShadowLength,
+        desertShadowStrength: vegetationDesertShadowStrength,
+        desertHatchDensity: vegetationDesertHatchDensity,
+        desertRippleLines: vegetationDesertRippleLines,
           strokeLength: vegetationStrokeLength,
           strokeThickness: vegetationStrokeThickness,
           strokeOpacity: vegetationStrokeOpacity,
@@ -3232,6 +3418,7 @@ export function MountainDetailStudio({
              outlineColor: forestOutlineColor,
            },
           inkColor: vegetationInkColor,
+        aridInkColor: vegetationAridInkColor,
           flowWashStrength: vegetationFlowWashStrength,
           flowWashDarkStrength: vegetationFlowWashDarkStrength,
           flowWashLightStrength: vegetationFlowWashLightStrength,
@@ -3487,11 +3674,15 @@ export function MountainDetailStudio({
 
   const commitAnalysisControls = () =>
     setAnalysisCommitVersion((version) => version + 1);
-  /** One inspector number row; `commit` regenerates terrain on release, `key` names the currentSettings reset value. */
+  /**
+   * One inspector number row; `commit` regenerates terrain on release, `key` names the currentSettings reset value.
+   * Typed values may leave the slider range; `limits` sets hard bounds where a value would be invalid.
+   */
   const num = (label: string, value: number, onChange: (value: number) => void, min: number, max: number, step: number,
-    options: { unit?: string; key?: string; commit?: boolean; log?: boolean; power?: number; disabled?: boolean; title?: string } = {}) =>
+    options: { unit?: string; key?: string; commit?: boolean; log?: boolean; power?: number; disabled?: boolean; title?: string;
+      limits?: readonly [number, number] } = {}) =>
     <NumericControl key={label} label={label} value={value} onChange={onChange} min={min} max={max} step={step}
-      unit={options.unit} power={options.power} disabled={options.disabled} title={options.title}
+      unit={options.unit} power={options.power} disabled={options.disabled} title={options.title} limits={options.limits}
       logarithmic={options.log ?? (options.unit !== "%" && min > 0 && max / min >= 8)}
       defaultValue={options.key ? baselineSettings[options.key] as number | undefined : undefined}
       onCommit={options.commit ? commitAnalysisControls : undefined} />;
@@ -3784,7 +3975,13 @@ export function MountainDetailStudio({
             <span className="text-slate-500">Slope</span>
             <span className="text-right tabular-nums text-slate-100">{hoverInfo.slopeDeg.toFixed(0)}° {getCompassHeading(hoverInfo.aspectDeg)}</span>
             <span className="text-slate-500">Biome</span>
-            <span className="max-w-[180px] truncate text-right text-slate-100">{hoverInfo.biomeName}</span>
+            <span className="max-w-[240px] truncate text-right text-slate-100" title={hoverInfo.biomeName}>{hoverInfo.biomeName}</span>
+            <span className="text-slate-500" title="Holdridge life zone from biotemperature and precipitation">Climate zone</span>
+            <span className="max-w-[240px] truncate text-right text-slate-100" title={hoverInfo.climateZone}>{hoverInfo.climateZone}</span>
+            <span className="text-slate-500">Rain / temp</span>
+            <span className="text-right tabular-nums text-slate-100">{Math.round(hoverInfo.precipMm)} mm · {hoverInfo.tempC.toFixed(1)} °C</span>
+            <span className="text-slate-500" title="Height above nearest river or lake (HAND/REM): below 5.3 m waterlogged, below 15 m shallow water table">Above river</span>
+            <span className="text-right tabular-nums text-slate-100">{Number.isFinite(hoverInfo.heightAboveRiverM) ? `${hoverInfo.heightAboveRiverM.toFixed(1)} m` : "no river"}</span>
             {hoverInfo.strahler > 0 && <>
               <span className="text-slate-500">River order</span>
               <span className="text-right tabular-nums text-slate-100">{hoverInfo.strahler}</span>
@@ -3963,10 +4160,10 @@ export function MountainDetailStudio({
           </InspectorSection>
 
           <InspectorSection title="Elevation and scale">
-            {num("Summit height", maxElevM, setMaxElevM, 1500, 6000, 50, { unit: "m", key: "maxElevM", commit: true })}
-            {num("Valley floor", minElevM, setMinElevM, 0, 1500, 10, { unit: "m", key: "minElevM", commit: true })}
+            {num("Summit height", maxElevM, (next) => { setMaxElevM(next); setMinElevM((floor) => Math.min(floor, next - 1)); }, 1500, 6000, 50, { unit: "m", key: "maxElevM", commit: true, limits: [1, Infinity] })}
+            {num("Valley floor", minElevM, (next) => { setMinElevM(next); setMaxElevM((summit) => Math.max(summit, next + 1)); }, 0, 1500, 10, { unit: "m", key: "minElevM", commit: true })}
             {num("Sea level", oceanElevationM, setOceanElevationM, -100, 100, 1, { unit: "m", key: "oceanElevationM", commit: true })}
-            {num("Map width", domainWidthKm, setDomainWidthKm, 8, 120, 1, { unit: "km", key: "domainWidthKm", commit: true })}
+            {num("Map width", domainWidthKm, setDomainWidthKm, 8, 120, 1, { unit: "km", key: "domainWidthKm", commit: true, limits: [0.01, Infinity] })}
             <InspectorSelect label="Relief palette" value={activePalette} onChange={setActivePalette} options={[
               ["swiss_topo", "Swiss topo"], ["european_topo", "European topo"], ["physical_satellite", "Physical"],
               ["alpine_glacial", "Alpine glacial"], ["thermal_magma", "Thermal"], ["viridis", "Viridis"], ["slope_hazard", "Slope hazard"],
@@ -3975,7 +4172,7 @@ export function MountainDetailStudio({
 
           <InspectorSection title="Biomes">
             <InspectorNote>These settings apply to every biome.</InspectorNote>
-            {num("Border noise scale", biomeEdgeNoiseScaleM, setBiomeEdgeNoiseScaleM, 50, 5000, 50, { unit: "m", key: "biomeEdgeNoiseScaleM", commit: true, log: true })}
+            {num("Border noise scale", biomeEdgeNoiseScaleM, setBiomeEdgeNoiseScaleM, 50, 5000, 50, { unit: "m", key: "biomeEdgeNoiseScaleM", commit: true, log: true, limits: [1, Infinity] })}
             {num("Border irregularity", vegetationBiomeTransitionStrength, setVegetationBiomeTransitionStrength, 0, INSPECTOR_BOUNDS.biomeBorder, 0.05, { unit: "×", key: "vegetationBiomeTransitionStrength", commit: true })}
             <InspectorFold title="Biome colors">
               {MOUNTAIN_PALETTE_BIOME_IDS.filter((biomeId) => biomeId !== 6 && biomeId !== 8).map((biomeId) =>
@@ -4001,8 +4198,8 @@ export function MountainDetailStudio({
           </InspectorSection>
 
           <InspectorSection title="Rivers and climate">
-            {num("Water evolution", waterEvolutionStep, setWaterEvolutionStep, 0, MOUNTAIN_WATER_EVOLUTION_STEPS, 1, { key: "waterEvolutionStep", commit: true, title: "0 is the initial terrain; later steps reroute rivers and erode the terrain" })}
-            {num("River catchment", riverThresholdKm2, setRiverThresholdKm2, 0.25, 20, 0.01, { unit: "km²", key: "riverThresholdKm2", commit: true, log: true, title: "Wet-climate area needed before a river appears" })}
+            {num("Water evolution", waterEvolutionStep, (next) => setWaterEvolutionStep(Math.round(next)), 0, MOUNTAIN_WATER_EVOLUTION_STEPS, 1, { key: "waterEvolutionStep", commit: true, limits: [0, MOUNTAIN_WATER_EVOLUTION_STEPS], title: "0 is the initial terrain; later steps reroute rivers and erode the terrain" })}
+            {num("River catchment", riverThresholdKm2, setRiverThresholdKm2, 1, 200, 0.01, { unit: "km²", key: "riverThresholdKm2", commit: true, log: true, title: "Wet-climate catchment area needed before a river appears. 1 km² carries about 24 L/s in the reference climate; raise it for fewer, longer rivers" })}
             <InspectorFold title="Advanced climate and terrain evolution">
               {num("Wetland ceiling", wetlandElevationThresholdM, setWetlandElevationThresholdM, 0, 3000, 1, { unit: "m", key: "wetlandElevationThresholdM", commit: true, power: 2, title: "Flat terrain below this elevation can become wetland" })}
               {num("Biome region scale", biomeRegionScaleKm, setBiomeRegionScaleKm, 0.01, 1, 0.001, { unit: "km", key: "biomeRegionScaleKm", commit: true, log: true })}
@@ -4011,7 +4208,7 @@ export function MountainDetailStudio({
               {num("Erosion strength", waterLandscapeImpact, setWaterLandscapeImpact, 0.1, 1, 0.05, { unit: "%", key: "waterLandscapeImpact", commit: true, log: false })}
               {num("Wind direction", windAzimuthDeg, setWindAzimuthDeg, 0, 360, 15, { unit: "°", key: "windAzimuthDeg", commit: true })}
               {num("Wind speed", windSpeedMs, setWindSpeedMs, 2, 40, 1, { unit: "m/s", key: "windSpeedMs", commit: true, log: false })}
-              {num("Precipitation", basePrecipMm, setBasePrecipMm, 300, 4000, 100, { unit: "mm/yr", key: "basePrecipMm", commit: true, log: false })}
+              {num("Precipitation", basePrecipMm, setBasePrecipMm, 100, 4000, 100, { unit: "mm/yr", key: "basePrecipMm", commit: true, log: false, title: "Drier and hotter climates turn valleys into steppe and desert" })}
               {num("Temperature", baseTemperatureC, setBaseTemperatureC, -10, 30, 1, { unit: "°C", key: "baseTemperatureC", commit: true, title: "Lower temperatures bring snow to lower elevations" })}
             </InspectorFold>
           </InspectorSection>
@@ -4051,23 +4248,69 @@ export function MountainDetailStudio({
             </InspectorFold>
           </InspectorSection>
 
+          <InspectorSection title="Desert dunes" aside={<input type="checkbox" aria-label="Draw desert dunes" title="Draw sand desert as pen-and-ink dunes instead of flow lines" checked={vegetationDesertDunes} onChange={(event) => setVegetationDesertDunes(event.target.checked)} />}>
+            {vegetationDesertDunes ? <>
+              <InspectorNote>Sand desert only. Each dune is one crest line with hatching on its downwind slip face.</InspectorNote>
+              <InspectorFold title="Shape" defaultOpen>
+                {num("Dune spacing", vegetationDesertDuneSpacingKm, setVegetationDesertDuneSpacingKm, 0.2, 8, 0.05, { unit: "km", key: "vegetationDesertDuneSpacingKm", log: true, title: "Distance between crests" })}
+                <InspectorNote>{`Wind from ${compassLabel(windAzimuthDeg)} (${Math.round(windAzimuthDeg)}°): crests run across it and slip faces face downwind. Change it under Terrain › Rivers and climate › Wind direction.`}</InspectorNote>
+                {num("Crest scallops", vegetationDesertCrestScallop, setVegetationDesertCrestScallop, 0, 1, 0.05, { unit: "%", key: "vegetationDesertCrestScallop", title: "0 gives straight crests, higher values deep crescents with horns" })}
+                {num("Terrain bend", vegetationDesertTerrainFollowing, setVegetationDesertTerrainFollowing, 0, 1, 0.05, { unit: "%", key: "vegetationDesertTerrainFollowing", title: "How much large landforms bend the crests" })}
+              </InspectorFold>
+              <InspectorFold title="Slip-face shading" defaultOpen>
+                {num("Shadow length", vegetationDesertShadowLength, setVegetationDesertShadowLength, 0.1, 0.45, 0.01, { unit: "%", key: "vegetationDesertShadowLength", title: "Depth of the hatched slip face, as a share of the dune spacing" })}
+                {num("Shadow strength", vegetationDesertShadowStrength, setVegetationDesertShadowStrength, 0, 1, 0.05, { unit: "%", key: "vegetationDesertShadowStrength" })}
+                {num("Hatch density", vegetationDesertHatchDensity, setVegetationDesertHatchDensity, 0.25, 3, 0.05, { unit: "×", key: "vegetationDesertHatchDensity" })}
+                {num("Ripple lines", vegetationDesertRippleLines, (next) => setVegetationDesertRippleLines(Math.round(next)), 0, 3, 1, { key: "vegetationDesertRippleLines", log: false, limits: [0, 3], title: "Faint broken lines on the windward side of each dune" })}
+              </InspectorFold>
+              <InspectorFold title="Line character" defaultOpen>
+                {num("Line breaks", vegetationDesertLineBreaks, setVegetationDesertLineBreaks, 0, 1, 0.05, { unit: "%", key: "vegetationDesertLineBreaks", title: "How often crest and ripple lines break; every break tapers on both sides" })}
+                {num("Dots", vegetationDesertDots, setVegetationDesertDots, 0, 1, 0.05, { unit: "%", key: "vegetationDesertDots", title: "Dotted trails through gaps and faded crest ends, plus scattered dots on the sand" })}
+              </InspectorFold>
+              <InspectorFold title="Wash" defaultOpen>
+                {num("Highlight", vegetationDesertHighlight, setVegetationDesertHighlight, 0, 1, 0.05, { unit: "%", key: "vegetationDesertHighlight", title: "Brightening of dune faces turned towards the sun (Lighting tab)" })}
+                {num("Color variation", vegetationDesertColorVariation, setVegetationDesertColorVariation, 0, 1, 0.05, { unit: "%", key: "vegetationDesertColorVariation", title: "Broad reddish-brown patches in the sand" })}
+                {num("Patch size", vegetationDesertColorScaleKm, setVegetationDesertColorScaleKm, 0.5, 40, 0.1, { unit: "km", key: "vegetationDesertColorScaleKm", log: true, disabled: vegetationDesertColorVariation <= 0, title: "Typical size of the colour patches" })}
+                {num("Shadow wash", vegetationDesertWashShadow, setVegetationDesertWashShadow, 0, 1, 0.05, { unit: "%", key: "vegetationDesertWashShadow", title: "Darkening of dune faces turned away from the sun" })}
+              </InspectorFold>
+              <InspectorFold title="Colors">
+                <InspectorColor label="Sand" value={vegetationBiomeColors[15]} onChange={(color) => setVegetationBiomeColors((previous) => ({ ...previous, 15: color }))} />
+                <InspectorColor label="Spots" value={vegetationDesertSpotColor} onChange={setVegetationDesertSpotColor} />
+                <InspectorColor label="Ink" value={vegetationAridInkColor} onChange={setVegetationAridInkColor} />
+              </InspectorFold>
+            </> : <InspectorNote>Off: sand desert uses the ground pattern flow lines.</InspectorNote>}
+          </InspectorSection>
+
           <InspectorSection title="Trees and shrubs">
             <ForestRenderControls
               settings={forestSettings}
               defaults={baselineSettings.forestSettings as ForestRenderSettings}
-              biomeDensityDefault={(baselineSettings.vegetationRasterPropBiomeSettings as Record<string, { density?: number }> | undefined)?.[rasterPropBiome]?.density ?? baselineSettings.vegetationRasterPropDensity as number}
-              biomeClusteringDefault={(baselineSettings.vegetationRasterPropBiomeSettings as Record<string, { clustering?: number }> | undefined)?.[rasterPropBiome]?.clustering ?? baselineSettings.vegetationRasterPropClustering as number}
-              wetlandShrubDensityDefault={baselineSettings.vegetationWetlandShrubDensity as number}
+              treeDensityDefault={baselineRasterSettings.treeDensity}
+              shrubDensityDefault={baselineRasterSettings.shrubDensity}
+              biomeClusteringDefault={baselineRasterSettings.clustering}
               propScaleDefault={baselineSettings.vegetationRasterPropScale as number}
               standSizeDefault={baselineSettings.vegetationRasterPropStandSize as number}
               placementNoiseScaleDefault={baselineSettings.vegetationRasterPropPlacementNoiseScale as number}
               onSettingsChange={setForestSettings}
-              density={selectedRasterDensity}
-              onDensityChange={(density) => {
-                updateRasterBiome("density", density);
+              treeDensity={selectedRasterSettings.treeDensity}
+              onTreeDensityChange={(density) => {
+                updateRasterBiome("treeDensity", density);
                 setForestSettings((previous) => ({ ...previous, density }));
               }}
-              clustering={selectedRasterClustering}
+              shrubDensity={selectedRasterSettings.shrubDensity}
+              onShrubDensityChange={(density) => updateRasterBiome("shrubDensity", density)}
+              treeColor={selectedStandStyle.tree}
+              onTreeColorChange={(color) => updateRasterBiome("treeColor", color)}
+              shrubColor={selectedStandStyle.shrub}
+              onShrubColorChange={(color) => updateRasterBiome("shrubColor", color)}
+              shrubTreeShare={selectedStandStyle.shrubTreeShare}
+              onShrubTreeShareChange={(share) => updateRasterBiome("shrubTreeShare", share)}
+              shrubTreeShareDefault={propStandStyleForBiome(
+                normalizeForestRenderSettings(baselineSettings.forestSettings),
+                baselineSettings.vegetationRasterPropBiomeSettings as RasterPropBiomeSettings | undefined,
+                rasterPropBiome,
+              ).shrubTreeShare}
+              clustering={selectedRasterSettings.clustering}
               onClusteringChange={(clustering) => {
                 updateRasterBiome("clustering", clustering);
                 setForestSettings((previous) => ({ ...previous, clustering }));
@@ -4075,7 +4318,7 @@ export function MountainDetailStudio({
               placementNoiseScale={vegetationRasterPropPlacementNoiseScale}
               onPlacementNoiseScaleChange={setVegetationRasterPropPlacementNoiseScale}
               biome={rasterPropBiome}
-              biomeOptions={[2, 3, 4, 7].map((biome) => ({ id: biome, label: MOUNTAIN_BIOME_LABELS[biome] }))}
+              biomeOptions={RASTER_PROP_BIOMES.map((biome) => ({ id: biome, label: MOUNTAIN_BIOME_LABELS[biome] }))}
               onBiomeChange={setRasterPropBiome}
               treeScale={vegetationRasterPropScale}
               onTreeScaleChange={setVegetationRasterPropScale}
@@ -4083,17 +4326,14 @@ export function MountainDetailStudio({
               onStandSizeChange={setVegetationRasterPropStandSize}
               sourceZoom={forestSourceZoom}
               onSourceZoomChange={setForestSourceZoom}
-              sourceUrls={rasterPropBiome === 7
-                ? WETLAND_VEGETATION_PROP_DEFINITIONS.map((definition) => definition.url)
-                : ALPINE_TREE_75_ASSET_URLS}
-              wetlandShrubDensity={vegetationWetlandShrubDensity}
-              onWetlandShrubDensityChange={setVegetationWetlandShrubDensity}
+              sourceUrls={[
+                ...ALPINE_TREE_75_ASSET_URLS,
+                ...WETLAND_VEGETATION_PROP_DEFINITIONS.map((definition) => definition.url),
+              ]}
             />
             <InspectorFold title="Colors">
-              {([["alpineCanopyColor", "Alpine foliage"], ["wetlandShrubColor", "Wetland shrubs"],
-                ["wetlandCanopyColor", "Wetland canopy"], ["wetlandWoodColor", "Wetland wood"]] as const).map(([key, label]) =>
-                <InspectorColor key={key} label={label} value={forestSettings[key]}
-                  onChange={(color) => setForestSettings((previous) => ({ ...previous, [key]: color }))} />)}
+              <InspectorColor label="Wood" value={forestSettings.wetlandWoodColor}
+                onChange={(color) => setForestSettings((previous) => ({ ...previous, wetlandWoodColor: color }))} />
               <InspectorColor label="Outline" value={forestOutlineColor} onChange={setForestOutlineColor} />
             </InspectorFold>
           </InspectorSection>
@@ -4141,7 +4381,7 @@ export function MountainDetailStudio({
               {num("Charcoal thickness", waterFlowThickness, setWaterFlowThickness, 0.2, 3, 0.01, { unit: "×", key: "waterFlowThickness", disabled: !showWaterDetails })}
               <InspectorSelect label="Charcoal smoothing" value={waterFlowSmoothing} disabled={!showWaterDetails}
                 options={SMOOTHING_LABELS.map((label, passes) => [passes, label] as const)} onChange={setWaterFlowSmoothing} />
-              {num("Coastal bands", oceanRippleCount, setOceanRippleCount, 1, 12, 1, { key: "oceanRippleCount", disabled: !showWaterDetails, log: false })}
+              {num("Coastal bands", oceanRippleCount, (next) => setOceanRippleCount(Math.round(next)), 1, 12, 1, { key: "oceanRippleCount", limits: [1, 12], disabled: !showWaterDetails, log: false })}
               {num("Lake full depth", lakeFullDepthM, setLakeFullDepthM, 1, 200, 1, { unit: "m", key: "lakeFullDepthM", title: "Lake depth that reaches the deep water colour" })}
             </InspectorFold>
           </InspectorSection>
@@ -4163,8 +4403,8 @@ export function MountainDetailStudio({
           <InspectorSection title="Wetland pools" aside={<input type="checkbox" aria-label="Show wetland pools" checked={showWetlandPuddleContours} disabled={!showWaterDetails} onChange={(event) => setShowWetlandPuddleContours(event.target.checked)} />}>
             {showWetlandPuddleContours ? <>
               {num("Density", wetlandPuddleDensity, setWetlandPuddleDensity, 0, 2, 0.05, { unit: "×", key: "wetlandPuddleDensity", disabled: !showWaterDetails })}
-              {num("Minimum size", wetlandPuddleSizeMin, (next) => { setWetlandPuddleSizeMin(next); setWetlandPuddleSizeMax((current) => Math.max(current, next)); }, INSPECTOR_BOUNDS.poolSizeMin, 1, 0.005, { unit: "%", key: "wetlandPuddleSizeMin", disabled: !showWaterDetails })}
-              {num("Maximum size", wetlandPuddleSizeMax, (next) => { setWetlandPuddleSizeMax(next); setWetlandPuddleSizeMin((current) => Math.min(current, next)); }, INSPECTOR_BOUNDS.poolSizeMin, 1, 0.005, { unit: "%", key: "wetlandPuddleSizeMax", disabled: !showWaterDetails })}
+              {num("Minimum size", wetlandPuddleSizeMin, (next) => { setWetlandPuddleSizeMin(next); setWetlandPuddleSizeMax((current) => Math.max(current, next)); }, INSPECTOR_BOUNDS.poolSizeMin, 1, 0.005, { unit: "%", key: "wetlandPuddleSizeMin", limits: [INSPECTOR_BOUNDS.poolSizeMin, 1], disabled: !showWaterDetails })}
+              {num("Maximum size", wetlandPuddleSizeMax, (next) => { setWetlandPuddleSizeMax(next); setWetlandPuddleSizeMin((current) => Math.min(current, next)); }, INSPECTOR_BOUNDS.poolSizeMin, 1, 0.005, { unit: "%", key: "wetlandPuddleSizeMax", limits: [INSPECTOR_BOUNDS.poolSizeMin, 1], disabled: !showWaterDetails })}
               {num("Coast clearance", wetlandPuddleCoastDistance, setWetlandPuddleCoastDistance, 0, 2, 0.05, { unit: "×", key: "wetlandPuddleCoastDistance", disabled: !showWaterDetails })}
               {num("Shoreline stroke length", wetlandPoolContourLength, setWetlandPoolContourLength, 0.2, 5, 0.05, { unit: "×", key: "wetlandPoolContourLength", disabled: !showWaterDetails })}
               <InspectorSeed value={wetlandPuddleSeed} onChange={setWetlandPuddleSeed} disabled={!showWaterDetails} />
@@ -4174,14 +4414,14 @@ export function MountainDetailStudio({
           <InspectorSection title="River silt">
             {num("Reach", siltReachM, setSiltReachM, 0, 6000, 100, { unit: "m", key: "siltReachM", title: "How far floods laid down silt; 0 turns silt off" })}
             {num("Top layers removed", siltTopRemoved, setSiltTopRemoved, 0, 4, 0.1, { key: "siltTopRemoved" })}
-            {num("Layers", siltLayers, setSiltLayers, 1, 10, 1, { key: "siltLayers", log: false })}
+            {num("Layers", siltLayers, (next) => setSiltLayers(Math.round(next)), 1, 10, 1, { key: "siltLayers", limits: [1, Infinity], log: false })}
           </InspectorSection>
         </>}
 
         {inspectorTab === "Lighting" && <>
           <InspectorSection title="Sun">
             {num("Azimuth", sunAzimuthDeg, setSunAzimuthDeg, 0, 360, 5, { unit: `° ${getCompassHeading(sunAzimuthDeg)}`, key: "sunAzimuthDeg" })}
-            {num("Altitude", sunAltitudeDeg, setSunAltitudeDeg, 10, 85, 1, { unit: "°", key: "sunAltitudeDeg", log: false })}
+            {num("Altitude", sunAltitudeDeg, setSunAltitudeDeg, 10, 85, 1, { unit: "°", key: "sunAltitudeDeg", limits: [0, 90], log: false })}
           </InspectorSection>
 
           <InspectorSection title="Terrain shading">
@@ -4197,11 +4437,11 @@ export function MountainDetailStudio({
             {fullTerrainCameraEnabled ? <>
               <InspectorSelect label="Projection" value={fullTerrainCameraType} onChange={setFullTerrainCameraType}
                 options={[["orthographic", "Orthographic"], ["perspective", "Perspective (35° FOV)"]]} />
-              {num("Elevation", fullTerrainCameraElevationDeg, setFullTerrainCameraElevationDeg, 30, 85, 1, { unit: "°", key: "fullTerrainCameraElevationDeg", log: false })}
+              {num("Elevation", fullTerrainCameraElevationDeg, setFullTerrainCameraElevationDeg, 30, 85, 1, { unit: "°", key: "fullTerrainCameraElevationDeg", limits: [1, 89], log: false })}
               {num("Height exaggeration", fullTerrainCameraHeightExaggeration, setFullTerrainCameraHeightExaggeration, 0.25, 3, 0.05, { unit: "×", key: "fullTerrainCameraHeightExaggeration", log: false })}
               <InspectorNote>Effective terrain height {(fullTerrainCameraHeightExaggeration * vertExagg).toFixed(1)}×</InspectorNote>
             </> : <>
-              {num("Mountain view angle", mountainViewAngleDeg, setMountainViewAngleDeg, 75, 90, 1, { unit: "°", key: "mountainViewAngleDeg", log: false, title: "90° is overhead; lower angles lift only the mountain faces" })}
+              {num("Mountain view angle", mountainViewAngleDeg, setMountainViewAngleDeg, 75, 90, 1, { unit: "°", key: "mountainViewAngleDeg", limits: [1, 90], log: false, title: "90° is overhead; lower angles lift only the mountain faces" })}
               {num("Mountain height", mountainHeightExaggeration, setMountainHeightExaggeration, 1, 2, 0.1, { unit: "×", key: "mountainHeightExaggeration" })}
             </>}
           </InspectorSection>
@@ -4219,8 +4459,8 @@ export function MountainDetailStudio({
             <InspectorColor label="Hatch color" value={mountainHatchColor} onChange={setMountainHatchColor} />
             <InspectorFold title="Advanced local mountain detail">
               <InspectorNote>Adds marks on lower-relief faces on top of the 1× mountain baseline.</InspectorNote>
-              {num("Detail ceiling", mountainLocalDetailDensityMax, setMountainLocalDetailDensityMax, MOUNTAIN_LOCAL_DETAIL_DENSITY_MIN, MOUNTAIN_LOCAL_DETAIL_DENSITY_MAX, 0.05, { unit: "×", key: "mountainLocalDetailDensityMax" })}
-              {num("Foothill multiplier", mountainFoothillDetailMultiplier, setMountainFoothillDetailMultiplier, MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_MIN, MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_MAX, 0.05, { unit: "×", key: "mountainFoothillDetailMultiplier" })}
+              {num("Detail ceiling", mountainLocalDetailDensityMax, setMountainLocalDetailDensityMax, MOUNTAIN_LOCAL_DETAIL_DENSITY_MIN, MOUNTAIN_LOCAL_DETAIL_DENSITY_MAX, 0.05, { unit: "×", key: "mountainLocalDetailDensityMax", limits: [MOUNTAIN_LOCAL_DETAIL_DENSITY_MIN, Infinity] })}
+              {num("Foothill multiplier", mountainFoothillDetailMultiplier, setMountainFoothillDetailMultiplier, MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_MIN, MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_MAX, 0.05, { unit: "×", key: "mountainFoothillDetailMultiplier", limits: [MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_MIN, Infinity] })}
               {num("Biome multiplier", mountainBiomeDetailMultiplier, setMountainBiomeDetailMultiplier, MOUNTAIN_BIOME_DETAIL_MULTIPLIER_MIN, MOUNTAIN_BIOME_DETAIL_MULTIPLIER_MAX, 0.05, { unit: "×", key: "mountainBiomeDetailMultiplier" })}
             </InspectorFold>
           </InspectorSection>
@@ -4263,8 +4503,8 @@ export function MountainDetailStudio({
                   </button>
                 ))}
               </div>
-              {num("Long edge", outputLongEdge, setOutputLongEdge, MIN_MOUNTAIN_RENDER_RESOLUTION, MAX_MOUNTAIN_RENDER_RESOLUTION, 1,
-                { unit: "px", log: true, disabled: Boolean(exportProgress) })}
+              {num("Long edge", outputLongEdge, (next) => setOutputLongEdge(Math.round(next)), MIN_MOUNTAIN_RENDER_RESOLUTION, MAX_MOUNTAIN_RENDER_RESOLUTION, 1,
+                { unit: "px", log: true, limits: [MIN_MOUNTAIN_RENDER_RESOLUTION, MAX_MOUNTAIN_RENDER_RESOLUTION], disabled: Boolean(exportProgress) })}
               <InspectorToggle label="Split into 4 horizontal strips" checked={splitExportIntoStrips}
                 disabled={Boolean(exportProgress)} onChange={setSplitExportIntoStrips} />
               {splitExportIntoStrips && (

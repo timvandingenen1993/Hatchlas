@@ -68,6 +68,8 @@ export interface MountainPreviewInspectResult {
   tempC: number;
   solarFlux: number;
   biomeName: string;
+  climateZone: string;
+  heightAboveRiverM: number;
 }
 
 export interface MountainPreviewProfileResult {
