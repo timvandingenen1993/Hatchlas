@@ -1543,6 +1543,8 @@ interface TiffHeightmapHeader {
   stripOffsets: number[];
   stripByteCounts: number[];
   noDataValue: number | null;
+  /** Ground footprint of a GeoTIFF; absent for plain TIFF images. */
+  groundExtent: { widthKm: number; heightKm: number } | null;
 }
 
 const TIFF_FIELD_TYPE_SIZES: readonly number[] = [
@@ -1560,6 +1562,14 @@ const TIFF_TAG_SAMPLES_PER_PIXEL = 277;
 const TIFF_TAG_PLANAR_CONFIGURATION = 284;
 const TIFF_TAG_SAMPLE_FORMAT = 339;
 const TIFF_TAG_GDAL_NODATA = 42113;
+const TIFF_TAG_MODEL_PIXEL_SCALE = 33550;
+const TIFF_TAG_MODEL_TIEPOINT = 33922;
+const TIFF_TAG_GEO_KEY_DIRECTORY = 34735;
+const GEO_KEY_MODEL_TYPE = 1024;
+const GEO_KEY_PROJECTED_CRS = 3072;
+const GEO_KEY_PROJECTED_LINEAR_UNITS = 3076;
+const WEB_MERCATOR_CRS_CODES = new Set([3857, 3785, 900913, 102100, 102113]);
+const WGS84_RADIUS_M = 6378137;
 const MIN_TIFF_ELEVATION_M = -10;
 
 function isTiff(bytes: Uint8Array): boolean {
@@ -1648,6 +1658,63 @@ function readTiffAscii(view: DataView, field: TiffField): string {
     .join("")
     .replace(/\0+$/, "")
     .trim();
+}
+
+/**
+ * Reads the ground footprint from GeoTIFF pixel scale, tiepoint and GeoKeys.
+ * Geographic rasters are measured at their centre latitude, and Web Mercator
+ * spans are shrunk by the Mercator scale at their centre, so both report
+ * approximate ground kilometres. Unknown linear units are not guessed.
+ */
+function readTiffGroundExtent(
+  view: DataView,
+  fields: Map<number, TiffField>,
+  littleEndian: boolean,
+  width: number,
+  height: number,
+): { widthKm: number; heightKm: number } | null {
+  const scaleField = fields.get(TIFF_TAG_MODEL_PIXEL_SCALE);
+  const tiepointField = fields.get(TIFF_TAG_MODEL_TIEPOINT);
+  const keyField = fields.get(TIFF_TAG_GEO_KEY_DIRECTORY);
+  if (!scaleField || !tiepointField || !keyField) return null;
+  const [scaleX, scaleY] = readTiffFieldValues(view, scaleField, littleEndian);
+  const tiepoint = readTiffFieldValues(view, tiepointField, littleEndian);
+  if (!(scaleX > 0) || !(scaleY > 0) || tiepoint.length < 6) return null;
+
+  const directory = readTiffFieldValues(view, keyField, littleEndian);
+  const geoKeys = new Map<number, number>();
+  for (let entry = 4; entry + 3 < directory.length && entry < 4 + directory[3] * 4; entry += 4) {
+    // Location 0 stores the SHORT value inline; the keys used here all do.
+    if (directory[entry + 1] === 0) geoKeys.set(directory[entry], directory[entry + 3]);
+  }
+
+  const spanX = scaleX * width;
+  const spanY = scaleY * height;
+  const centerY = tiepoint[4] - tiepoint[1] * scaleY - spanY / 2;
+  const modelType = geoKeys.get(GEO_KEY_MODEL_TYPE);
+  if (modelType === 2) {
+    if (Math.abs(centerY) > 90) return null;
+    const metresPerDegree = (Math.PI * WGS84_RADIUS_M) / 180;
+    return {
+      widthKm: (spanX * metresPerDegree * Math.cos((centerY * Math.PI) / 180)) / 1000,
+      heightKm: (spanY * metresPerDegree) / 1000,
+    };
+  }
+  if (modelType !== 1) return null;
+
+  const linearUnit = geoKeys.get(GEO_KEY_PROJECTED_LINEAR_UNITS) ?? 9001;
+  const metresPerUnit =
+    linearUnit === 9001 ? 1 : linearUnit === 9002 ? 0.3048 : linearUnit === 9003 ? 1200 / 3937 : null;
+  if (metresPerUnit === null) return null;
+  const crs = geoKeys.get(GEO_KEY_PROJECTED_CRS);
+  const groundScale =
+    crs !== undefined && WEB_MERCATOR_CRS_CODES.has(crs)
+      ? 1 / Math.cosh((centerY * metresPerUnit) / WGS84_RADIUS_M)
+      : 1;
+  return {
+    widthKm: (spanX * metresPerUnit * groundScale) / 1000,
+    heightKm: (spanY * metresPerUnit * groundScale) / 1000,
+  };
 }
 
 function readTiffHeader(buffer: ArrayBuffer): TiffHeightmapHeader | null {
@@ -1794,6 +1861,7 @@ function readTiffHeader(buffer: ArrayBuffer): TiffHeightmapHeader | null {
     stripOffsets,
     stripByteCounts,
     noDataValue,
+    groundExtent: readTiffGroundExtent(view, fields, littleEndian, width, height),
   };
 }
 
@@ -1830,11 +1898,66 @@ function isTiffMissingSample(
   return sampleFormat !== 1 && sample === -9999;
 }
 
+/**
+ * Real-world scale of a georeferenced heightmap. `rawLuminance` spans
+ * `minElevationM`..`maxElevationM`, so using them as valley floor and summit
+ * restores the source elevations.
+ */
+export interface HeightmapGeoMetadata {
+  minElevationM: number;
+  maxElevationM: number;
+  widthKm: number;
+  heightKm: number;
+}
+
 export interface HeightmapRaster {
   width: number;
   height: number;
   rawLuminance: Float32Array;
   oceanMask?: Uint8Array;
+  /** Present only for georeferenced sources, never for plain images. */
+  metadata?: HeightmapGeoMetadata;
+}
+
+/**
+ * Normalizes a grid of elevations in metres (NaN = missing) with the same
+ * rules as the GeoTIFF decoder: missing or deep cells become ocean at the
+ * minimum elevation, and the range is recorded as metadata.
+ */
+export function heightmapFromElevations(
+  elevations: Float32Array,
+  width: number,
+  height: number,
+  extent: { widthKm: number; heightKm: number },
+): HeightmapRaster {
+  if (elevations.length !== width * height)
+    throw new Error("Elevation grid size does not match its dimensions");
+  const rawLuminance = new Float32Array(elevations.length);
+  const oceanMask = new Uint8Array(elevations.length);
+  let minimum = Number.POSITIVE_INFINITY;
+  let maximum = Number.NEGATIVE_INFINITY;
+  for (let i = 0; i < elevations.length; i++) {
+    const sample = elevations[i];
+    if (isTiffMissingSample(sample, null, 3)) {
+      oceanMask[i] = 1;
+      rawLuminance[i] = MIN_TIFF_ELEVATION_M;
+    } else {
+      rawLuminance[i] = sample;
+    }
+    minimum = Math.min(minimum, rawLuminance[i]);
+    maximum = Math.max(maximum, rawLuminance[i]);
+  }
+  const range = maximum - minimum;
+  for (let i = 0; i < rawLuminance.length; i++) {
+    rawLuminance[i] = range <= 0 ? 0 : (rawLuminance[i] - minimum) / range;
+  }
+  return {
+    width,
+    height,
+    rawLuminance,
+    oceanMask,
+    metadata: { minElevationM: minimum, maxElevationM: maximum, ...extent },
+  };
 }
 
 /** Decodes an uncompressed, single-band classic TIFF/GeoTIFF DEM. */
@@ -1925,11 +2048,18 @@ export function decodeTiffHeightmap(
         : Math.max(0, Math.min(1, normalized));
   });
 
+  // Only a GeoTIFF's samples are trusted as metres; a plain 16-bit image
+  // TIFF would otherwise claim a 65 km summit.
+  const metadata =
+    header.groundExtent && header.photometricInterpretation === 1
+      ? { minElevationM: minimum, maxElevationM: maximum, ...header.groundExtent }
+      : undefined;
   return {
     width: header.width,
     height: header.height,
     rawLuminance,
     oceanMask,
+    metadata,
   };
 }
 

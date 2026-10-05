@@ -4,6 +4,8 @@
 import { INSPECTOR_BOUNDS } from "../config/inspectorBounds";
 import { DESERT_DEFAULT_SPOT_COLOR, DESERT_DUNE_DEFAULTS } from "../rendering/desertDunes";
 import {
+  lazy,
+  Suspense,
   useEffect,
   useRef,
   useState,
@@ -19,6 +21,7 @@ import {
   MAX_MOUNTAIN_RENDER_RESOLUTION,
   MOUNTAIN_WATER_EVOLUTION_STEPS,
   resampleHeightmapLuminance,
+  type HeightmapRaster,
   type MountainDEMData,
 } from "../terrain/mountainBaseDEM";
 import {
@@ -136,6 +139,9 @@ function baselineRasterPropSettings(biome: number) {
   }, biome);
 }
 import { calibrateBundledMountainHeightmap } from "../terrain/mountainHeightmapCalibration";
+
+// The map picker brings Leaflet and MapLibre, so it loads only when opened.
+const GlobalDemDialog = lazy(() => import("./GlobalDemDialog"));
 
 const EPICENTER_WAVES_ENABLED = false;
 
@@ -888,6 +894,7 @@ export function MountainDetailStudio({
   const [heightmapSourceName, setHeightmapSourceName] = useState<string>(
     "nz-linz-dem.tif",
   );
+  const [globalDemOpen, setGlobalDemOpen] = useState(false);
   const [previewMetadata, setPreviewMetadata] =
     useState<MountainPreviewMetadata | null>(null);
   const demDataRef = useRef<MountainDEMData | null>(null);
@@ -2129,23 +2136,40 @@ export function MountainDetailStudio({
       });
   }, []);
 
+  /** Stops work on the previous source; returns the id that later results must still match. */
+  const beginHeightmapLoad = () => {
+    exportWorkerRef.current?.terminate();
+    exportWorkerRef.current = null;
+    setExportProgress(null);
+    setIsLoading(true);
+    setLoadError(null);
+    return ++sourceLoadIdRef.current;
+  };
+
+  /** Shows a user-chosen heightmap; a georeferenced one also sets its real width and relief. */
+  const applyLoadedHeightmap = (
+    { width, height, rawLuminance: data, oceanMask, metadata }: HeightmapRaster,
+    sourceName: string,
+  ) => {
+    setRawLuminance({ width, height, data, oceanMask });
+    setHeightmapSourceName(sourceName);
+    if (!metadata) return;
+    const floor = Math.round(metadata.minElevationM);
+    setMinElevM(floor);
+    setMaxElevM(Math.max(floor + 1, Math.round(metadata.maxElevationM)));
+    setDomainWidthKm(Math.round(metadata.widthKm * 100) / 100);
+  };
+
   const handleHeightmapFile = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.currentTarget.files?.[0];
     event.currentTarget.value = "";
     if (!file) return;
 
-    exportWorkerRef.current?.terminate();
-    exportWorkerRef.current = null;
-    setExportProgress(null);
-    const requestId = ++sourceLoadIdRef.current;
-    setIsLoading(true);
-    setLoadError(null);
-
+    const requestId = beginHeightmapLoad();
     loadHeightmapFile(file)
-      .then(({ width, height, rawLuminance: data, oceanMask }) => {
+      .then((raster) => {
         if (requestId !== sourceLoadIdRef.current) return;
-        setRawLuminance({ width, height, data, oceanMask });
-        setHeightmapSourceName(file.name);
+        applyLoadedHeightmap(raster, file.name);
       })
       .catch((err: unknown) => {
         if (requestId !== sourceLoadIdRef.current) return;
@@ -2154,6 +2178,12 @@ export function MountainDetailStudio({
         setLoadError(message);
         setIsLoading(false);
       });
+  };
+
+  const handleGlobalDemLoad = (raster: HeightmapRaster, sourceName: string) => {
+    beginHeightmapLoad();
+    applyLoadedHeightmap(raster, sourceName);
+    setGlobalDemOpen(false);
   };
 
   useEffect(() => {
@@ -4150,10 +4180,12 @@ export function MountainDetailStudio({
           <InspectorSection title="Heightmap">
             <div className="flex items-center gap-2">
               <span className="min-w-0 flex-1 truncate text-[12px] text-slate-200" title={heightmapSourceName}>{heightmapSourceName}</span>
+              <button type="button" onClick={() => setGlobalDemOpen(true)} title="Download real terrain for any place on Earth"
+                className="rounded border border-white/10 bg-white/5 px-2 py-1 text-[12px] text-slate-200 hover:bg-white/10">Get map…</button>
               <label htmlFor="mountain-heightmap-file" className="cursor-pointer rounded border border-white/10 bg-white/5 px-2 py-1 text-[12px] text-slate-200 hover:bg-white/10">Replace…</label>
               <input id="mountain-heightmap-file" className="sr-only" type="file" accept=".png,.tif,.tiff,image/png,image/tiff" onChange={handleHeightmapFile} />
             </div>
-            <InspectorNote>PNG or single-band uncompressed TIFF/GeoTIFF.</InspectorNote>
+            <InspectorNote>Get map loads real terrain worldwide. Replace takes a PNG or single-band uncompressed TIFF; a GeoTIFF also sets map width, summit and valley floor.</InspectorNote>
             <InspectorSelect label="Denoising" value={heightmapSmoothingPasses}
               options={SMOOTHING_LABELS.map((label, passes) => [passes, label] as const)}
               onChange={(passes) => { setHeightmapSmoothingPasses(passes); commitAnalysisControls(); }} />
@@ -4555,6 +4587,11 @@ export function MountainDetailStudio({
         </div>
       )}
 
+      {globalDemOpen && (
+        <Suspense fallback={null}>
+          <GlobalDemDialog onClose={() => setGlobalDemOpen(false)} onLoad={handleGlobalDemLoad} />
+        </Suspense>
+      )}
     </div>
   );
 }
