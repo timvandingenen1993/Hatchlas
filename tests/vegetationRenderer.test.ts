@@ -916,8 +916,8 @@ describe("procedural vegetation flow renderer", () => {
       dem.slopeDeg.fill(1);
       dem.biomeType.fill(biome);
       dem.isRiverChannel.fill(0);
-      dem.visualWaterMask.fill(0);
-      dem.visualWaterCoverage.fill(0);
+      dem.visualWaterMask?.fill(0);
+      dem.visualWaterCoverage?.fill(0);
       const plain = renderMountainDetailDEM(dem, {
         layer: "vegetation_patterns", palette: "swiss_topo", sunAzimuthDeg: 315, sunAltitudeDeg: 45,
         verticalExaggeration: 2, ambientOcclusionStrength: 0.35, showRivers: false, riverThresholdKm2: 1,

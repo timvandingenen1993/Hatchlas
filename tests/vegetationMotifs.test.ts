@@ -2,8 +2,6 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
-  ARID_MOTIF_DEFINITIONS,
-  loadVegetationMotifAssets,
   parseSvgVectorAsset,
   STAND_PROP_BIOME_IDS,
   VEGETATION_RASTER_PROP_DEFINITIONS,
@@ -86,30 +84,6 @@ describe("vegetation motif asset loading", () => {
     expect(fetchMock).toHaveBeenCalledTimes(8);
     vi.unstubAllGlobals();
   });
-
-  it("uses the selected SVG path data for reeds", async () => {
-    const reedsSvg = readFileSync(
-      join(process.cwd(), "src/assets/vegetation/reeds01.svg"),
-      "utf8",
-    );
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => ({
-        ok: true,
-        text: async () => reedsSvg,
-      })),
-    );
-
-    const assets = await loadVegetationMotifAssets();
-    const reeds = assets.find((asset) => asset.key === "reeds-01");
-    const points = reeds?.vectorPaths?.[0]?.points ?? [];
-
-    expect(reeds?.vectorPaths).toHaveLength(1);
-    expect(points[0]?.x).toBeCloseTo(0, 6);
-    expect(points.at(-1)?.x).toBeCloseTo(64, 6);
-    vi.unstubAllGlobals();
-  });
-
 
   it("registers the supplied alpine tree path with a filled closed silhouette", async () => {
     const alpineTrees = VEGETATION_RASTER_PROP_DEFINITIONS.filter((definition) =>

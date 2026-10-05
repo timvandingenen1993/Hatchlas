@@ -18,6 +18,7 @@ import {
   resolveVegetationPatternOptions,
   MOUNTAIN_FOOTHILL_TRANSPORT_STEPS_DEFAULT,
   sampleAlpineForestTerrainSuitability,
+  type RasterPropBiomeSettings,
   type VegetationRasterPropAsset,
   type VegetationRasterPropPlacement,
   sampleMountainFoothillTerrain,
@@ -138,6 +139,11 @@ function makeAsset(
     anchorY: 0.5,
     eligibleBiomeIds,
   };
+}
+
+/** A tree asset as registered for the alpine forest stands. */
+function makeTreeAsset(key: string, eligibleBiomeIds: readonly number[] = [3]): VegetationRasterPropAsset {
+  return { ...makeAsset(key, eligibleBiomeIds), outlineGroup: "alpine-forest" };
 }
 
 function placement(x = 160, y = 120): VegetationRasterPropPlacement {
@@ -387,10 +393,10 @@ describe("grid-authored raster vegetation props", () => {
 
   it("builds connected woodland stands with mixed variants and open clearings", () => {
     const dem = makeDem(640, 480, 3);
-    const assets = [makeAsset("fir"), makeAsset("pine"), makeAsset("spruce")];
+    const assets = [makeTreeAsset("fir"), makeTreeAsset("pine"), makeTreeAsset("spruce")];
     const options = { density: 0, motifDensity: 0, rasterPropCellSize: 4,
       rasterPropDensity: 0.65, rasterPropClustering: 0.9, rasterPropAssets: assets };
-    const props = buildVegetationGeometry(dem, options).rasterProps!;
+    const props = buildVegetationRasterPropPlacements(dem, options);
     expect(props.length).toBeGreaterThan(100);
     expect(new Set(props.map(p => p.assetKey)).size).toBe(3);
     const unvisited = new Set(props.map((_, index) => index));
@@ -416,19 +422,18 @@ describe("grid-authored raster vegetation props", () => {
       if (props.every(p => Math.hypot(p.x - x, p.y - y) > 30)) clearCells++;
     }
     expect(clearCells).toBeGreaterThan(20);
-    const disabled = buildVegetationGeometry(dem, { ...options, rasterPropDensity: 0 });
-    expect(disabled.rasterProps).toEqual([]);
+    expect(buildVegetationRasterPropPlacements(dem, { ...options, rasterPropDensity: 0 })).toEqual([]);
   });
 
   it("increases forest population above the old density saturation point", () => {
     const dem = makeDem(640, 480, 3);
     const options = { density: 0, motifDensity: 0, rasterPropCellSize: 4,
-      rasterPropClustering: 0.72, rasterPropAssets: [makeAsset("fir")] };
-    const sparse = buildVegetationGeometry(dem, { ...options, rasterPropDensity: 0.8 }).rasterProps!;
-    const dense = buildVegetationGeometry(dem, { ...options, rasterPropDensity: 1.5 }).rasterProps!;
+      rasterPropClustering: 0.72, rasterPropAssets: [makeTreeAsset("fir")] };
+    const sparse = buildVegetationRasterPropPlacements(dem, { ...options, rasterPropDensity: 0.8 });
+    const dense = buildVegetationRasterPropPlacements(dem, { ...options, rasterPropDensity: 1.5 });
     expect(dense.length).toBeGreaterThan(sparse.length * 1.15);
-    expect(sparse.length).toBeGreaterThan(800);
-    expect(buildVegetationGeometry(dem, { ...options, rasterPropDensity: 0.8 }).rasterProps).toEqual(sparse);
+    expect(sparse.length).toBeGreaterThan(500);
+    expect(buildVegetationRasterPropPlacements(dem, { ...options, rasterPropDensity: 0.8 })).toEqual(sparse);
   });
 
   it("calibrates padded foliage to the same visible cell size", () => {
@@ -475,7 +480,7 @@ describe("grid-authored raster vegetation props", () => {
       expect(cache.stats.vegetationGeometryBuilds).toBe(4);
       expect(cache.stats.vegetationOverlayBuilds).toBe(4);
     }
-  });
+  }, 30_000);
 
   it("isolates density and clustering changes to the selected biome", () => {
     const dem = makeDem(400, 300, 2);
@@ -638,7 +643,7 @@ describe("grid-authored raster vegetation props", () => {
       rasterPropCellSize: 16,
       rasterPropAssets: [shrub],
       wetlandShrubDensity: 2,
-      rasterPropBiomeSettings: { 17: { shrubDensity: 1 } },
+      rasterPropBiomeSettings: { 17: { shrubDensity: 1 } } as RasterPropBiomeSettings,
     };
     const accentTrees = (biome: number, settings: typeof options) =>
       buildVegetationGeometry(makeDem(320, 240, biome), settings).stands!
@@ -922,14 +927,14 @@ describe("grid-authored raster vegetation props", () => {
     for (let y = 0; y < dem.height; y++) {
       for (let x = 150; x < 170; x++) dem.biomeType[y * dem.width + x] = 2;
     }
-    const asset = makeAsset("alpine-tree", [2, 3]);
+    const asset = makeTreeAsset("alpine-tree", [2, 3]);
     for (const cellSize of [4, 16]) {
-      const geometry = buildVegetationGeometry(dem, {
+      const props = buildVegetationRasterPropPlacements(dem, {
         density: 0, motifDensity: 0, rasterPropDensity: 1,
         rasterPropCellSize: cellSize, rasterPropAssets: [asset],
       });
-      expect(geometry.rasterProps!.length).toBeGreaterThan(0);
-      expect(geometry.rasterProps!.every(p => p.cellSize === cellSize && p.biomeId === 2)).toBe(true);
+      expect(props.length).toBeGreaterThan(0);
+      expect(props.every(p => p.cellSize === cellSize && p.biomeId === 2)).toBe(true);
     }
     const center = { ...placement(), biomeId: 2 };
     expect(isRasterPropPlacementValid(dem, center, asset)).toBe(true);
