@@ -86,8 +86,12 @@ export function computeOrographicPrecipitationRate(
   // up to a power of two for the radix-2 FFT. The reference pads with 0 m,
   // which suits landscapes ringed by sea level but puts an artificial cliff
   // at every land edge of a cropped heightmap. Instead the padding continues
-  // each edge's own height and blends smoothly to the opposite edge, so the
-  // periodic transform wraps without a step. Sea-level edges still pad to 0.
+  // each edge's own height, flat, and only blends to the opposite edge in the
+  // middle of the pad, so the periodic transform wraps without a step. A
+  // blend spread over the whole pad would be a fake slope against the map
+  // edge (ocean on one side, mountains on the other), and air crossing it
+  // gains or loses rain that the terrain does not explain. Sea-level edges
+  // still pad to 0.
   const pad = Math.min(Math.ceil((width + height) / 2), MAXIMUM_PAD_CELLS);
   const paddedWidth = nextPowerOfTwo(width + 2 * pad);
   const paddedHeight = nextPowerOfTwo(height + 2 * pad);
@@ -106,7 +110,7 @@ export function computeOrographicPrecipitationRate(
     const west = elevationM[y * width];
     for (let step = 0; step < padX; step++) {
       const column = (pad + width + step) % paddedWidth;
-      real[row + column] = east + (west - east) * smoothBlend((step + 1) / (padX + 1));
+      real[row + column] = east + (west - east) * padBlend((step + 1) / (padX + 1));
     }
   }
   for (let column = 0; column < paddedWidth; column++) {
@@ -114,7 +118,7 @@ export function computeOrographicPrecipitationRate(
     const north = real[pad * paddedWidth + column];
     for (let step = 0; step < padY; step++) {
       const row = (pad + height + step) % paddedHeight;
-      real[row * paddedWidth + column] = south + (north - south) * smoothBlend((step + 1) / (padY + 1));
+      real[row * paddedWidth + column] = south + (north - south) * padBlend((step + 1) / (padY + 1));
     }
   }
 
@@ -187,6 +191,15 @@ function stripUndefined<T extends object>(value: T): Partial<T> {
 
 function smoothBlend(t: number): number {
   return t * t * (3 - 2 * t);
+}
+
+/** Fraction of the pad, at each end, that keeps its own edge's height. */
+const PAD_HOLD_FRACTION = 0.35;
+
+/** 0 over the first and last hold fractions, a smooth rise between them. */
+function padBlend(t: number): number {
+  const span = 1 - 2 * PAD_HOLD_FRACTION;
+  return smoothBlend(Math.min(1, Math.max(0, (t - PAD_HOLD_FRACTION) / span)));
 }
 
 function nextPowerOfTwo(value: number): number {

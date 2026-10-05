@@ -4,6 +4,7 @@
 import { INSPECTOR_BOUNDS, MIN_POSITIVE_SCALE } from "../config/inspectorBounds";
 import type { MountainDEMData } from "../terrain/mountainBaseDEM";
 import {
+  DEFAULT_RIVER_THRESHOLD_KM2,
   extractDeepOpenOceanMask,
   filterSmallOceanComponents,
 } from "../terrain/mountainBaseDEM";
@@ -1135,7 +1136,7 @@ export function buildRiverSplinesForExport(
     useEcologicalBiomeWater?: boolean;
   } = {},
 ): RiverSpline[] {
-  const threshold = Math.max(0.001, options.riverThresholdKm2 ?? 0.8);
+  const threshold = Math.max(0.001, options.riverThresholdKm2 ?? DEFAULT_RIVER_THRESHOLD_KM2);
   const outlineThickness = Math.max(0, options.outlineThickness ?? 1);
   const ecological =
     options.useEcologicalBiomeWater !== false && hasEcologicalWaterBiome(dem);
@@ -2878,7 +2879,7 @@ export function buildVisualWaterSurfaceDEM(
   profiler?: MountainProfiler,
 ): MountainDEMData {
   const totalCells = dem.width * dem.height;
-  const threshold = Math.max(0.001, options.riverThresholdKm2 ?? 0.8);
+  const threshold = Math.max(0.001, options.riverThresholdKm2 ?? DEFAULT_RIVER_THRESHOLD_KM2);
   const poolGeometryStop = profiler?.begin("visual water pool geometry");
   const wetlandPoolGeometry =
     options.enabled !== false && dem.biomeType?.some((biome) => biome === 7)
@@ -6065,7 +6066,7 @@ function renderWaterOverlayInternal(
   const { width, height } = dem;
   const totalCells = width * height;
   const seed = Math.round(options.seed ?? 23817);
-  const threshold = Math.max(0.001, options.riverThresholdKm2 ?? 0.8);
+  const threshold = Math.max(0.001, options.riverThresholdKm2 ?? DEFAULT_RIVER_THRESHOLD_KM2);
   const hasWetland = Boolean(
     dem.wetlandPoolMask?.some((value) => value === 1) ||
       dem.biomeType?.some((biome) => biome === 7),

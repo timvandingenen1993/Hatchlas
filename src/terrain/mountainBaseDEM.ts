@@ -687,6 +687,35 @@ export function extractDeepOpenOceanMask(
 
 export const getOpenOceanMask = extractDeepOpenOceanMask;
 
+/**
+ * Default catchment, in reference wet-climate km2, at which a stream becomes a
+ * mapped river (3.2 km2 is about 77 L/s of mean flow). The orographic rain
+ * model made the water budget roughly four times wetter than the earlier
+ * aspect-based one, so the scale was raised four-fold to keep the same river
+ * density (Heightmap2 at 2048 px: about 0.4 km of channel per km2 of land).
+ */
+export const DEFAULT_RIVER_THRESHOLD_KM2 = 3.2;
+
+/**
+ * Lee-side rainfall floor, as a fraction of the base precipitation. The linear
+ * orographic model removes moisture without limit (its raw floor is 0.14% of
+ * the background rate), so any large ridge produced hyper-arid desert. Real
+ * rain shadows keep roughly 20-50% of windward rainfall; 0.4 keeps a warm
+ * (17 C) lowland out of steppe at the default 1500 mm. True desert needs a
+ * dry base climate or heat, not just a ridge upwind.
+ */
+const MIN_OROGRAPHIC_RAIN_RATIO = 0.4;
+/** Holdridge PET ratio from which a climate is desert (desert scrub and drier). */
+const DESERT_PET_RATIO = 4;
+/** Riparian reach beside a river: base plus a step per stream order, capped. */
+const RIPARIAN_BASE_REACH_M = 150;
+const RIPARIAN_REACH_PER_ORDER_M = 150;
+const RIPARIAN_MAX_REACH_M = 900;
+/** Fractional wobble of the corridor edge from the shared biome noise. */
+const RIPARIAN_EDGE_NOISE = 0.3;
+/** Width of the semi-arid transition kept between desert and wetland. */
+const DESERT_WETLAND_BUFFER_M = 600;
+
 // Rennó et al. (2008), HAND classes for terra firme: below 5.3 m above the
 // nearest drainage the ground is waterlogged (water table at the surface);
 // 5.3–15 m is the ecotone with a shallow water table that bank vegetation
@@ -822,6 +851,115 @@ function applyWaterloggedBankBiomes(
     const biome = biomeType[index];
     if (biome === 15 || biome === 16) biomeType[index] = 19;
     else if (biome === 17 || biome === 18) biomeType[index] = 5;
+  }
+}
+
+/**
+ * Desert does not meet wetland directly: ground between them is semi-arid, so
+ * desert within the buffer of a wetland becomes dry steppe. Two separable
+ * passes dilate the wetland mask by the buffer radius (Chebyshev distance).
+ */
+export function separateDesertFromWetland(
+  width: number,
+  height: number,
+  biomeType: Uint8Array,
+  radius: number,
+): void {
+  const total = width * height;
+  const wetland = new Uint8Array(total);
+  let hasWetland = false;
+  for (let index = 0; index < total; index++) {
+    if (biomeType[index] === 7) {
+      wetland[index] = 1;
+      hasWetland = true;
+    }
+  }
+  if (!hasWetland) return;
+
+  const horizontal = new Uint8Array(total);
+  const near = new Uint8Array(total);
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    let last = -Infinity;
+    const lastWetland = new Float64Array(width);
+    for (let x = 0; x < width; x++) {
+      if (wetland[row + x] === 1) last = x;
+      lastWetland[x] = last;
+    }
+    let next = Infinity;
+    for (let x = width - 1; x >= 0; x--) {
+      if (wetland[row + x] === 1) next = x;
+      if (x - lastWetland[x] <= radius || next - x <= radius) horizontal[row + x] = 1;
+    }
+  }
+  for (let x = 0; x < width; x++) {
+    let last = -Infinity;
+    const lastWetland = new Float64Array(height);
+    for (let y = 0; y < height; y++) {
+      if (horizontal[y * width + x] === 1) last = y;
+      lastWetland[y] = last;
+    }
+    let next = Infinity;
+    for (let y = height - 1; y >= 0; y--) {
+      if (horizontal[y * width + x] === 1) next = y;
+      if (y - lastWetland[y] <= radius || next - y <= radius) near[y * width + x] = 1;
+    }
+  }
+  for (let index = 0; index < total; index++) {
+    if (near[index] === 1 && (biomeType[index] === 15 || biomeType[index] === 16)) {
+      biomeType[index] = 17;
+    }
+  }
+}
+
+/**
+ * Green corridor along rivers. HAND only reaches ground a few metres above the
+ * water, and its horizontal fallback is a fixed 15 cells, so across a wide
+ * valley floor dry steppe or desert could start right behind a thin riparian
+ * strip. Dry ground within a distance of the river, growing with stream order
+ * and roughened by the shared edge noise, becomes riparian shrubland (steppe
+ * and grassland) or oasis (desert).
+ */
+export function applyRiparianCorridors(
+  width: number,
+  height: number,
+  biomeType: Uint8Array,
+  isOcean: Uint8Array,
+  isRiverChannel: Uint8Array,
+  strahlerOrder: Uint8Array,
+  dxMeters: number,
+  dyMeters: number,
+  noiseScaleM: number,
+): void {
+  const total = width * height;
+  const riverMask = new Uint8Array(total);
+  let hasRiver = false;
+  for (let index = 0; index < total; index++) {
+    if (isRiverChannel[index] === 1 && isOcean[index] === 0) {
+      riverMask[index] = 1;
+      hasRiver = true;
+    }
+  }
+  if (!hasRiver) return;
+
+  const nearest = exactEuclideanDistanceTransform(riverMask, width, height);
+  const cellM = Math.sqrt(dxMeters * dyMeters);
+  const maximumReachM = RIPARIAN_MAX_REACH_M * (1 + RIPARIAN_EDGE_NOISE);
+  for (let index = 0; index < total; index++) {
+    const biome = biomeType[index];
+    if (biome < 15 || biome > 18) continue;
+    if (isOcean[index] === 1 || riverMask[index] === 1) continue;
+    const distanceM = nearest.distance[index] * cellM;
+    if (distanceM > maximumReachM) continue;
+    const source = nearest.nearestY[index] * width + nearest.nearestX[index];
+    const order = Math.max(1, strahlerOrder[source]);
+    const x = index % width;
+    const y = (index - x) / width;
+    const reachM =
+      Math.min(RIPARIAN_MAX_REACH_M, RIPARIAN_BASE_REACH_M + RIPARIAN_REACH_PER_ORDER_M * order) *
+      (1 + RIPARIAN_EDGE_NOISE * biomeEdgeNoise(x * dxMeters, y * dyMeters, noiseScaleM, 4421));
+    if (distanceM > reachM) continue;
+    biomeType[index] = biome === 15 || biome === 16 ? 19 : 5;
   }
 }
 
@@ -2178,7 +2316,7 @@ export function processMountainBaseDEM(
         evolvedDEM,
         erosionPassStrength,
         options.basePrecipitationMmYr ?? 1400,
-        options.riverThresholdKm2 ?? 0.8,
+        options.riverThresholdKm2 ?? DEFAULT_RIVER_THRESHOLD_KM2,
       );
       const marineIncisionM = computeMountainMarineIncision(
         evolvedDEM,
@@ -2256,7 +2394,7 @@ export function processMountainBaseDEM(
   const windSpeed = options.windSpeedMs ?? 15.0;
   const basePrecip = options.basePrecipitationMmYr ?? 1400.0;
   const baseTempC = options.baseTemperatureC ?? 18.0;
-  const riverThresholdKm2 = options.riverThresholdKm2 ?? 0.8;
+  const riverThresholdKm2 = options.riverThresholdKm2 ?? DEFAULT_RIVER_THRESHOLD_KM2;
   const wetlandElevationThresholdM = Math.max(0.0, options.wetlandElevationThresholdM ?? 400.0);
   const biomeRegionScaleKm = Math.max(0.0, options.biomeRegionScaleKm ?? 1.0);
 
@@ -2475,7 +2613,8 @@ export function processMountainBaseDEM(
       const slope = slopeDeg[idx];
       const aspect = aspectDeg[idx];
       const slopeFactor = Math.sin((slope * Math.PI) / 180.0);
-      const precipitation = basePrecip * orographicRatio[idx];
+      const precipitation =
+        basePrecip * Math.max(MIN_OROGRAPHIC_RAIN_RATIO, orographicRatio[idx]);
       precipitationMmYr[idx] = precipitation;
 
       const sunFacing = Math.cos(((aspect - 180.0) * Math.PI) / 180.0);
@@ -3055,9 +3194,12 @@ export function processMountainBaseDEM(
       const climateBiome: MountainBiomeId = isMeadow ? 20 : holdridgeBiome;
       const isDesertClimate = climateBiome === 15 || climateBiome === 16;
       // Wetlands need at least a subhumid climate (PET ratio below 2, the
-      // semi-arid boundary) or a water table at the surface.
+      // semi-arid boundary) or a water table at the surface. A water table
+      // does not make a wetland in a desert climate (PET ratio 4 and above):
+      // there the banks become oasis or riparian shrub instead.
       const supportsWetland =
-        petRatio < 2 || heightAboveDrainageM[idx] < WATERLOGGED_HAND_M;
+        petRatio < 2 ||
+        (heightAboveDrainageM[idx] < WATERLOGGED_HAND_M && petRatio < DESERT_PET_RATIO);
 
       if (isGlacial) {
         biomeType[idx] = 0; // Permanent Glacier / Ice Horn
@@ -3108,7 +3250,24 @@ export function processMountainBaseDEM(
     Math.max(0, options.biomeEdgeStrength ?? 1),
   );
 
+  separateDesertFromWetland(
+    width,
+    height,
+    biomeType,
+    Math.max(1, Math.round(DESERT_WETLAND_BUFFER_M / biomeCellSizeM)),
+  );
   applyWaterloggedBankBiomes(biomeType, heightAboveDrainageM, isOcean, isRiverChannel);
+  applyRiparianCorridors(
+    width,
+    height,
+    biomeType,
+    isOcean,
+    isRiverChannel,
+    strahlerOrder,
+    dxMeters,
+    dyMeters,
+    Math.max(1, options.biomeEdgeNoiseScaleM ?? DEFAULT_BIOME_EDGE_NOISE_SCALE_M),
+  );
 
   // Add shoreline materials after regional smoothing, preserving routed water.
   classifyCoastalBiomes(

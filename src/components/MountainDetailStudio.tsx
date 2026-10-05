@@ -776,7 +776,7 @@ export function MountainDetailStudio({
   // Hydrology & Micro-climate Controls
   const [showHeightmapWater, setShowHeightmapWater] = useState(false);
   const [showRivers, setShowRivers] = useState<boolean>(true);
-  const [riverThresholdKm2, setRiverThresholdKm2] = useState<number>(4);
+  const [riverThresholdKm2, setRiverThresholdKm2] = useState<number>(16);
   const [showWaterDetails, setShowWaterDetails] = useState<boolean>(true);
   const [showOceanDetails, setShowOceanDetails] = useState<boolean>(true);
   const [showWetlandPuddleContours, setShowWetlandPuddleContours] =
@@ -828,17 +828,17 @@ export function MountainDetailStudio({
     MOUNTAIN_REFERENCE_LINE_COLORS.waterFlow,
   );
   const [wetlandElevationThresholdM, setWetlandElevationThresholdM] =
-    useState<number>(400);
-  const [biomeRegionScaleKm, setBiomeRegionScaleKm] = useState<number>(1.0);
-  const [waterStageScale, setWaterStageScale] = useState<number>(1.2);
-  const [flowRateScale, setFlowRateScale] = useState<number>(0.45);
-  const [waterLandscapeImpact, setWaterLandscapeImpact] = useState<number>(0.7);
+    useState<number>(454);
+  const [biomeRegionScaleKm, setBiomeRegionScaleKm] = useState<number>(0.01);
+  const [waterStageScale, setWaterStageScale] = useState<number>(0.8);
+  const [flowRateScale, setFlowRateScale] = useState<number>(0.9);
+  const [waterLandscapeImpact, setWaterLandscapeImpact] = useState<number>(1);
   const [waterEvolutionStep, setWaterEvolutionStep] = useState<number>(0);
   const [rainOverlayOpacity, setRainOverlayOpacity] = useState<number>(0.0);
   const [windAzimuthDeg, setWindAzimuthDeg] = useState<number>(225);
   const [windSpeedMs, setWindSpeedMs] = useState<number>(16);
-  const [basePrecipMm, setBasePrecipMm] = useState<number>(1400);
-  const [baseTemperatureC, setBaseTemperatureC] = useState<number>(18);
+  const [basePrecipMm, setBasePrecipMm] = useState<number>(1500);
+  const [baseTemperatureC, setBaseTemperatureC] = useState<number>(17);
 
   // Contours
   const [showContours, setShowContours] = useState<boolean>(false);
@@ -1549,7 +1549,7 @@ export function MountainDetailStudio({
       setShowHeightmapWater(readStoredBoolean(stored, "showHeightmapWater", false));
       setShowRivers(readStoredBoolean(stored, "showRivers", true));
       setRiverThresholdKm2(
-        readStoredNumber(stored, "riverThresholdKm2", 4, 0.25, 20),
+        readStoredNumber(stored, "riverThresholdKm2", 16, 1, 200),
       );
       setShowWaterDetails(readStoredBoolean(stored, "showWaterDetails", true));
       setShowOceanDetails(readStoredBoolean(stored, "showOceanDetails", true));
@@ -1683,17 +1683,17 @@ export function MountainDetailStudio({
         ),
       );
       setWetlandElevationThresholdM(
-        readStoredNumber(stored, "wetlandElevationThresholdM", 400, 0, 3000),
+        readStoredNumber(stored, "wetlandElevationThresholdM", 454, 0, 3000),
       );
       setBiomeRegionScaleKm(
-        readStoredNumber(stored, "biomeRegionScaleKm", 1.0, 0.01, 1),
+        readStoredNumber(stored, "biomeRegionScaleKm", 0.01, 0.01, 1),
       );
       setWaterStageScale(
-        readStoredNumber(stored, "waterStageScale", 1.2, 0.3, 3),
+        readStoredNumber(stored, "waterStageScale", 0.8, 0.3, 3),
       );
-      setFlowRateScale(readStoredNumber(stored, "flowRateScale", 0.45, 0.2, 1));
+      setFlowRateScale(readStoredNumber(stored, "flowRateScale", 0.9, 0.2, 1));
       setWaterLandscapeImpact(
-        readStoredNumber(stored, "waterLandscapeImpact", 0.7, 0.1, 1),
+        readStoredNumber(stored, "waterLandscapeImpact", 1, 0.1, 1),
       );
       setWaterEvolutionStep(
         readStoredNumber(stored, "waterEvolutionStep", 0, 0, MOUNTAIN_WATER_EVOLUTION_STEPS, true),
@@ -1706,10 +1706,10 @@ export function MountainDetailStudio({
       );
       setWindSpeedMs(readStoredNumber(stored, "windSpeedMs", 16, 0, 60));
       setBasePrecipMm(
-        readStoredNumber(stored, "basePrecipMm", 1400, 100, 4000),
+        readStoredNumber(stored, "basePrecipMm", 1500, 100, 4000),
       );
       setBaseTemperatureC(
-        readStoredNumber(stored, "baseTemperatureC", 18, -10, 30),
+        readStoredNumber(stored, "baseTemperatureC", 17, -10, 30),
       );
       setShowContours(readStoredBoolean(stored, "showContours", false));
       setContourIntervalM(
@@ -4199,7 +4199,7 @@ export function MountainDetailStudio({
 
           <InspectorSection title="Rivers and climate">
             {num("Water evolution", waterEvolutionStep, (next) => setWaterEvolutionStep(Math.round(next)), 0, MOUNTAIN_WATER_EVOLUTION_STEPS, 1, { key: "waterEvolutionStep", commit: true, limits: [0, MOUNTAIN_WATER_EVOLUTION_STEPS], title: "0 is the initial terrain; later steps reroute rivers and erode the terrain" })}
-            {num("River catchment", riverThresholdKm2, setRiverThresholdKm2, 0.25, 20, 0.01, { unit: "km²", key: "riverThresholdKm2", commit: true, log: true, title: "Wet-climate area needed before a river appears" })}
+            {num("River catchment", riverThresholdKm2, setRiverThresholdKm2, 1, 200, 0.01, { unit: "km²", key: "riverThresholdKm2", commit: true, log: true, title: "Wet-climate catchment area needed before a river appears. 1 km² carries about 24 L/s in the reference climate; raise it for fewer, longer rivers" })}
             <InspectorFold title="Advanced climate and terrain evolution">
               {num("Wetland ceiling", wetlandElevationThresholdM, setWetlandElevationThresholdM, 0, 3000, 1, { unit: "m", key: "wetlandElevationThresholdM", commit: true, power: 2, title: "Flat terrain below this elevation can become wetland" })}
               {num("Biome region scale", biomeRegionScaleKm, setBiomeRegionScaleKm, 0.01, 1, 0.001, { unit: "km", key: "biomeRegionScaleKm", commit: true, log: true })}

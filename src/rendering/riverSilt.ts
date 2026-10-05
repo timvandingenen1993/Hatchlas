@@ -1,4 +1,5 @@
 import {
+  DEFAULT_RIVER_THRESHOLD_KM2,
   exactEuclideanDistanceTransform,
   type MountainDEMData,
 } from "../terrain/mountainBaseDEM";
@@ -169,7 +170,7 @@ export function buildRiverSiltDepthForDEM(
   riverThresholdKm2: number | undefined,
   options: RiverSiltOptions = {},
 ): Float32Array | null {
-  const threshold = Math.max(0.001, riverThresholdKm2 ?? 0.8);
+  const threshold = Math.max(0.001, riverThresholdKm2 ?? DEFAULT_RIVER_THRESHOLD_KM2);
   const area = dem.rainfallWeightedAreaKm2 ?? dem.drainageAreaKm2;
   const rivers = new Uint8Array(dem.width * dem.height);
   for (let index = 0; index < rivers.length; index++) {

@@ -7,6 +7,7 @@ import {
   rebuildMountainEvolutionStep,
   recomputeMountainLighting,
   resampleHeightmapLuminance,
+  DEFAULT_RIVER_THRESHOLD_KM2,
   resampleHeightmapMask,
   sampleMountainElevationProfile,
   smoothHeightmapLuminance,
@@ -1216,7 +1217,7 @@ function analyze(request: Extract<MountainPreviewRequest, { type: "analyze" }>):
         domainHeightKm: dem.domainHeightKm,
         minElevationM: dem.minElevationM,
         maxElevationM: dem.maxElevationM,
-        riverThresholdKm2: request.options.riverThresholdKm2 ?? 0.8,
+        riverThresholdKm2: request.options.riverThresholdKm2 ?? DEFAULT_RIVER_THRESHOLD_KM2,
       },
     };
   if (coreChanged) {

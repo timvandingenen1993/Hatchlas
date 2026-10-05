@@ -8,6 +8,8 @@ import {
   loadHeightmapImage,
   processMountainBaseDEM,
   rebuildMountainEvolutionStep,
+  applyRiparianCorridors,
+  separateDesertFromWetland,
   resampleHeightmapMask,
   type MountainEvolutionState,
   resampleHeightmapLuminance,
@@ -510,6 +512,102 @@ describe('2D Mountain Base DEM & Geomorphic Pipeline', () => {
       }
       expect(banks).toBeGreaterThan(0);
       expect(dryUplands).toBeGreaterThan(banks);
+    });
+
+    it('keeps rain-shadow rainfall above a realistic floor', () => {
+      const RW = 120;
+      const RH = 120;
+      const range = new Float32Array(RW * RH);
+      for (let y = 0; y < RH; y++) {
+        for (let x = 0; x < RW; x++) {
+          const dx = (x - RW / 2) / (RW * 0.16);
+          const dy = (y - RH / 2) / (RH * 0.38);
+          range[y * RW + x] = 0.05 + 0.9 * Math.exp(-(dx * dx + dy * dy));
+        }
+      }
+      const base = 1000;
+      const dem = processMountainBaseDEM(range, RW, RH, {
+        minElevationM: 80, maxElevationM: 3850, domainWidthKm: 45,
+        riverThresholdKm2: 40, windAzimuthDeg: 225, windSpeedMs: 16,
+        baseTemperatureC: 18, basePrecipitationMmYr: base,
+      });
+      // Without the floor the shadow falls to a few percent of base rainfall.
+      expect(Math.min(...dem.precipitationMmYr)).toBeGreaterThanOrEqual(base * 0.4 - 1);
+    });
+
+    it('does not make wetland from a shallow water table in a desert climate', () => {
+      const RW = 160;
+      const RH = 160;
+      const terrain = new Float32Array(RW * RH);
+      for (let y = 0; y < RH; y++) {
+        for (let x = 0; x < RW; x++) {
+          const range = Math.exp(-(((x - 18) / 16) ** 2)) * 0.85;
+          terrain[y * RW + x] = 0.03 + range + 0.03 * Math.abs(y - RH / 2) / (RH / 2) + 0.04 * (1 - x / RW);
+        }
+      }
+      const dem = processMountainBaseDEM(terrain, RW, RH, {
+        minElevationM: 0, maxElevationM: 3500, domainWidthKm: 30, biomeRegionScaleKm: 0.5,
+        riverThresholdKm2: 2, windAzimuthDeg: 270, windSpeedMs: 16,
+        baseTemperatureC: 30, basePrecipitationMmYr: 300, wetlandElevationThresholdM: 3500,
+      });
+      let waterloggedDesert = 0;
+      for (let index = 0; index < RW * RH; index++) {
+        if (dem.isOcean[index] === 1 || dem.isRiverChannel[index] === 1) continue;
+        const zone = getMountainClimateZoneLabel(dem, index);
+        if (!/desert|Bare soil/i.test(zone)) continue;
+        if (dem.heightAboveDrainageM![index] < 5.3) waterloggedDesert++;
+        expect(dem.biomeType[index]).not.toBe(7);
+      }
+      // Precondition: the scene does contain waterlogged ground in desert.
+      expect(waterloggedDesert).toBeGreaterThan(0);
+    });
+
+    it('keeps a semi-arid buffer between desert and wetland', () => {
+      const BW = 40;
+      const BH = 9;
+      const biomes = new Uint8Array(BW * BH).fill(15);
+      for (let y = 0; y < BH; y++) biomes[y * BW + 2] = 7;
+      separateDesertFromWetland(BW, BH, biomes, 5);
+      const row = (x: number) => biomes[4 * BW + x];
+      expect(row(2)).toBe(7);
+      expect(row(7)).toBe(17); // within the buffer: dry steppe
+      expect(row(8)).toBe(15); // beyond the buffer: still desert
+      expect(row(0)).toBe(17);
+      // Non-desert neighbours are left alone.
+      const forest = new Uint8Array(BW * BH).fill(4);
+      forest[4 * BW + 2] = 7;
+      separateDesertFromWetland(BW, BH, forest, 5);
+      expect(forest[4 * BW + 3]).toBe(4);
+    });
+
+    it('greens dry ground along a river out to a reach that grows with stream order', () => {
+      const CW = 80;
+      const CH = 6;
+      const run = (order: number, dry: number) => {
+        const biomes = new Uint8Array(CW * CH).fill(dry);
+        const river = new Uint8Array(CW * CH);
+        const orders = new Uint8Array(CW * CH);
+        for (let y = 0; y < CH; y++) {
+          river[y * CW] = 1;
+          orders[y * CW] = order;
+        }
+        applyRiparianCorridors(CW, CH, biomes, new Uint8Array(CW * CH), river, orders, 100, 100, 800);
+        // First column of ground that is still dry, i.e. the corridor width in cells.
+        let x = 1;
+        while (x < CW && biomes[2 * CW + x] !== dry) x++;
+        return { biomes, edge: x };
+      };
+      const small = run(1, 17);
+      const large = run(4, 17);
+      // 100 m cells: reach is 300 m (order 1) and 750 m (order 4), +-30%.
+      expect(small.edge).toBeGreaterThanOrEqual(2);
+      expect(small.edge).toBeLessThanOrEqual(5);
+      expect(large.edge).toBeGreaterThanOrEqual(5);
+      expect(large.edge).toBeLessThanOrEqual(10);
+      expect(large.edge).toBeGreaterThan(small.edge);
+      expect(large.biomes[2 * CW + 1]).toBe(5); // steppe becomes riparian shrubland
+      expect(large.biomes[2 * CW + 70]).toBe(17); // far ground stays dry
+      expect(run(4, 15).biomes[2 * CW + 1]).toBe(19); // desert becomes oasis
     });
 
     it('dries the lee side of a range through the rain shadow', () => {
