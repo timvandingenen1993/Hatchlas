@@ -2,13 +2,42 @@
  * Reference map for the global terrain picker: muted OpenFreeMap cartography
  * with Mapterhorn relief, drawn by MapLibre inside a Leaflet map.
  */
-import { maplibreGL } from "@maplibre/maplibre-gl-leaflet";
+import { MaplibreGL, maplibreGL } from "@maplibre/maplibre-gl-leaflet";
 import { setWorkerUrl, type Map, type StyleSpecification } from "maplibre-gl";
 import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
-import type L from "leaflet";
+import L from "leaflet";
 import "maplibre-gl/dist/maplibre-gl.css";
 
 setWorkerUrl(workerUrl);
+
+interface AdapterInternals {
+  _map: L.Map | null;
+  _glMap: (Map & { _actualCanvas: HTMLElement }) | null;
+  _resizeContainer: () => void;
+  _zoomEnd: () => void;
+}
+
+/**
+ * The adapter finishes resizes and zoom transitions in a frame callback that
+ * assumes the layer is still on a map. Loading terrain resizes the picker and
+ * then closes it within that frame, so the callback read a removed map. This
+ * copy of `_transitionEnd` (maplibre-gl-leaflet 0.1.4, ISC) checks first.
+ * It replaces the prototype method because `onAdd` binds it per instance.
+ */
+(MaplibreGL.prototype as unknown as { _transitionEnd: () => void })._transitionEnd = function (this: AdapterInternals) {
+  L.Util.requestAnimFrame(() => {
+    const map = this._map;
+    const glMap = this._glMap;
+    if (!map || !glMap) return;
+    const zoom = map.getZoom();
+    const center = map.getCenter();
+    const offset = map.latLngToContainerPoint(map.getBounds().getNorthWest());
+    this._resizeContainer();
+    L.DomUtil.setTransform(glMap._actualCanvas, offset, 1);
+    glMap.once("moveend", () => { if (this._map && this._glMap) this._zoomEnd(); });
+    glMap.jumpTo({ center, zoom: zoom - 1 });
+  });
+};
 
 const TERRAIN_LAYER = "reference-hillshade";
 const attribution = '<a href="https://openfreemap.org/">OpenFreeMap</a> · '
