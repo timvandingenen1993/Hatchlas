@@ -6,6 +6,10 @@
  * screen-up direction during illustration compositing.
  */
 
+import { MIN_POSITIVE_SCALE } from '../config/inspectorBounds';
+
+// *_MIN/*_MAX pairs are inspector slider ranges. Typed values may go beyond
+// them, so normalization only rejects values the renderer cannot represent.
 export const MOUNTAIN_VIEW_ANGLE_MIN_DEG = 75;
 export const MOUNTAIN_VIEW_ANGLE_MAX_DEG = 90;
 export const MOUNTAIN_VIEW_ANGLE_DEFAULT_DEG = 78;
@@ -103,16 +107,8 @@ export function normalizeMountainProjectionSettings(
   heightExaggeration: number | undefined,
 ): MountainProjectionSettings {
   return {
-    viewAngleDeg: clamp(
-      viewAngleDeg ?? MOUNTAIN_VIEW_ANGLE_DEFAULT_DEG,
-      MOUNTAIN_VIEW_ANGLE_MIN_DEG,
-      MOUNTAIN_VIEW_ANGLE_MAX_DEG,
-    ),
-    heightExaggeration: clamp(
-      heightExaggeration ?? MOUNTAIN_HEIGHT_EXAGGERATION_DEFAULT,
-      MOUNTAIN_HEIGHT_EXAGGERATION_MIN,
-      MOUNTAIN_HEIGHT_EXAGGERATION_MAX,
-    ),
+    viewAngleDeg: clamp(viewAngleDeg ?? MOUNTAIN_VIEW_ANGLE_DEFAULT_DEG, 1, MOUNTAIN_VIEW_ANGLE_MAX_DEG),
+    heightExaggeration: Math.max(0, heightExaggeration ?? MOUNTAIN_HEIGHT_EXAGGERATION_DEFAULT),
   };
 }
 
@@ -127,27 +123,18 @@ export function normalizeMountainLineworkSettings(
   horizontalHatchOpacity?: number,
   verticalHatchOpacity?: number,
 ): MountainLineworkSettings {
-  const normalizedOpacity = clamp(opacity ?? MOUNTAIN_LINEWORK_OPACITY_DEFAULT,
-    MOUNTAIN_LINEWORK_OPACITY_MIN, MOUNTAIN_LINEWORK_OPACITY_MAX);
-  const normalizedHatchOpacity = clamp(hatchOpacity ?? normalizedOpacity,
-    MOUNTAIN_HATCH_OPACITY_MIN, MOUNTAIN_HATCH_OPACITY_MAX);
+  const normalizedOpacity = clamp(opacity ?? MOUNTAIN_LINEWORK_OPACITY_DEFAULT, 0, 1);
+  const normalizedHatchOpacity = clamp(hatchOpacity ?? normalizedOpacity, 0, 1);
   return {
-    scale: clamp(scale ?? MOUNTAIN_LINEWORK_SCALE_DEFAULT,
-      MOUNTAIN_LINEWORK_SCALE_MIN, MOUNTAIN_LINEWORK_SCALE_MAX),
+    scale: Math.max(MIN_POSITIVE_SCALE, scale ?? MOUNTAIN_LINEWORK_SCALE_DEFAULT),
     opacity: normalizedOpacity,
     hatchOpacity: normalizedHatchOpacity,
-    horizontalHatchOpacity: clamp(horizontalHatchOpacity ?? normalizedHatchOpacity,
-      MOUNTAIN_HATCH_OPACITY_MIN, MOUNTAIN_HATCH_OPACITY_MAX),
-    verticalHatchOpacity: clamp(verticalHatchOpacity ?? normalizedHatchOpacity,
-      MOUNTAIN_HATCH_OPACITY_MIN, MOUNTAIN_HATCH_OPACITY_MAX),
-    hatchDensity: clamp(hatchDensity ?? MOUNTAIN_HATCH_DENSITY_DEFAULT,
-      MOUNTAIN_HATCH_DENSITY_MIN, MOUNTAIN_HATCH_DENSITY_MAX),
-    hatchThickness: clamp(hatchThickness ?? MOUNTAIN_HATCH_THICKNESS_DEFAULT,
-      MOUNTAIN_HATCH_THICKNESS_MIN, MOUNTAIN_HATCH_THICKNESS_MAX),
-    ridgeDensity: clamp(ridgeDensity ?? MOUNTAIN_RIDGE_DENSITY_DEFAULT,
-      MOUNTAIN_RIDGE_DENSITY_MIN, MOUNTAIN_RIDGE_DENSITY_MAX),
-    ridgeThickness: clamp(ridgeThickness ?? MOUNTAIN_RIDGE_THICKNESS_DEFAULT,
-      MOUNTAIN_RIDGE_THICKNESS_MIN, MOUNTAIN_RIDGE_THICKNESS_MAX),
+    horizontalHatchOpacity: clamp(horizontalHatchOpacity ?? normalizedHatchOpacity, 0, 1),
+    verticalHatchOpacity: clamp(verticalHatchOpacity ?? normalizedHatchOpacity, 0, 1),
+    hatchDensity: Math.max(0, hatchDensity ?? MOUNTAIN_HATCH_DENSITY_DEFAULT),
+    hatchThickness: Math.max(MIN_POSITIVE_SCALE, hatchThickness ?? MOUNTAIN_HATCH_THICKNESS_DEFAULT),
+    ridgeDensity: Math.max(0, ridgeDensity ?? MOUNTAIN_RIDGE_DENSITY_DEFAULT),
+    ridgeThickness: Math.max(MIN_POSITIVE_SCALE, ridgeThickness ?? MOUNTAIN_RIDGE_THICKNESS_DEFAULT),
   };
 }
 

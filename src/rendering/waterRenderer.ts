@@ -1,7 +1,7 @@
 /**
  * Water rendering: rivers, lakes and shorelines as ink strokes, with wave marks and splines.
  */
-import { INSPECTOR_BOUNDS } from "../config/inspectorBounds";
+import { INSPECTOR_BOUNDS, MIN_POSITIVE_SCALE } from "../config/inspectorBounds";
 import type { MountainDEMData } from "../terrain/mountainBaseDEM";
 import {
   extractDeepOpenOceanMask,
@@ -2281,16 +2281,14 @@ export function buildWetlandPuddleContours(
   const fillTone = new Uint8Array(totalCells);
   const puddleMask = new Uint8Array(totalCells);
   const puddleCoverage = new Float32Array(totalCells);
-  const density = Math.max(0, Math.min(2, options.density ?? 0.85));
+  // Typed inspector overrides may exceed the slider maxima; sizes stay fractions.
+  const density = Math.max(0, options.density ?? 0.85);
   const sizeMin = Math.max(INSPECTOR_BOUNDS.poolSizeMin, Math.min(1, options.sizeMin ?? 0.1));
   const sizeMax = Math.max(sizeMin, Math.min(1, options.sizeMax ?? 0.6));
-  const coastDistance = Math.max(0, Math.min(2, options.coastDistance ?? 0));
+  const coastDistance = Math.max(0, options.coastDistance ?? 0);
   const opacity = clamp01(options.opacity ?? 0.78);
   const coordinateScale = Math.max(0.25, options.coordinateScale ?? 1);
-  const thickness = Math.max(
-    0.2 * coordinateScale,
-    Math.min(3.5 * coordinateScale, options.thickness ?? 1),
-  );
+  const thickness = Math.max(0.2 * coordinateScale, options.thickness ?? 1);
   const seed = Math.round(options.seed ?? 23817);
   const coordinateOffsetX = options.coordinateOffsetX ?? 0;
   const coordinateOffsetY = options.coordinateOffsetY ?? 0;
@@ -6103,22 +6101,11 @@ function renderWaterOverlayInternal(
     0,
     options.deepOceanStrokeThickness ?? outlineThickness,
   );
-  const deepOceanWaveShadingScale = Math.max(
-    0.5,
-    Math.min(8, options.deepOceanWaveShadingScale ?? 4.5),
-  );
-  const deepOceanWaveShadingIntensity = Math.max(
-    0,
-    Math.min(4, options.deepOceanWaveShadingIntensity ?? 2.5),
-  );
-  const deepOceanTurbulenceScale = Math.max(
-    0.5,
-    Math.min(8, options.deepOceanTurbulenceScale ?? 4.5),
-  );
-  const deepOceanTurbulenceIntensity = Math.max(
-    0,
-    Math.min(INSPECTOR_BOUNDS.oceanTurbulence, options.deepOceanTurbulenceIntensity ?? 2.5),
-  );
+  // Typed inspector overrides may exceed the slider maxima.
+  const deepOceanWaveShadingScale = Math.max(MIN_POSITIVE_SCALE, options.deepOceanWaveShadingScale ?? 4.5);
+  const deepOceanWaveShadingIntensity = Math.max(0, options.deepOceanWaveShadingIntensity ?? 2.5);
+  const deepOceanTurbulenceScale = Math.max(MIN_POSITIVE_SCALE, options.deepOceanTurbulenceScale ?? 4.5);
+  const deepOceanTurbulenceIntensity = Math.max(0, options.deepOceanTurbulenceIntensity ?? 2.5);
   const outlineOpacity = clamp01(
     options.outlineOpacity ?? options.oceanWaveOpacity ?? 1,
   );
@@ -6128,10 +6115,7 @@ function renderWaterOverlayInternal(
   // and offshore wave paths use blue paint and foam.
   const charcoalDensity = Math.max(0, options.flowDensity ?? 1);
   const charcoalOpacity = clamp01(options.flowOpacity ?? 0.85);
-  const charcoalThickness = Math.max(
-    0.2,
-    options.flowThickness ?? 1,
-  );
+  const charcoalThickness = Math.max(MIN_POSITIVE_SCALE, options.flowThickness ?? 1);
   const charcoalLength = Math.max(0.1, options.flowLength ?? 1.0);
 
   const sourceOceanMask =
@@ -6763,7 +6747,7 @@ function renderWaterOverlayInternal(
   // ocean's cosine shallow-to-deep wash so both water bodies read alike.
   const lakeDepthM =
     dem.lakeDepthM?.length === totalCells ? dem.lakeDepthM : null;
-  const lakeFullDepthM = Math.max(0.5, options.lakeFullDepthM ?? 15);
+  const lakeFullDepthM = Math.max(MIN_POSITIVE_SCALE, options.lakeFullDepthM ?? 15);
   if (mode !== "geometry") {
     for (let index = 0; index < totalCells; index++) {
       if (waterAlpha[index] === 0 || oceanCoverage[index] >= 128) continue;

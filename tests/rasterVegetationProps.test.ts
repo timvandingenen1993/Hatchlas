@@ -10,6 +10,8 @@ import {
   buildMountainFoothillTransportField,
   isRasterPropPlacementValid,
   mapVegetationGeometryToTile,
+  propStandColorPartition,
+  rasterPropSettingsForBiome,
   rasterPropFootprintBounds,
   rasterPropShadowMetrics,
   renderVegetationOverlay,
@@ -91,6 +93,21 @@ function makeDem(width = 320, height = 240, biome = 3): MountainDEMData {
     isOcean: new Uint8Array(total),
     visualWaterMask: new Uint8Array(total),
     visualWaterCoverage: new Float32Array(total),
+  };
+}
+
+function standAsset(
+  key: string,
+  outlineGroup: "alpine-forest" | "wetland-forest",
+  eligibleBiomeIds: readonly number[],
+): VegetationRasterPropAsset {
+  return {
+    ...makeAsset(key, eligibleBiomeIds),
+    placementRole: outlineGroup === "wetland-forest" ? "wetland" : undefined,
+    footprintWidthCells: 1,
+    footprintHeightCells: 1,
+    heightCells: 0.8,
+    outlineGroup,
   };
 }
 
@@ -539,6 +556,126 @@ describe("grid-authored raster vegetation props", () => {
     const mask = geometry.stands![0].geometry.mask;
     expect(Array.from(mask).filter((value) => value > 0.5).length / mask.length).toBeGreaterThan(0.4);
     expect(geometry.rasterProps?.some((prop) => prop.assetKey === asset.key)).toBe(false);
+  });
+
+  it("gives dry steppe shrub stands by default, sparser than the wetland's", () => {
+    const shrubDefinition = VEGETATION_RASTER_PROP_DEFINITIONS.find((definition) =>
+      definition.placementRole === "wetland");
+    expect(shrubDefinition?.eligibleBiomeIds).toContain(17);
+    const asset = standAsset("wetland-shrub", "wetland-forest", shrubDefinition!.eligibleBiomeIds);
+    const options = {
+      density: 0,
+      motifDensity: 0,
+      rasterPropDensity: 1,
+      rasterPropCellSize: 16,
+      rasterPropAssets: [asset],
+      // Full wetland shrub density, so the steppe's lower default shows.
+      wetlandShrubDensity: 2,
+      wetlandImagePropDrynessBias: 1,
+    };
+    const steppe = buildVegetationRasterPropPlacements(makeDem(320, 240, 17), options);
+    const wetland = buildVegetationRasterPropPlacements(makeDem(320, 240, 7), options);
+    expect(steppe.length).toBeGreaterThan(0);
+    expect(steppe.every((prop) => prop.biomeId === 17 && prop.rotation === 0)).toBe(true);
+    expect(steppe.length).toBeLessThan(wetland.length * 0.8);
+
+    const geometry = buildVegetationGeometry(makeDem(320, 240, 17), options);
+    expect(geometry.stands?.map((stand) => [stand.group, stand.biomeIds])).toEqual([["wetland-shrubs", [17]]]);
+    expect(geometry.stands?.[0].geometry.items.length).toBeGreaterThan(0);
+    expect(geometry.rasterProps?.some((prop) => prop.assetKey === asset.key)).toBe(false);
+  });
+
+  it("keeps the wetland's former shrub density and the forest biomes' tree density as defaults", () => {
+    const options = {
+      rasterPropDensity: 1.5,
+      rasterPropBiomeSettings: { 3: { density: 1.8 }, 7: { density: 2 } },
+      wetlandShrubDensity: 1,
+    };
+    expect(rasterPropSettingsForBiome(options, 3)).toMatchObject({ treeDensity: 1.8, shrubDensity: 0 });
+    // The old shrub factor saturated at 2: density × min(1, shrub / 2).
+    expect(rasterPropSettingsForBiome(options, 7)).toMatchObject({ treeDensity: 0, shrubDensity: 1 });
+    expect(rasterPropSettingsForBiome({ ...options, wetlandShrubDensity: 4 }, 7).shrubDensity).toBe(2);
+    expect(rasterPropSettingsForBiome(options, 18)).toMatchObject({ treeDensity: 0, shrubDensity: 0 });
+  });
+
+  it("places trees and shrubs in any stand biome from its own densities", () => {
+    const dem = makeDem(400, 300, 18);
+    for (let y = 0; y < 300; y++) for (let x = 200; x < 400; x++) dem.biomeType[y * 400 + x] = 4;
+    const tree = standAsset("tree", "alpine-forest", [4, 18]);
+    const shrub = standAsset("shrub", "wetland-forest", [4, 18]);
+    const options = {
+      density: 0,
+      motifDensity: 0,
+      rasterPropDensity: 1,
+      rasterPropCellSize: 16,
+      rasterPropAssets: [tree, shrub],
+    };
+    const count = (placements: VegetationRasterPropPlacement[], biome: number, key: string) =>
+      placements.filter((prop) => prop.biomeId === biome && prop.assetKey === key).length;
+
+    // Defaults: trees in the woodland, nothing in the prairie.
+    const base = buildVegetationRasterPropPlacements(dem, options);
+    expect(count(base, 4, "tree")).toBeGreaterThan(0);
+    expect(count(base, 4, "shrub") + count(base, 18, "tree") + count(base, 18, "shrub")).toBe(0);
+
+    const mixed = buildVegetationRasterPropPlacements(dem, {
+      ...options,
+      rasterPropBiomeSettings: { 4: { treeDensity: 0, shrubDensity: 1 }, 18: { treeDensity: 1, shrubDensity: 1 } },
+    });
+    expect(count(mixed, 4, "tree")).toBe(0);
+    expect(count(mixed, 4, "shrub")).toBeGreaterThan(0);
+    // Trees and shrubs sharing a biome both find room.
+    expect(count(mixed, 18, "tree")).toBeGreaterThan(0);
+    expect(count(mixed, 18, "shrub")).toBeGreaterThan(count(mixed, 4, "shrub") * 0.25);
+  });
+
+  it("draws trees among shrubs from each biome's own share", () => {
+    const shrub = standAsset("shrub", "wetland-forest", [7, 17]);
+    const options = {
+      density: 0,
+      motifDensity: 0,
+      rasterPropDensity: 1,
+      rasterPropCellSize: 16,
+      rasterPropAssets: [shrub],
+      wetlandShrubDensity: 2,
+      rasterPropBiomeSettings: { 17: { shrubDensity: 1 } },
+    };
+    const accentTrees = (biome: number, settings: typeof options) =>
+      buildVegetationGeometry(makeDem(320, 240, biome), settings).stands!
+        .flatMap((stand) => stand.geometry.items)
+        .filter((item) => item.fills.some((fill) => fill.style === "accent")).length;
+    // The wetland keeps the stand setting; other biomes have none until set.
+    expect(accentTrees(7, options)).toBeGreaterThan(0);
+    expect(accentTrees(17, options)).toBe(0);
+    expect(accentTrees(17, { ...options, rasterPropBiomeSettings: { 17: { shrubDensity: 1, shrubTreeShare: 0.3 } } }))
+      .toBeGreaterThan(0);
+  });
+
+  it("splits stands only between biomes painted differently", () => {
+    const dem = makeDem(400, 300, 7);
+    for (let y = 0; y < 300; y++) for (let x = 200; x < 400; x++) dem.biomeType[y * 400 + x] = 17;
+    const shrub = standAsset("shrub", "wetland-forest", [7, 17]);
+    const options = {
+      density: 0,
+      motifDensity: 0,
+      rasterPropDensity: 1,
+      rasterPropCellSize: 16,
+      rasterPropAssets: [shrub],
+      wetlandShrubDensity: 2,
+      // The wetland's share of trees among shrubs, so only colour differs.
+      rasterPropBiomeSettings: { 17: { shrubDensity: 1, shrubTreeShare: 0.18 } },
+    };
+    const shared = buildVegetationGeometry(dem, options);
+    expect(shared.stands?.map((stand) => stand.biomeIds)).toEqual([[7, 17]]);
+
+    const painted = { ...options, rasterPropBiomeSettings: { 17: { shrubDensity: 1, shrubTreeShare: 0.18, shrubColor: "#c0a060" } } };
+    const split = buildVegetationGeometry(dem, painted);
+    expect(split.stands?.map((stand) => stand.biomeIds).sort()).toEqual([[17], [7]]);
+
+    // Recolouring keeps the geometry unless it changes which biomes share a stand.
+    expect(propStandColorPartition(painted)).not.toBe(propStandColorPartition(options));
+    expect(propStandColorPartition({ ...painted, rasterPropBiomeSettings: { 17: { shrubTreeShare: 0.18, shrubColor: "#806040" } } }))
+      .toBe(propStandColorPartition(painted));
   });
 
   it("keeps stands on near-flat ground lit and shades only clearly darker slopes", () => {

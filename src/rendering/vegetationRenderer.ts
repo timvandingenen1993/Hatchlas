@@ -1,7 +1,7 @@
 /**
  * Places and draws vegetation: trees, shrubs, reeds and stands, using the motif registry.
  */
-import { INSPECTOR_BOUNDS } from "../config/inspectorBounds";
+import { MIN_POSITIVE_SCALE } from "../config/inspectorBounds";
 import { SimplexNoise } from "../core/noise";
 import { sampleCartographicGrain, sampleCartographicWashNoise, sampleCartographicPatchNoise,
   filterCartographicGradient as filterVegetationGradient,
@@ -26,6 +26,14 @@ import {
   type CharcoalStrokeRun,
 } from "./cartographicStrokeRenderer";
 import { VEGETATION_MOTIF_DEFINITIONS } from "./vegetationMotifs";
+import {
+  desertDuneSignature,
+  isDesertDunePixel,
+  paintDesertDunes,
+  resolveDesertDuneOptions,
+  type DesertDuneOptions,
+  type ResolvedDesertDuneOptions,
+} from "./desertDunes";
 import { parseHexColor } from "./propColorVariation";
 
 import {
@@ -48,7 +56,7 @@ import {
 } from "./forestStandGeometry";
 import { renderForestStandLayer } from "./forestStandRenderer";
 
-export type VegetationMotifFamily = "grass" | "reeds" | "shrub" | "universal";
+export type VegetationMotifFamily = "grass" | "reeds" | "shrub" | "universal" | "arid";
 export type VegetationPatternPreset = "adaptive" | VegetationMotifFamily;
 
 export interface VegetationMotifAsset {
@@ -197,6 +205,8 @@ export interface VegetationGeometry {
 export interface VegetationPropStand {
   /** Id of the stand group the geometry was built for. */
   group: string;
+  /** Biomes whose plants form this stand; they share its stand colours. */
+  biomeIds: number[];
   geometry: ForestStandGeometry;
 }
 
@@ -225,23 +235,71 @@ export type VegetationPlacementTerrain = Pick<
 >>;
 
 export type RasterPropBiomeSettings = Partial<Record<number, {
+  /** Density of props outside the tree and shrub stands. */
   density?: number;
+  /** Density of the trees drawn as forest stands. */
+  treeDensity?: number;
+  /** Density of the shrubs drawn as shrub stands. */
+  shrubDensity?: number;
   clustering?: number;
+  /** Stand tree foliage; also the accent trees inside shrub stands. */
+  treeColor?: string;
+  shrubColor?: string;
+  /** Share of shrub-stand plants drawn as trees. */
+  shrubTreeShare?: number;
 }>>;
+
+/** Biomes whose trees default to the biome's prop density, as before per-biome tree density. */
+const DEFAULT_TREE_BIOMES: ReadonlySet<number> = new Set([2, 3, 4]);
+/** Shrub density of biomes with shrub stands unless the inspector sets otherwise. */
+const DEFAULT_SHRUB_DENSITY: Readonly<Record<number, number>> = { 17: 0.5 };
 
 export function rasterPropSettingsForBiome(options: {
   rasterPropDensity?: number;
   rasterPropClustering?: number;
   rasterPropBiomeSettings?: RasterPropBiomeSettings;
+  wetlandShrubDensity?: number;
 } | undefined, biomeId: number) {
   const override = options?.rasterPropBiomeSettings?.[biomeId];
+  const density = Math.max(0, override?.density ?? options?.rasterPropDensity ?? 0.42);
+  // Wetland shrubs used to scale the wetland's prop density by a shrub
+  // factor that saturated at 2; that product is the wetland's shrub density.
+  const legacyShrubDensity = biomeId === 7
+    ? density * clamp01(Math.max(0, options?.wetlandShrubDensity ?? 0.55) / 2)
+    : DEFAULT_SHRUB_DENSITY[biomeId] ?? 0;
   return {
-    density: Math.max(0, Math.min(INSPECTOR_BOUNDS.propDensity, override?.density ?? options?.rasterPropDensity ?? 0.42)),
+    density,
+    treeDensity: Math.max(0, override?.treeDensity ?? (DEFAULT_TREE_BIOMES.has(biomeId) ? density : 0)),
+    shrubDensity: Math.max(0, override?.shrubDensity ?? legacyShrubDensity),
     clustering: clamp01(override?.clustering ?? options?.rasterPropClustering ?? 0.65),
   };
 }
 
-export interface VegetationPatternOptions {
+/**
+ * Stand look of one biome: colours and the share of trees among its shrubs.
+ * Unset colours fall back to the forest palette. Only the wetland's shrub
+ * stands carry trees unless a biome sets its own share.
+ */
+export function propStandStyleForBiome(
+  forestSettings: Pick<
+    ForestRenderSettings,
+    "alpineCanopyColor" | "wetlandCanopyColor" | "wetlandShrubColor" | "standAccentTrees"
+  >,
+  biomeSettings: RasterPropBiomeSettings | undefined,
+  biomeId: number,
+): { tree: string; shrub: string; shrubTreeShare: number } {
+  const override = biomeSettings?.[biomeId];
+  return {
+    shrubTreeShare: Math.max(0, override?.shrubTreeShare ?? (biomeId === 7 ? forestSettings.standAccentTrees : 0)),
+    // Outside the forest biomes, trees default to the paler wetland tree
+    // colour that the shrub stands' accent trees were tuned with.
+    tree: override?.treeColor ??
+      (DEFAULT_TREE_BIOMES.has(biomeId) ? forestSettings.alpineCanopyColor : forestSettings.wetlandCanopyColor),
+    shrub: override?.shrubColor ?? forestSettings.wetlandShrubColor,
+  };
+}
+
+export interface VegetationPatternOptions extends DesertDuneOptions {
   preset?: VegetationPatternPreset;
   seed?: number;
   density?: number;
@@ -289,6 +347,8 @@ export interface VegetationPatternOptions {
   /** Scale forest ink, shadows, and texture marks with mapped export geometry. */
   forestRenderScale?: number;
   inkColor?: string;
+  /** Ink for desert biomes (15, 16), a warm sepia that suits sand better than `inkColor`. */
+  aridInkColor?: string;
   /** Subtle tonal lift around curl-field centres. */
   flowWashStrength?: number;
   /** Strength of the darker outer flow-wash colour stop. */
@@ -343,6 +403,8 @@ export interface VegetationPatternOptions {
 
 export interface ResolvedVegetationPatternOptions {
   preset: VegetationPatternPreset;
+  /** Procedural dunes for sand desert; see desertDunes.ts. */
+  desertDunes: ResolvedDesertDuneOptions;
   seed: number;
   density: number;
   patternScale: number;
@@ -482,6 +544,12 @@ const BIOME_SUITABILITY: Readonly<Record<number, number>> = {
   4: 0.7,
   5: 0.8,
   7: 1,
+  15: 0.3,
+  16: 0.25,
+  17: 0.55,
+  18: 0.85,
+  19: 0.95,
+  20: 0.85,
 };
 
 type VegetationMotifPercentages = Readonly<
@@ -499,14 +567,27 @@ type VegetationMotifPercentages = Readonly<
  * 4 = Montane Broadleaf Woodland
  * 5 = Riparian Canyon & Shrubland
  * 7 = Valley Floodplain & Wetland
+ * 15 = Sand Desert & Dunes
+ * 16 = Rocky Desert & Hamada
+ * 17 = Dry Steppe
+ * 18 = Grassland & Prairie
+ * 19 = Desert Oasis
+ * 20 = Montane Meadow
  */
 export const BIOME_MOTIF_PERCENTAGES: Readonly<
   Record<number, VegetationMotifPercentages>
 > = {
-  2: { grass: 67, reeds: 0, shrub: 11, universal: 22 },
-  4: { grass: 30, reeds: 0, shrub: 48, universal: 22 },
-  5: { grass: 25, reeds: 0, shrub: 53, universal: 22 },
-  7: { grass: 0, reeds: 0, shrub: 80, universal: 20 },
+  2: { grass: 67, reeds: 0, shrub: 11, universal: 22, arid: 0 },
+  4: { grass: 30, reeds: 0, shrub: 48, universal: 22, arid: 0 },
+  5: { grass: 25, reeds: 0, shrub: 53, universal: 22, arid: 0 },
+  7: { grass: 0, reeds: 0, shrub: 80, universal: 20, arid: 0 },
+  // Deserts use the sparse arid marks instead of grass and shrubs.
+  15: { grass: 0, reeds: 0, shrub: 0, universal: 0, arid: 100 },
+  16: { grass: 0, reeds: 0, shrub: 0, universal: 0, arid: 100 },
+  17: { grass: 70, reeds: 0, shrub: 20, universal: 10, arid: 0 },
+  18: { grass: 85, reeds: 0, shrub: 5, universal: 10, arid: 0 },
+  19: { grass: 15, reeds: 0, shrub: 65, universal: 20, arid: 0 },
+  20: { grass: 75, reeds: 0, shrub: 8, universal: 17, arid: 0 },
 };
 
 export function resolveVegetationPatternOptions(
@@ -514,51 +595,37 @@ export function resolveVegetationPatternOptions(
 ): ResolvedVegetationPatternOptions {
   return {
     preset: options?.preset ?? "adaptive",
+    desertDunes: resolveDesertDuneOptions(options),
     seed: Math.round(options?.seed ?? 23817),
-    density: Math.max(0, Math.min(INSPECTOR_BOUNDS.groundDensity, options?.density ?? 1)),
-    patternScale: Math.max(0.5, Math.min(INSPECTOR_BOUNDS.patternScale, options?.patternScale ?? 1)),
+    // Inspector values may be typed beyond their slider range, so only the
+    // floors that keep each setting meaningful are enforced here.
+    density: Math.max(0, options?.density ?? 1),
+    patternScale: Math.max(MIN_POSITIVE_SCALE, options?.patternScale ?? 1),
     swirlStrength: clamp01(options?.swirlStrength ?? 0.65),
     terrainFollowing: clamp01(options?.terrainFollowing ?? 0.35),
-    strokeLength: Math.max(0.4, Math.min(INSPECTOR_BOUNDS.strokeLength, options?.strokeLength ?? 1)),
-    strokeThickness: Math.max(0.1, Math.min(3, options?.strokeThickness ?? 1)),
+    strokeLength: Math.max(MIN_POSITIVE_SCALE, options?.strokeLength ?? 1),
+    strokeThickness: Math.max(MIN_POSITIVE_SCALE, options?.strokeThickness ?? 1),
     strokeOpacity: clamp01(options?.strokeOpacity ?? 0.72),
-    mountainSideRidgeDensity: Math.max(
-      0,
-      Math.min(2, options?.mountainSideRidgeDensity ?? 1),
-    ),
-    mountainMainRidgeThickness: Math.max(
-      0.25,
-      Math.min(2, options?.mountainMainRidgeThickness ?? 0.75),
-    ),
+    mountainSideRidgeDensity: Math.max(0, options?.mountainSideRidgeDensity ?? 1),
+    mountainMainRidgeThickness: Math.max(MIN_POSITIVE_SCALE, options?.mountainMainRidgeThickness ?? 0.75),
     drySkipProbability: clamp01(options?.drySkipProbability ?? 0.05),
     lineInterruptionProbability: clamp01(
       options?.lineInterruptionProbability ?? 0.3,
     ),
-    motifDensity: Math.max(0, Math.min(1.5, options?.motifDensity ?? 0.8)),
-    motifSize: Math.max(0.1, Math.min(5, options?.motifSize ?? 1)),
-    wetlandShrubDensity: Math.max(0, Math.min(INSPECTOR_BOUNDS.propDensity, options?.wetlandShrubDensity ?? 0.55)),
+    motifDensity: Math.max(0, options?.motifDensity ?? 0.8),
+    motifSize: Math.max(MIN_POSITIVE_SCALE, options?.motifSize ?? 1),
+    wetlandShrubDensity: Math.max(0, options?.wetlandShrubDensity ?? 0.55),
     wetlandImagePropDrynessBias: clamp01(
       options?.wetlandImagePropDrynessBias ?? 0.65,
     ),
     rasterPropAssets: options?.rasterPropAssets ?? [],
     rasterPropBiomeSettings: options?.rasterPropBiomeSettings ?? {},
-    rasterPropDensity: Math.max(
-      0,
-      Math.min(INSPECTOR_BOUNDS.propDensity, options?.rasterPropDensity ?? 0.42),
-    ),
+    rasterPropDensity: Math.max(0, options?.rasterPropDensity ?? 0.42),
     mountainBoulderDensity: Math.max(
       0,
-      Math.min(
-        2,
-        options?.mountainBoulderDensity ??
-          options?.rasterPropDensity ??
-          0.42,
-      ),
+      options?.mountainBoulderDensity ?? options?.rasterPropDensity ?? 0.42,
     ),
-    mountainBoulderSize: Math.max(
-      0.5,
-      Math.min(2, options?.mountainBoulderSize ?? 1),
-    ),
+    mountainBoulderSize: Math.max(MIN_POSITIVE_SCALE, options?.mountainBoulderSize ?? 1),
     rasterPropCellSize: Math.max(
       4,
       Math.min(256, options?.rasterPropCellSize ?? 16),
@@ -566,34 +633,19 @@ export function resolveVegetationPatternOptions(
     rasterPropScale:
       options?.rasterPropScale === undefined
         ? undefined
-        : Math.max(INSPECTOR_BOUNDS.propScaleMin, Math.min(4, options.rasterPropScale)),
+        : Math.max(MIN_POSITIVE_SCALE, options.rasterPropScale),
     rasterPropClustering: clamp01(options?.rasterPropClustering ?? 0.65),
     rasterPropStandSize: clamp01(options?.rasterPropStandSize ?? 0.5),
-    rasterPropPlacementNoiseScale: Math.max(
-      0.25,
-      Math.min(4, options?.rasterPropPlacementNoiseScale ?? 1),
-    ),
+    rasterPropPlacementNoiseScale: Math.max(MIN_POSITIVE_SCALE, options?.rasterPropPlacementNoiseScale ?? 1),
     forestSettings: { ...DEFAULT_FOREST_RENDER_SETTINGS, ...options?.forestSettings },
     forestRenderScale: Math.max(0.25, Math.min(128, options?.forestRenderScale ?? 1)),
     inkColor: options?.inkColor ?? "#2f4a2d",
     flowWashStrength: clamp01(options?.flowWashStrength ?? 0.24),
     flowWashNoiseStrength: clamp01(options?.flowWashNoiseStrength ?? 0.45),
-    flowWashNoiseScale: Math.max(
-      0.5,
-      Math.min(INSPECTOR_BOUNDS.washNoiseScale, options?.flowWashNoiseScale ?? 1),
-    ),
-    wetlandDryDistanceStart: Math.max(
-      0,
-      Math.min(100, options?.wetlandDryDistanceStart ?? 8),
-    ),
-    wetlandDryDistanceEnd: Math.max(
-      1,
-      Math.min(INSPECTOR_BOUNDS.wetlandDryEnd, options?.wetlandDryDistanceEnd ?? 32),
-    ),
-    wetlandDryNoiseScale: Math.max(
-      0.5,
-      Math.min(3, options?.wetlandDryNoiseScale ?? 1.4),
-    ),
+    flowWashNoiseScale: Math.max(MIN_POSITIVE_SCALE, options?.flowWashNoiseScale ?? 1),
+    wetlandDryDistanceStart: Math.max(0, options?.wetlandDryDistanceStart ?? 8),
+    wetlandDryDistanceEnd: Math.max(1, options?.wetlandDryDistanceEnd ?? 32),
+    wetlandDryNoiseScale: Math.max(MIN_POSITIVE_SCALE, options?.wetlandDryNoiseScale ?? 1.4),
     wetlandDryNoiseStrength: clamp01(options?.wetlandDryNoiseStrength ?? 0.9),
     showFlowGuides: options?.showFlowGuides ?? false,
     showWetlandDrynessOverlay: options?.showWetlandDrynessOverlay ?? false,
@@ -601,20 +653,11 @@ export function resolveVegetationPatternOptions(
       options?.showAlpineTreeSuitabilityOverlay ?? false,
     waterDistanceOverride: options?.waterDistanceOverride,
     motifShadowStrength: clamp01(options?.motifShadowStrength ?? 0.2),
-    motifShadowDistance: Math.max(
-      0,
-      Math.min(8, options?.motifShadowDistance ?? 2.2),
-    ),
-    motifShadowSoftness: Math.max(
-      0,
-      Math.min(INSPECTOR_BOUNDS.markShadowSoftness, options?.motifShadowSoftness ?? 1.1),
-    ),
+    motifShadowDistance: Math.max(0, options?.motifShadowDistance ?? 2.2),
+    motifShadowSoftness: Math.max(0, options?.motifShadowSoftness ?? 1.1),
     washShadowStrength: clamp01(options?.washShadowStrength ?? 0.2),
-    washShadowDistance: Math.max(
-      0,
-      Math.min(INSPECTOR_BOUNDS.washShadowOffset, options?.washShadowDistance ?? 2.2),
-    ),
-    washShadowGap: Math.max(0, Math.min(INSPECTOR_BOUNDS.washShadowGap, options?.washShadowGap ?? 1)),
+    washShadowDistance: Math.max(0, options?.washShadowDistance ?? 2.2),
+    washShadowGap: Math.max(0, options?.washShadowGap ?? 1),
     washShadowGrain: clamp01(options?.washShadowGrain ?? 1),
     motifAssets: options?.motifAssets ?? [],
     coordinateOffsetX: Math.round(options?.coordinateOffsetX ?? 0),
@@ -2152,10 +2195,17 @@ function chooseMotifKey(
     families.add(definition.family);
   }
 
+  // Until desert artwork is supplied, arid placements use the plain line
+  // and dot marks, which are the least bushy registered family.
+  const aridFallback =
+    preset === "adaptive" && !families.has("arid")
+      ? Math.max(0, percentages?.arid ?? 0)
+      : 0;
   const weightedFamilies = [...families].map((family) => {
     const familyWeight =
       preset === "adaptive"
-        ? Math.max(0, percentages?.[family] ?? 0)
+        ? Math.max(0, percentages?.[family] ?? 0) +
+          (family === "universal" ? aridFallback : 0)
         : family === preset
           ? 100
           : 0;
@@ -2403,6 +2453,12 @@ export function placeMotifsAlongPath(
       distance,
     );
     const placementBiome = biomeAt(dem, sample.x, sample.y);
+    // Streamlines seeded next door can run into sand desert; the dune
+    // renderer owns those pixels, so no flow-line marks are placed there.
+    if (isDesertDunePixel(options.desertDunes, placementBiome)) {
+      placementIndex++;
+      continue;
+    }
     const assetKey = chooseMotifKey(
       placementBiome,
       options.preset,
@@ -3706,6 +3762,16 @@ export function buildMountainFoothillPropPlacements(
   return placements;
 }
 
+/** Which stand kind a raster prop belongs to, if any. */
+function standPropKind(asset: VegetationRasterPropAsset): "tree" | "shrub" | undefined {
+  if (asset.outlineGroup === "alpine-forest") return "tree";
+  if (asset.outlineGroup === "wetland-forest") return "shrub";
+  return undefined;
+}
+
+/** Seed salt for shrub candidates sharing a biome with trees, so the two kinds do not compete for the same spots. */
+const SHRUB_CANDIDATE_SEED_SALT = 0x5a1b7e;
+
 function placeRasterProps(
   geometry: VegetationGeometry,
   dem: VegetationPlacementTerrain,
@@ -3713,6 +3779,7 @@ function placeRasterProps(
   targetBiome?: number,
   profiler?: MountainProfiler,
   reportProgress?: VegetationPreparationReporter,
+  standDensity?: { tree: number; shrub: number },
 ): void {
   const vegetationAssets = options.rasterPropAssets.filter((asset) =>
     (asset.placementRole ?? "vegetation") !== "mountain-foothill",
@@ -3724,9 +3791,14 @@ function placeRasterProps(
     );
     for (const biome of biomes) {
       const settings = rasterPropSettingsForBiome(options, biome);
-      const biomeAssets = vegetationAssets.filter((asset) =>
-        asset.eligibleBiomeIds.includes(biome),
-      );
+      const kindDensity = { tree: settings.treeDensity, shrub: settings.shrubDensity };
+      // Stand kinds turned off for this biome take no part in its placement,
+      // including the habitat fields they would otherwise trigger.
+      const biomeAssets = vegetationAssets.filter((asset) => {
+        if (!asset.eligibleBiomeIds.includes(biome)) return false;
+        const kind = standPropKind(asset);
+        return kind === undefined || kindDensity[kind] > 0;
+      });
       if (biomeAssets.length === 0) continue;
       placeRasterProps(
         geometry,
@@ -3740,6 +3812,7 @@ function placeRasterProps(
         biome,
         profiler,
         reportProgress,
+        kindDensity,
       );
     }
     return;
@@ -3772,13 +3845,11 @@ function placeRasterProps(
         )
       : buildWetlandImageWaterDistance(dem as MountainDEMData, profiler)
     : undefined;
+  // Trees and shrubs grow as stands: each kind gets its own woodland-style
+  // candidates at that kind's density for this biome.
+  const kindDensity = standDensity ?? { tree: options.rasterPropDensity, shrub: options.rasterPropDensity };
   const forestAssets = vegetationAssets.filter((asset) =>
-    asset.eligibleBiomeIds.includes(targetBiome) && (
-      targetBiome === 7
-        ? asset.outlineGroup === "wetland-forest"
-        : (targetBiome === 2 || targetBiome === 3 || targetBiome === 4) &&
-          asset.outlineGroup === "alpine-forest"
-    ),
+    asset.eligibleBiomeIds.includes(targetBiome) && standPropKind(asset) !== undefined,
   );
   const forestCandidatesByAsset = new Map<
     VegetationRasterPropAsset,
@@ -3787,30 +3858,37 @@ function placeRasterProps(
   const forestCandidateStop = forestAssets.length > 0
     ? profiler?.begin("vegetation forest candidate generation and grouping")
     : undefined;
-  if (forestAssets.length > 0) {
+  const hasTrees = kindDensity.tree > 0 &&
+    forestAssets.some((asset) => standPropKind(asset) === "tree");
+  for (const kind of ["tree", "shrub"] as const) {
+    const kindAssets = forestAssets.filter((asset) => standPropKind(asset) === kind);
+    if (kindAssets.length === 0 || kindDensity[kind] <= 0) continue;
     const forestCandidates = buildForestCandidates(
       dem,
       propCellSize * Math.max(
-        ...forestAssets.map(asset => Math.max(
+        ...kindAssets.map(asset => Math.max(
           asset.renderWidthCells ?? asset.footprintWidthCells,
           asset.renderHeightCells ?? asset.footprintHeightCells,
         )),
       ),
-      options,
+      {
+        ...options,
+        rasterPropDensity: kindDensity[kind],
+        seed: kind === "shrub" && hasTrees ? options.seed ^ SHRUB_CANDIDATE_SEED_SALT : options.seed,
+      },
       reportProgress,
-      targetBiome === 2 || targetBiome === 3 || targetBiome === 4
-        ? dem
-        : undefined,
+      // Trees read the terrain for shelter-shaped clearings and habitat.
+      kind === "tree" ? dem : undefined,
       targetBiome,
     );
     reportProgress?.("Grouping forest candidates");
     for (let index = 0; index < forestCandidates.length; index++) {
       const candidate = forestCandidates[index];
-      const assetIndex = Math.floor(hash01(candidate.key, 937) * forestAssets.length);
+      const assetIndex = Math.floor(hash01(candidate.key, 937) * kindAssets.length);
       // hash01 can produce exactly 1 for its maximum uint value. The previous
       // per-asset filter then matched no asset for that candidate.
-      if (assetIndex >= forestAssets.length) continue;
-      const asset = forestAssets[assetIndex];
+      if (assetIndex >= kindAssets.length) continue;
+      const asset = kindAssets[assetIndex];
       let grouped = forestCandidatesByAsset.get(asset);
       if (!grouped) {
         grouped = [];
@@ -3827,12 +3905,8 @@ function placeRasterProps(
     const asset = vegetationAssets[assetIndex];
     if (!asset.eligibleBiomeIds.includes(targetBiome)) continue;
     const forest = forestAssets.includes(asset);
-    const wetlandTypeDensity = targetBiome === 7 && asset.placementRole === "wetland"
-      ? options.wetlandShrubDensity
-      : undefined;
-    const propDensity = wetlandTypeDensity === undefined
-      ? options.rasterPropDensity
-      : wetlandTypeDensity * options.rasterPropDensity;
+    const kind = standPropKind(asset);
+    const propDensity = kind ? kindDensity[kind] : options.rasterPropDensity;
     if (propDensity <= 0) continue;
     const footprint = Math.max(
       asset.footprintWidthCells,
@@ -3873,10 +3947,7 @@ function placeRasterProps(
     }): boolean => {
       const candidateBiome = biomeAt(dem, candidate.x, candidate.y);
       if (candidateBiome !== targetBiome) return false;
-      if (
-        forest && asset.outlineGroup === "alpine-forest" &&
-        (targetBiome === 2 || targetBiome === 3 || targetBiome === 4)
-      ) {
+      if (forest && kind === "tree") {
         const habitatWeight = candidate.habitatWeight ??
           sampleAlpineForestTerrainSuitability(dem, candidate.x, candidate.y).habitatWeight;
         if (hash01(candidate.key, 941) >= habitatWeight) return false;
@@ -3893,18 +3964,19 @@ function placeRasterProps(
         assetKey: asset.key,
       };
       if (
-        forest && wetlandTypeDensity !== undefined &&
-        hash01(candidate.key, 839) >= clamp01(wetlandTypeDensity / 2)
-      ) return false;
-      if (placement.biomeId === 7 && wetlandWaterDistance) {
+        placement.biomeId === 7 && wetlandWaterDistance &&
+        asset.placementRole !== "wetland"
+      ) {
         const index =
           Math.round(placement.y) * dem.width + Math.round(placement.x);
         const habitatAffinity = wetlandImagePropHabitatAtDistance(
           wetlandWaterDistance[index],
           options,
         );
-        // Keep active wetland shrubs on the same normalized distance-gradient
-        // band that is shown by the dryness-map diagnostic.
+        // Keep wetland-habitat props on the same normalized distance-gradient
+        // band that is shown by the dryness-map diagnostic. The wetland's own
+        // shrubs only build this field alongside such props, so they keep
+        // their placement whether or not it exists.
         if (
           habitatAffinity <= 0 ||
           hash01(candidate.key, 839) > habitatAffinity
@@ -4104,6 +4176,8 @@ function buildVegetationFlowGeometry(
         const y = (row + 0.5 + (hash01(key, 43) - 0.5) * 0.74) * spacing;
         if (x < 1 || y < 1 || x >= dem.width - 1 || y >= dem.height - 1)
           continue;
+        // Sand desert is drawn by the procedural dune renderer, not flow lines.
+        if (isDesertDunePixel(options.desertDunes, biomeAt(dem, x, y))) continue;
         const suitability = sampleVegetationSuitabilityAt(
           dem,
           x,
@@ -4336,10 +4410,14 @@ interface PropStandGroup {
   /** Templates, L4 shape and plant size relative to a stand tree. */
   profile: StandProfile;
   seedSalt: number;
-  /** Palette colour the wash and plant bodies are shaded from. */
-  color: (settings: ForestRenderSettings) => string;
-  /** Palette colours of the profile's accent plants. */
-  accentColors?: (settings: ForestRenderSettings) => { body: string; trunk: string };
+  /**
+   * Stand look from a biome's style: the body colour the wash and plant
+   * fills are shaded from, and the profile's accent plants with their share.
+   */
+  style: (
+    biome: ReturnType<typeof propStandStyleForBiome>,
+    settings: ForestRenderSettings,
+  ) => { body: string; accent?: { body: string; trunk: string; share: number } };
 }
 
 /**
@@ -4352,17 +4430,55 @@ const PROP_STAND_GROUPS: readonly PropStandGroup[] = [
     isMember: (asset) => asset.outlineGroup === "alpine-forest",
     profile: TREE_STAND_PROFILE,
     seedSalt: 0,
-    color: (settings) => settings.alpineCanopyColor,
+    style: (biome) => ({ body: biome.tree }),
   },
   {
     id: "wetland-shrubs",
     isMember: (asset) => asset.outlineGroup === "wetland-forest" && asset.family === "shrub",
     profile: SHRUB_STAND_PROFILE,
     seedSalt: 0x5a1b7e,
-    color: (settings) => settings.wetlandShrubColor,
-    accentColors: (settings) => ({ body: settings.wetlandCanopyColor, trunk: settings.wetlandWoodColor }),
+    // A shrub stand's accent plants are the biome's trees.
+    style: (biome, settings) => ({
+      body: biome.shrub,
+      accent: { body: biome.tree, trunk: settings.wetlandWoodColor, share: biome.shrubTreeShare },
+    }),
   },
 ];
+
+function propStandGroupStyle(
+  group: PropStandGroup,
+  options: Pick<ResolvedVegetationPatternOptions, "forestSettings" | "rasterPropBiomeSettings">,
+  biomeId: number,
+) {
+  return group.style(
+    propStandStyleForBiome(options.forestSettings, options.rasterPropBiomeSettings, biomeId),
+    options.forestSettings,
+  );
+}
+
+/**
+ * Which biomes share a stand look, per stand group. Biomes styled alike
+ * merge into one stand while differently styled ones are split, so this
+ * belongs in the geometry cache key; the colours themselves only repaint.
+ */
+export function propStandColorPartition(options: VegetationPatternOptions | undefined): string {
+  const resolved = {
+    forestSettings: { ...DEFAULT_FOREST_RENDER_SETTINGS, ...options?.forestSettings },
+    rasterPropBiomeSettings: options?.rasterPropBiomeSettings ?? {},
+  };
+  // Biomes without overrides look like id -1, or like 2 in the forest
+  // biomes, or like the wetland, so only these ids can form further classes.
+  const biomeIds = [...new Set([-1, 7, ...DEFAULT_TREE_BIOMES, ...Object.keys(resolved.rasterPropBiomeSettings).map(Number)])]
+    .sort((a, b) => a - b);
+  return PROP_STAND_GROUPS.map((group) => {
+    const classes = new Map<string, number>();
+    return biomeIds.map((biomeId) => {
+      const key = JSON.stringify(propStandGroupStyle(group, resolved, biomeId));
+      if (!classes.has(key)) classes.set(key, classes.size);
+      return `${biomeId}:${classes.get(key)}`;
+    }).join(",");
+  }).join("|");
+}
 
 /**
  * Stand tree height in prop cells: the alpine tree's rendered height (1.65
@@ -4383,14 +4499,33 @@ function buildPropStands(
   options: ResolvedVegetationPatternOptions,
 ): void {
   const assets = new Map(options.rasterPropAssets.map((asset) => [asset.key, asset]));
-  const members = PROP_STAND_GROUPS.map(() => [] as VegetationRasterPropPlacement[]);
+  // One stand per group and look: biomes styled alike share a stand, so it
+  // runs across their borders; differently styled biomes get their own.
+  const buckets = new Map<string, {
+    group: PropStandGroup;
+    style: ReturnType<PropStandGroup["style"]>;
+    biomeIds: number[];
+    placements: VegetationRasterPropPlacement[];
+  }>();
   const kept: VegetationRasterPropPlacement[] = [];
   for (const placement of geometry.rasterProps ?? []) {
     const asset = assets.get(placement.assetKey);
-    const group = asset ? PROP_STAND_GROUPS.findIndex((candidate) => candidate.isMember(asset)) : -1;
-    (group >= 0 ? members[group] : kept).push(placement);
+    const group = asset ? PROP_STAND_GROUPS.find((candidate) => candidate.isMember(asset)) : undefined;
+    if (!group) {
+      kept.push(placement);
+      continue;
+    }
+    const style = propStandGroupStyle(group, options, placement.biomeId);
+    const key = `${group.id}|${JSON.stringify(style)}`;
+    let bucket = buckets.get(key);
+    if (!bucket) {
+      bucket = { group, style, biomeIds: [], placements: [] };
+      buckets.set(key, bucket);
+    }
+    if (!bucket.biomeIds.includes(placement.biomeId)) bucket.biomeIds.push(placement.biomeId);
+    bucket.placements.push(placement);
   }
-  if (members.every((list) => list.length === 0)) return;
+  if (buckets.size === 0) return;
   geometry.rasterProps = kept;
 
   const { width, height } = geometry;
@@ -4414,9 +4549,11 @@ function buildPropStands(
 
   const settings = options.forestSettings;
   const stands: VegetationPropStand[] = [];
-  PROP_STAND_GROUPS.forEach((group, groupIndex) => {
-    const placements = members[groupIndex];
-    if (placements.length === 0) return;
+  const bucketsPerGroup = new Map<string, number>();
+  for (const { group, style, biomeIds, placements } of buckets.values()) {
+    // The first stand of a group keeps the group's seed; later ones vary it.
+    const bucketIndex = bucketsPerGroup.get(group.id) ?? 0;
+    bucketsPerGroup.set(group.id, bucketIndex + 1);
     const cellSizes = placements.map((placement) => placement.cellSize).sort((a, b) => a - b);
     // The floor applies to the shared tree size, never to one group alone,
     // so small preview scales keep every group in proportion.
@@ -4454,18 +4591,20 @@ function buildPropStands(
 
     stands.push({
       group: group.id,
+      biomeIds: biomeIds.sort((a, b) => a - b),
       geometry: buildForestStandGeometry({
         width,
         height,
         forest,
         treeSize,
-        seed: ((options.seed ^ Math.imul(settings.seed, 2654435761)) ^ group.seedSalt) >>> 0,
+        seed: ((options.seed ^ Math.imul(settings.seed, 2654435761)) ^ group.seedSalt ^
+          Math.imul(bucketIndex, 0x9e3779b1)) >>> 0,
         settings: {
           markSpacing: settings.standMarkSpacing,
           edgeTrees: settings.standEdgeTrees,
           interiorTrees: settings.standInteriorTrees,
           meadowTrees: settings.standMeadowTrees,
-          accentTrees: settings.standAccentTrees,
+          accentTrees: style.accent?.share,
         },
         slope: dem.slopeDeg,
         light,
@@ -4473,7 +4612,7 @@ function buildPropStands(
         profile: group.profile,
       }),
     });
-  });
+  }
   geometry.stands = stands;
 }
 
@@ -4922,6 +5061,7 @@ export function mapVegetationGeometryToTile(
     rasterProps,
     stands: geometry.stands?.map((stand) => ({
       group: stand.group,
+      biomeIds: stand.biomeIds,
       geometry: mapForestStandGeometry(stand.geometry, scaleX, scaleY, tileX, tileY, tileWidth, tileHeight),
     })),
   };
@@ -4990,10 +5130,12 @@ function paintVectorCharcoalMotif(
   flowStretch = true,
   batchedSegments?: BatchedInkSegment[],
   depthValue?: number,
+  mirrorNormal = false,
 ): void {
   const vectorPaths = asset.vectorPaths;
   if (!vectorPaths || vectorPaths.length === 0) return;
 
+  const normalSign = mirrorNormal ? -1 : 1;
   const curved =
     pathSampler !== undefined &&
     pathSampler.totalLength > 0 &&
@@ -5041,7 +5183,7 @@ function paintVectorCharcoalMotif(
     point: VegetationStrokePoint,
   ): TransformedMotifPoint => {
     const localX = (point.x - asset.width * 0.5) * flowScale;
-    const localY = (asset.height * 0.5 - point.y) * normalScale;
+    const localY = (asset.height * 0.5 - point.y) * normalScale * normalSign;
     if (curved && pathSampler) {
       const pathDistance = Math.max(
         0,
@@ -5240,6 +5382,21 @@ function paintVectorCharcoalMotif(
       }
     }
   }
+}
+
+/**
+ * Asymmetric arid marks keep their lee-side detail (such as a thin companion
+ * line) on the +y side of the SVG, which lies along (sin r, -cos r) once the
+ * mark is rotated by r. Streamline direction is arbitrary, so mirror the mark
+ * whenever that side would face the sun; the detail then always sits on the
+ * shadow side, (-sin az, cos az).
+ */
+export function aridMotifNeedsLeeMirror(
+  rotation: number,
+  sunAzimuthDeg: number,
+): boolean {
+  const azimuth = (sunAzimuthDeg * Math.PI) / 180;
+  return Math.cos(rotation - azimuth) > 0;
 }
 
 /**
@@ -6857,9 +7014,10 @@ function renderRasterPropLayers(
       if (!group) continue;
       const standStop = profiler?.begin("vegetation forest stands");
       const settings = options.forestSettings;
-      // Wash and plant fills share one colour: the group's palette foliage,
-      // darkened to the value the lab was tuned with.
-      const foliage = parseHexColor(group.color(settings)) ?? [86, 123, 84];
+      const colors = propStandGroupStyle(group, options, stand.biomeIds[0] ?? -1);
+      // Wash and plant fills share one colour: the biome's foliage for this
+      // group, darkened to the value the lab was tuned with.
+      const foliage = parseHexColor(colors.body) ?? [86, 123, 84];
       const standPixels = renderForestStandLayer(dem.width, dem.height, stand.geometry, {
         washColor: `#${foliage.map((channel) => Math.round(channel * 0.75).toString(16).padStart(2, "0")).join("")}`,
         washStrength: settings.standWashStrength,
@@ -6868,8 +7026,8 @@ function renderRasterPropLayers(
         inkColor: settings.outlineColor,
         inkWeight: settings.standInkWeight,
         lightStrength: settings.standLightStrength,
-        accentColor: group.accentColors?.(settings).body,
-        trunkColor: group.accentColors?.(settings).trunk,
+        accentColor: colors.accent?.body,
+        trunkColor: colors.accent?.trunk,
       }, profiler);
       if (standPixels) {
         rasterPropStandShare ??= new Uint8Array(dem.width * dem.height);
@@ -6993,6 +7151,12 @@ export function renderVegetationOverlay(
     options.drySkipProbability,
     options.lineInterruptionProbability,
     vegetationMotifAssetSignature(options.motifAssets),
+    desertDuneSignature(options.desertDunes),
+    // Arid marks are mirrored toward the shadow side, so the ink depends on
+    // the sun only when such marks exist; other biomes keep their cache.
+    options.motifAssets.some((asset) => asset.family === "arid")
+      ? sunAzimuthDeg
+      : null,
   ]);
   const cachedAlpha =
     stageCache?.inkKey === inkKey && stageCache.alpha
@@ -7103,6 +7267,9 @@ export function renderVegetationOverlay(
             1,
             true,
             flowMotifSegments,
+            undefined,
+            asset.family === "arid" &&
+              aridMotifNeedsLeeMirror(motif.rotation, sunAzimuthDeg),
           );
         } else {
           paintCharcoalMotif(
@@ -7126,6 +7293,29 @@ export function renderVegetationOverlay(
       dem.height,
       flowMotifSegments,
     );
+    const duneStop = profiler?.begin("vegetation desert dunes");
+    if (options.desertDunes.enabled) {
+      const duneSampling = createVegetationFlowSampling(dem, options);
+      paintDesertDunes(
+        alpha,
+        clip,
+        dem,
+        options.desertDunes,
+        {
+          sourceXByPixel: duneSampling.sourceXByPixel,
+          sourceYByPixel: duneSampling.sourceYByPixel,
+          sourcePerPixel:
+            duneSampling.sourceXRange / duneSampling.outputXDenominator,
+        },
+        options.seed,
+        options.strokeThickness,
+        undefined,
+        undefined,
+        sunAzimuthDeg,
+        outputPixelScale,
+      );
+    }
+    duneStop?.();
     const inkOpacityStop = profiler?.begin("vegetation ink opacity");
     if (options.strokeOpacity < 1) {
       for (let index = 0; index < alpha.length; index++) {
@@ -7159,6 +7349,9 @@ export function renderVegetationOverlay(
     options.wetlandDryNoiseScale,
     options.wetlandDryNoiseStrength,
     options.wetlandImagePropDrynessBias,
+    desertDuneSignature(options.desertDunes),
+    // The dune wash is lit by the sun.
+    options.desertDunes.enabled ? sunAzimuthDeg : null,
   ]);
   let background =
     stageCache?.backgroundKey === backgroundKey &&
@@ -7177,6 +7370,28 @@ export function renderVegetationOverlay(
       profiler,
       geometry.flowCache,
     );
+    if (options.desertDunes.enabled) {
+      // Sand desert takes its wash from the dunes: lit windward slopes and
+      // shaded slip faces that line up with the dune ink.
+      const duneSampling = createVegetationFlowSampling(dem, options);
+      paintDesertDunes(
+        undefined,
+        clip,
+        dem,
+        options.desertDunes,
+        {
+          sourceXByPixel: duneSampling.sourceXByPixel,
+          sourceYByPixel: duneSampling.sourceYByPixel,
+          sourcePerPixel:
+            duneSampling.sourceXRange / duneSampling.outputXDenominator,
+        },
+        options.seed,
+        options.strokeThickness,
+        background.tone,
+        background.noise,
+        sunAzimuthDeg,
+      );
+    }
     if (stageCache) {
       stageCache.backgroundKey = backgroundKey;
       stageCache.backgroundWaterDistance = options.waterDistanceOverride;

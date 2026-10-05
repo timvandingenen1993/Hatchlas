@@ -223,8 +223,10 @@ export function prepareFullTerrainCameraProjection(
   const meshWidth = dem.width;
   const meshHeight = dem.height;
   const cameraType = requested.cameraType ?? "orthographic";
-  const elevationDeg = clamp(requested.elevationDeg ?? 75, 15, 85, 75);
-  const heightExaggeration = clamp(requested.heightExaggeration ?? 1, 0.25, 24, 1);
+  // Typed inspector overrides may leave the slider range; only a level or
+  // straight-down camera is refused.
+  const elevationDeg = clamp(requested.elevationDeg ?? 75, 1, 89, 75);
+  const heightExaggeration = clamp(requested.heightExaggeration ?? 1, 0.01, Infinity, 1);
   const angle = elevationDeg * Math.PI / 180;
   const sin = Math.sin(angle);
   const cos = Math.cos(angle);

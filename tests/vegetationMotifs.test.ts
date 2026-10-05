@@ -2,8 +2,10 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
+  ARID_MOTIF_DEFINITIONS,
   loadVegetationMotifAssets,
   parseSvgVectorAsset,
+  STAND_PROP_BIOME_IDS,
   VEGETATION_RASTER_PROP_DEFINITIONS,
 } from "../src/rendering/vegetationMotifs";
 
@@ -124,7 +126,8 @@ describe("vegetation motif asset loading", () => {
       outlineGroup: "alpine-forest",
       rasterizeVectorFill: true,
     });
-    expect(alpineTrees[0].eligibleBiomeIds).toEqual([2, 3, 4]);
+    // Trees may grow in any stand biome; per-biome tree density decides where they do.
+    expect(alpineTrees[0].eligibleBiomeIds).toEqual(STAND_PROP_BIOME_IDS);
 
     const svg = readFileSync(
       join(

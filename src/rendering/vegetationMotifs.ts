@@ -56,6 +56,23 @@ export interface VegetationMotifDefinition {
   rasterizeVectorFill?: boolean;
 }
 
+// Desert flow-line marks. Any SVG dropped into this folder is registered as
+// an arid motif; see the folder README for the authoring format. While it is
+// empty, deserts fall back to the plain line and dot marks.
+// (import.meta.glob needs a literal pattern.)
+const ARID_MOTIF_URLS = import.meta.glob<string>(
+  "../assets/BiomeProps/Desert/motifs/*.svg",
+  { query: "?url", import: "default", eager: true },
+);
+
+export const ARID_MOTIF_DEFINITIONS: readonly VegetationMotifDefinition[] =
+  Object.entries(ARID_MOTIF_URLS)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([path, url]) => {
+      const name = path.slice(path.lastIndexOf("/") + 1, -".svg".length);
+      return { key: `arid-${name}`, label: `arid_${name}`, family: "arid" as const, url };
+    });
+
 export const VEGETATION_MOTIF_DEFINITIONS: readonly VegetationMotifDefinition[] =
   [
     {
@@ -148,7 +165,8 @@ export const VEGETATION_MOTIF_DEFINITIONS: readonly VegetationMotifDefinition[] 
       family: "universal",
       url: dots02Url,
     },
-  ] as const;
+    ...ARID_MOTIF_DEFINITIONS,
+  ];
 
 export interface VegetationRasterPropDefinition extends VegetationMotifDefinition {
   placementRole?: "vegetation" | "mountain-foothill" | "wetland";
@@ -177,6 +195,13 @@ export interface VegetationRasterPropDefinition extends VegetationMotifDefinitio
 const WETLAND_REFERENCE_RENDER_WIDTH_CELLS = 1.55;
 const WETLAND_REFERENCE_RENDER_HEIGHT_CELLS = 1.7;
 
+/**
+ * Vegetated land biomes that can hold tree and shrub stands. Each biome's
+ * tree and shrub densities decide whether it actually does (most default to
+ * none; see `rasterPropSettingsForBiome`).
+ */
+export const STAND_PROP_BIOME_IDS = [2, 3, 4, 5, 7, 9, 16, 17, 18, 19, 20] as const;
+
 export const ALPINE_TREE_75_ASSET_URLS = [
   alpineTree75Url,
   alpineTree75Variant01Url,
@@ -187,7 +212,7 @@ export const ALPINE_TREE_75_ASSET_URLS = [
   alpineTree75Variant06Url,
 ] as const;
 
-/** User-authored wetland shrubs: placed like props, drawn as wetland shrub stands. */
+/** User-authored wetland shrubs: placed like props, drawn as shrub stands in any stand biome. */
 export const WETLAND_VEGETATION_PROP_DEFINITIONS: readonly VegetationRasterPropDefinition[] = [
   ...[
     {
@@ -230,7 +255,7 @@ export const WETLAND_VEGETATION_PROP_DEFINITIONS: readonly VegetationRasterPropD
     renderAnchorY: 1,
     outlineGroup: "wetland-forest",
     forestCanopyPathIndex: shrub.canopyPath,
-    eligibleBiomeIds: [7],
+    eligibleBiomeIds: STAND_PROP_BIOME_IDS,
   })),
 ] as const;
 
@@ -253,7 +278,7 @@ export const VEGETATION_RASTER_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       renderAnchorY: 1,
       outlineMode: "alpha-dilation",
       outlineGroup: "alpine-forest",
-      eligibleBiomeIds: [2, 3, 4],
+      eligibleBiomeIds: STAND_PROP_BIOME_IDS,
     },
     {
       key: "alpine-tree-75-01",
@@ -272,7 +297,7 @@ export const VEGETATION_RASTER_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       renderAnchorY: 1,
       outlineMode: "alpha-dilation",
       outlineGroup: "alpine-forest",
-      eligibleBiomeIds: [2, 3, 4],
+      eligibleBiomeIds: STAND_PROP_BIOME_IDS,
     },
     {
       key: "alpine-tree-75-02",
@@ -291,7 +316,7 @@ export const VEGETATION_RASTER_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       renderAnchorY: 1,
       outlineMode: "alpha-dilation",
       outlineGroup: "alpine-forest",
-      eligibleBiomeIds: [2, 3, 4],
+      eligibleBiomeIds: STAND_PROP_BIOME_IDS,
     },
     {
       key: "alpine-tree-75-03",
@@ -310,7 +335,7 @@ export const VEGETATION_RASTER_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       renderAnchorY: 1,
       outlineMode: "alpha-dilation",
       outlineGroup: "alpine-forest",
-      eligibleBiomeIds: [2, 3, 4],
+      eligibleBiomeIds: STAND_PROP_BIOME_IDS,
     },
     {
       key: "alpine-tree-75-04",
@@ -329,7 +354,7 @@ export const VEGETATION_RASTER_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       renderAnchorY: 1,
       outlineMode: "alpha-dilation",
       outlineGroup: "alpine-forest",
-      eligibleBiomeIds: [2, 3, 4],
+      eligibleBiomeIds: STAND_PROP_BIOME_IDS,
     },
     {
       key: "alpine-tree-75-05",
@@ -348,7 +373,7 @@ export const VEGETATION_RASTER_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       renderAnchorY: 1,
       outlineMode: "alpha-dilation",
       outlineGroup: "alpine-forest",
-      eligibleBiomeIds: [2, 3, 4],
+      eligibleBiomeIds: STAND_PROP_BIOME_IDS,
     },
     {
       key: "alpine-tree-75-06",
@@ -367,7 +392,7 @@ export const VEGETATION_RASTER_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       renderAnchorY: 1,
       outlineMode: "alpha-dilation",
       outlineGroup: "alpine-forest",
-      eligibleBiomeIds: [2, 3, 4],
+      eligibleBiomeIds: STAND_PROP_BIOME_IDS,
     },
     ...WETLAND_VEGETATION_PROP_DEFINITIONS,
   ] as const;
@@ -392,7 +417,7 @@ export const MOUNTAIN_FOOTHILL_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       heightCells: 0.45,
       anchorX: 0.5,
       anchorY: 0.5,
-      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10],
+      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10, 16, 17, 20],
     },
     {
       key: "mountain-boulder-02",
@@ -405,7 +430,7 @@ export const MOUNTAIN_FOOTHILL_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       heightCells: 0.9,
       anchorX: 0.5,
       anchorY: 0.5,
-      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10],
+      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10, 16, 17, 20],
     },
     {
       key: "mountain-boulder-03",
@@ -418,7 +443,7 @@ export const MOUNTAIN_FOOTHILL_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       heightCells: 1.35,
       anchorX: 0.5,
       anchorY: 0.5,
-      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10],
+      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10, 16, 17, 20],
     },
     {
       key: "mountain-boulder-04",
@@ -431,7 +456,7 @@ export const MOUNTAIN_FOOTHILL_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       heightCells: 0.32,
       anchorX: 0.5,
       anchorY: 0.5,
-      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10],
+      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10, 16, 17, 20],
     },
     {
       key: "mountain-boulder-05",
@@ -444,7 +469,7 @@ export const MOUNTAIN_FOOTHILL_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       heightCells: 0.35,
       anchorX: 0.5,
       anchorY: 0.5,
-      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10],
+      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10, 16, 17, 20],
     },
     {
       key: "mountain-boulder-06",
@@ -457,7 +482,7 @@ export const MOUNTAIN_FOOTHILL_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       heightCells: 0.6,
       anchorX: 0.5,
       anchorY: 0.5,
-      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10],
+      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10, 16, 17, 20],
     },
     {
       key: "mountain-boulder-07",
@@ -470,7 +495,7 @@ export const MOUNTAIN_FOOTHILL_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       heightCells: 0.65,
       anchorX: 0.5,
       anchorY: 0.5,
-      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10],
+      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10, 16, 17, 20],
     },
     {
       key: "mountain-boulder-08",
@@ -483,7 +508,7 @@ export const MOUNTAIN_FOOTHILL_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       heightCells: 0.7,
       anchorX: 0.5,
       anchorY: 0.5,
-      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10],
+      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10, 16, 17, 20],
     },
     {
       key: "mountain-boulder-09",
@@ -496,7 +521,7 @@ export const MOUNTAIN_FOOTHILL_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       heightCells: 0.75,
       anchorX: 0.5,
       anchorY: 0.5,
-      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10],
+      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10, 16, 17, 20],
     },
     {
       key: "mountain-boulder-10",
@@ -509,7 +534,7 @@ export const MOUNTAIN_FOOTHILL_PROP_DEFINITIONS: readonly VegetationRasterPropDe
       heightCells: 0.7,
       anchorX: 0.5,
       anchorY: 0.5,
-      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10],
+      eligibleBiomeIds: [1, 2, 3, 4, 5, 9, 10, 16, 17, 20],
     },
   ] as const;
 

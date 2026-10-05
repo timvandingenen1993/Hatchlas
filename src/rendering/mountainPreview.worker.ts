@@ -1,5 +1,6 @@
 import {
-  MOUNTAIN_BIOME_LABELS,
+  getMountainBiomeLabel,
+  getMountainClimateZoneLabel,
   MOUNTAIN_WATER_EVOLUTION_STEPS,
   getHeightmapFitResolution,
   processMountainBaseDEM,
@@ -2056,7 +2057,9 @@ self.onmessage = (event: MessageEvent<MountainPreviewRequest>) => {
             precipMm: dem.precipitationMmYr[index],
             tempC: dem.temperatureC[index],
             solarFlux: dem.solarInsolation[index],
-            biomeName: MOUNTAIN_BIOME_LABELS[dem.biomeType[index]] || "Alpine",
+            biomeName: getMountainBiomeLabel(dem.biomeType[index]),
+            climateZone: getMountainClimateZoneLabel(dem, index),
+            heightAboveRiverM: dem.heightAboveDrainageM?.[index] ?? Number.POSITIVE_INFINITY,
           },
         });
         return;

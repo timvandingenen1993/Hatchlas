@@ -3,6 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   decodeTiffHeightmap,
   getHeightmapExportAnalysisResolution,
+  getMountainClimateZoneLabel,
   getHeightmapFitResolution,
   loadHeightmapImage,
   processMountainBaseDEM,
@@ -245,9 +246,13 @@ describe('2D Mountain Base DEM & Geomorphic Pipeline', () => {
     const W = 96;
     const H = 96;
     const rawLuminance = new Float32Array(W * H);
-    const threshold = 1100 / 3000;
+    // Holdridge boreal/cool temperate line (biotemperature 6 °C) at a 22 °C
+    // base temperature and 6.5 °C/km lapse rate. The warm base lifts the line
+    // above the meadow elevation limit, so the flat belt keeps its forests.
+    const baseTemperatureC = 22;
+    const threshold = (((baseTemperatureC - 6) / 6.5) * 1000) / 3000;
 
-    // A broad elevation belt crosses the 1100 m biome threshold. Add a
+    // A broad elevation belt crosses that biome threshold. Add a
     // checker/noise signal around that threshold to model DEM-scale relief.
     // It should not turn the ecological boundary into a pixel checkerboard.
     for (let y = 0; y < H; y++) {
@@ -277,6 +282,7 @@ describe('2D Mountain Base DEM & Geomorphic Pipeline', () => {
       riverThresholdKm2: 10_000,
       wetlandElevationThresholdM: 0,
       biomeRegionScaleKm: 0,
+      baseTemperatureC,
     });
     const regional = processMountainBaseDEM(rawLuminance, W, H, {
       minElevationM: 0,
@@ -285,6 +291,7 @@ describe('2D Mountain Base DEM & Geomorphic Pipeline', () => {
       riverThresholdKm2: 10_000,
       wetlandElevationThresholdM: 0,
       biomeRegionScaleKm: 1.5,
+      baseTemperatureC,
     });
 
     const cellTransitions = countTransitions(cellScale.biomeType);
@@ -292,6 +299,30 @@ describe('2D Mountain Base DEM & Geomorphic Pipeline', () => {
     expect(cellTransitions).toBeGreaterThan(300);
     expect(regionalTransitions).toBeLessThan(cellTransitions * 0.35);
     expect(regionalTransitions).toBeLessThan(W * 2);
+  });
+
+  it('opens flat, low ground in the forest belts into montane meadow', () => {
+    const W = 64;
+    const H = 64;
+    const options = {
+      minElevationM: 0,
+      maxElevationM: 3000,
+      domainWidthKm: 3,
+      domainHeightKm: 3,
+      riverThresholdKm2: 10_000,
+      wetlandElevationThresholdM: 0,
+    };
+    const share = (biomes: Uint8Array, biome: number): number =>
+      biomes.filter((value) => value === biome).length / biomes.length;
+
+    const flat = processMountainBaseDEM(new Float32Array(W * H).fill(0.3), W, H, options);
+    expect(share(flat.biomeType, 20)).toBeGreaterThan(0.9);
+
+    // An 1800 m rise over 3 km (about 31 degrees) keeps the forest belt but no flats.
+    const ramp = new Float32Array(W * H);
+    for (let y = 0; y < H; y++) ramp.fill(0.05 + (y / (H - 1)) * 0.6, y * W, (y + 1) * W);
+    const steep = processMountainBaseDEM(ramp, W, H, options);
+    expect(share(steep.biomeType, 20)).toBeLessThan(0.05);
   });
 
   it('varies beach width along a flat coast using the shared noise scale', () => {
@@ -316,7 +347,8 @@ describe('2D Mountain Base DEM & Geomorphic Pipeline', () => {
     const height = 112;
     const rawLuminance = new Float32Array(width * height);
     for (let y = 0; y < height; y++) {
-      const band = 1100 / 3000 + (height / 2 - y) * 0.0022;
+      // Centred on the Holdridge boreal/cool temperate line (see above).
+      const band = (((18 - 6) / 6.5) * 1000) / 3000 + (height / 2 - y) * 0.0022;
       for (let x = 0; x < width; x++) rawLuminance[y * width + x] = band;
     }
     const oceanMask = new Uint8Array(width * height);
@@ -386,6 +418,131 @@ describe('2D Mountain Base DEM & Geomorphic Pipeline', () => {
     expect(countBiome(cold.biomeType, 0)).toBeGreaterThan(countBiome(warm.biomeType, 0));
     expect(countBiome(cold.biomeType, 0) + countBiome(cold.biomeType, 2))
       .toBeGreaterThan(countBiome(warm.biomeType, 0) + countBiome(warm.biomeType, 2));
+  });
+
+  describe('Holdridge climate biomes', () => {
+    const W = 64;
+    const H = 64;
+    // A gentle lowland plain with a shallow diagonal valley.
+    const plain = new Float32Array(W * H);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const valley = Math.abs(x - y) / W;
+        plain[y * W + x] = 0.04 + 0.03 * ((x + y) / (W + H)) + 0.04 * valley;
+      }
+    }
+    // Climate-only runs: no rivers and no valley-floor wetland rule.
+    const climateOnly = {
+      minElevationM: 0,
+      maxElevationM: 2000,
+      domainWidthKm: 20,
+      riverThresholdKm2: 10_000,
+      wetlandElevationThresholdM: 0,
+      biomeRegionScaleKm: 0.5,
+    };
+    const countBiome = (biomes: Uint8Array, ids: number[]): number =>
+      biomes.reduce((count, biome) => count + (ids.includes(biome) ? 1 : 0), 0);
+
+    it('turns tropical desert scrub into desert, never wetland or woodland', () => {
+      const dem = processMountainBaseDEM(plain, W, H, {
+        ...climateOnly, wetlandElevationThresholdM: 400,
+        baseTemperatureC: 28, basePrecipitationMmYr: 100,
+      });
+      expect(getMountainClimateZoneLabel(dem, 32 * W + 32)).toMatch(/^Tropical desert( scrub)?$/);
+      expect(countBiome(dem.biomeType, [15, 16])).toBe(W * H);
+    });
+
+    it('maps warm temperate thorn steppe to dry steppe', () => {
+      const dem = processMountainBaseDEM(plain, W, H, {
+        ...climateOnly, baseTemperatureC: 18, basePrecipitationMmYr: 350,
+      });
+      expect(getMountainClimateZoneLabel(dem, 32 * W + 32)).toMatch(/thorn (steppe|woodland)/);
+      expect(countBiome(dem.biomeType, [17])).toBe(W * H);
+    });
+
+    it('maps cool temperate steppe to grassland', () => {
+      const dem = processMountainBaseDEM(plain, W, H, {
+        ...climateOnly, baseTemperatureC: 10, basePrecipitationMmYr: 400,
+      });
+      expect(getMountainClimateZoneLabel(dem, 32 * W + 32)).toBe('Cool temperate steppe');
+      expect(countBiome(dem.biomeType, [18])).toBe(W * H);
+    });
+
+    it('keeps valley wetlands in humid climates', () => {
+      const humid = processMountainBaseDEM(plain, W, H, {
+        ...climateOnly, wetlandElevationThresholdM: 400,
+        baseTemperatureC: 18, basePrecipitationMmYr: 2400,
+      });
+      expect(countBiome(humid.biomeType, [7])).toBeGreaterThan(W * H * 0.5);
+      expect(countBiome(humid.biomeType, [15, 16, 17, 18, 19])).toBe(0);
+    });
+
+    it('greens river banks with a shallow water table (HAND < 15 m) in a dry climate', () => {
+      const RW = 160;
+      const RH = 160;
+      // A wet range in the west drains a river east across a dry plain.
+      const terrain = new Float32Array(RW * RH);
+      for (let y = 0; y < RH; y++) {
+        for (let x = 0; x < RW; x++) {
+          const range = Math.exp(-(((x - 18) / 16) ** 2)) * 0.85;
+          terrain[y * RW + x] = 0.03 + range + 0.03 * Math.abs(y - RH / 2) / (RH / 2) + 0.04 * (1 - x / RW);
+        }
+      }
+      const dem = processMountainBaseDEM(terrain, RW, RH, {
+        minElevationM: 0, maxElevationM: 3500, domainWidthKm: 30, biomeRegionScaleKm: 0.5,
+        riverThresholdKm2: 2, windAzimuthDeg: 270, windSpeedMs: 16,
+        baseTemperatureC: 26, basePrecipitationMmYr: 500,
+      });
+      const hand = dem.heightAboveDrainageM!;
+      let banks = 0;
+      let dryUplands = 0;
+      for (let y = 0; y < RH; y++) {
+        for (let x = 80; x < RW; x++) {
+          const index = y * RW + x;
+          if (dem.isRiverChannel[index] === 1) continue;
+          if (hand[index] < 15) {
+            banks++;
+            expect([15, 16, 17, 18]).not.toContain(dem.biomeType[index]);
+          } else if ([15, 16, 17].includes(dem.biomeType[index])) {
+            dryUplands++;
+          }
+        }
+      }
+      expect(banks).toBeGreaterThan(0);
+      expect(dryUplands).toBeGreaterThan(banks);
+    });
+
+    it('dries the lee side of a range through the rain shadow', () => {
+      const RW = 120;
+      const RH = 120;
+      const range = new Float32Array(RW * RH);
+      for (let y = 0; y < RH; y++) {
+        for (let x = 0; x < RW; x++) {
+          const dx = (x - RW / 2) / (RW * 0.16);
+          const dy = (y - RH / 2) / (RH * 0.38);
+          range[y * RW + x] = 0.05 + 0.9 * Math.exp(-(dx * dx + dy * dy));
+        }
+      }
+      // Wind from the south-west (225°) puts the rain shadow in the east.
+      const dem = processMountainBaseDEM(range, RW, RH, {
+        minElevationM: 80, maxElevationM: 3850, domainWidthKm: 45,
+        riverThresholdKm2: 40, biomeRegionScaleKm: 1, windAzimuthDeg: 225, windSpeedMs: 16,
+        baseTemperatureC: 18, basePrecipitationMmYr: 600,
+      });
+      // Smith & Barstad: rain rises on the windward (south-west) flank and
+      // falls on the lee.
+      expect(dem.precipitationMmYr[60 * RW + 40]).toBeGreaterThan(dem.precipitationMmYr[60 * RW + 100] * 3);
+      const countSide = (fromX: number, toX: number): number => {
+        let count = 0;
+        for (let y = 30; y < 90; y++) {
+          for (let x = fromX; x < toX; x++) {
+            if ([15, 16, 17].includes(dem.biomeType[y * RW + x])) count++;
+          }
+        }
+        return count;
+      };
+      expect(countSide(95, RW)).toBeGreaterThan(countSide(0, 25));
+    });
   });
 
   it('processes raw heightmap luminance into complete geomorphic fields', () => {
@@ -1031,7 +1188,8 @@ describe('2D Mountain Base DEM & Geomorphic Pipeline', () => {
       }
     }
 
-    const dem = processMountainBaseDEM(rawLuminance, W, H);
+    // Rivers would cover these ~1 km² cells; contours are what is tested.
+    const dem = processMountainBaseDEM(rawLuminance, W, H, { riverThresholdKm2: 10_000 });
     const baseOptions: Parameters<typeof renderMountainDetailDEM>[1] = {
       layer: 'raw_heightmap',
       palette: 'swiss_topo',

@@ -38,7 +38,7 @@ function luminance(color: TintRGB): number {
  * Modulates a land color by local terrain instead of painting one flat color
  * per biome: flat low ground turns green, steep faces and high ground go cool
  * grey (Imhof-style aerial perspective), ridges/sunny slopes warm, gullies and
- * shaded slopes cool and dark. `green` is the palette's meadow/woodland color.
+ * shaded slopes cool and dark. `green` is the palette's Montane Meadow color.
  * Shading in `base` is preserved by matching the green to its luminance.
  */
 export function tintMountainLand(

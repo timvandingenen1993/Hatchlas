@@ -1,4 +1,4 @@
-import { INSPECTOR_BOUNDS } from "../config/inspectorBounds";
+import { MIN_POSITIVE_SCALE } from "../config/inspectorBounds";
 /**
  * Mountain Base DEM Processing & Analysis Pipeline
  * Loads the user's high-resolution mountain heightmap base and derives:
@@ -15,6 +15,17 @@ import { INSPECTOR_BOUNDS } from "../config/inspectorBounds";
  */
 
 import { biomeEdgeNoise, DEFAULT_BIOME_EDGE_NOISE_SCALE_M } from "./biomeEdgeNoise";
+import {
+  computeOrographicPrecipitationRate,
+  OROGRAPHIC_DEFAULTS,
+} from "./orographicPrecipitation";
+import {
+  classifyHoldridgeLifeZone,
+  HOLDRIDGE_ZONE_CODES,
+  holdridgeBiotemperatureFromAnnualMean,
+  holdridgeZoneName,
+  holdridgePetRatio,
+} from "./holdridgeLifeZones";
 import type { MountainProfiler } from "../rendering/mountainProfiler";
 
 export interface MountainDEMData {
@@ -61,6 +72,10 @@ export interface MountainDEMData {
   solarInsolation: Float32Array; // Incident solar radiation index (0.0 to 1.0)
   temperatureC: Float32Array; // Temperature with lapse rate
   biomeType: Uint8Array; // Ecological biome ID
+  /** Holdridge life zone per cell, as an index into HOLDRIDGE_ZONE_CODES. */
+  holdridgeZone?: Uint8Array;
+  /** Height above the nearest river or lake along the flow path, m (Infinity = none). */
+  heightAboveDrainageM?: Float32Array;
   isOcean: Uint8Array; // 1 = source no-data/ocean cell, 0 = land
   /** River-fed lake water depth in meters (spill level minus bed), 0 = no lake. */
   lakeDepthM?: Float32Array;
@@ -93,7 +108,13 @@ export type MountainBiomeId =
   | 11 // Sandy Beach
   | 12 // Silty Beach & River Mouth
   | 13 // Rocky Shore
-  | 14; // Coastal Cliff
+  | 14 // Coastal Cliff
+  | 15 // Sand Desert & Dunes
+  | 16 // Rocky Desert & Hamada
+  | 17 // Dry Steppe
+  | 18 // Grassland & Prairie
+  | 19 // Desert Oasis
+  | 20; // Montane Meadow
 
 /** Stable labels shared by the hover inspector and elevation profiles. */
 export const MOUNTAIN_BIOME_LABELS: readonly string[] = [
@@ -112,7 +133,24 @@ export const MOUNTAIN_BIOME_LABELS: readonly string[] = [
   "Silty Beach & River Mouth",
   "Rocky Shore",
   "Coastal Cliff",
+  "Sand Desert & Dunes",
+  "Rocky Desert & Hamada",
+  "Dry Steppe",
+  "Grassland & Prairie",
+  "Desert Oasis",
+  "Montane Meadow",
 ];
+
+/** Holdridge life zone name of a DEM cell for inspection, or "—" if none. */
+export function getMountainClimateZoneLabel(dem: MountainDEMData, index: number): string {
+  const code = HOLDRIDGE_ZONE_CODES[dem.holdridgeZone?.[index] ?? 255];
+  return code ? holdridgeZoneName(code) : "—";
+}
+
+/** Biome name with its numeric ID, e.g. "Dry Steppe (17)", for inspection. */
+export function getMountainBiomeLabel(biomeId: number): string {
+  return `${MOUNTAIN_BIOME_LABELS[biomeId] ?? "Unknown biome"} (${biomeId})`;
+}
 
 export interface BaseDEMOptions {
   domainWidthKm?: number;
@@ -267,7 +305,7 @@ function stabilizeBiomeZones(
 
       const x = index % width;
       const y = Math.floor(index / width);
-      const counts = new Uint8Array(8);
+      const counts = new Uint8Array(MOUNTAIN_BIOME_LABELS.length);
       let bestBiome = current[index];
       let bestCount = 0;
       let centerCount = 0;
@@ -649,6 +687,144 @@ export function extractDeepOpenOceanMask(
 
 export const getOpenOceanMask = extractDeepOpenOceanMask;
 
+// Rennó et al. (2008), HAND classes for terra firme: below 5.3 m above the
+// nearest drainage the ground is waterlogged (water table at the surface);
+// 5.3–15 m is the ecotone with a shallow water table that bank vegetation
+// can reach. Nobre et al. (2011) J Hydrol 404:13–29.
+const WATERLOGGED_HAND_M = 5.3;
+const SHALLOW_WATER_TABLE_HAND_M = 15;
+// Heuristic, not from a reference: loose sand settles on gentle ground.
+const DUNE_MAX_SLOPE_DEG = 6.0;
+// Flat, low-to-mid ground in the tundra and forest belts opens into meadow.
+// The limits are the midpoints of the land tint's flat-slope band (6-16 deg)
+// and its elevation fade (0.55-0.85), so the meadow biome covers the ground
+// the tint paints green (mountainTerrainTint.ts).
+const MEADOW_MAX_SLOPE_DEG = 11.0;
+const MEADOW_MAX_NORMALIZED_ELEVATION = 0.7;
+
+/**
+ * Mountain biome for a Holdridge life zone (see holdridgeLifeZones.ts). The
+ * altitudinal belts follow Holdridge's naming: subpolar = alpine, boreal =
+ * subalpine, cool temperate = montane. Deserts and desert scrub are desert;
+ * thorn steppe, thorn woodland, dry scrub and very dry forest are the
+ * semi-arid formations; cool temperate steppe is grassland.
+ */
+export function mountainBiomeForHoldridgeZone(
+  zoneCode: string,
+  biotemperatureC: number,
+  petRatio: number,
+  slopeDeg: number,
+): MountainBiomeId {
+  const desert: MountainBiomeId = slopeDeg < DUNE_MAX_SLOPE_DEG ? 15 : 16;
+  switch (zoneCode) {
+    case "PD":
+      return 1; // Polar desert: the nival belt of rock and scree
+    case "SpDt": case "SpMt": case "SpWt": case "SpRt":
+      return 2;
+    case "BD": case "CtD": case "CtDs": case "WtD": case "WtDs":
+    case "StD": case "StDs": case "TD": case "TDs":
+      return desert;
+    case "BDs": case "WtTs": case "StTw": case "TTw": case "TVdf":
+      return 17;
+    case "CtS":
+      return 18;
+    case "BMf": case "BWf": case "BRf":
+      return 3;
+    case "BaSl":
+      // Bare soil sits beyond the dry or the wet edge of the chart: desert
+      // on the dry side, the forest of its belt on the wet side.
+      if (petRatio >= 1) return desert;
+      return biotemperatureC < 1.5 ? 1 : biotemperatureC < 6 ? 3 : 4;
+    default:
+      return 4; // Temperate, subtropical and tropical forests
+  }
+}
+
+// Horizontal reach of the relative elevation model, in cells.
+const REM_MAX_DISTANCE_CELLS = 15;
+
+/**
+ * Height above the nearest river or lake, the lower of two published
+ * measures. HAND (Rennó et al. 2008): elevation minus that of the first
+ * drainage cell on the D8 flow path. REM (relative elevation model, Olson et
+ * al. 2014, Washington Dept of Ecology channel migration zones): elevation
+ * minus that of the horizontally nearest drainage cell. On flat floodplains
+ * D8 paths can run beside a river and join it far downstream, which inflates
+ * HAND; REM catches those banks. Cells reached by neither are Infinity.
+ */
+function computeHeightAboveNearestDrainage(
+  width: number,
+  height: number,
+  elevation: Float32Array,
+  flowDirection: Int8Array,
+  drainageMask: Uint8Array,
+  d8Offsets: readonly (readonly number[])[],
+): Float32Array {
+  const totalCells = width * height;
+  const drainageElevation = new Float32Array(totalCells).fill(Number.NaN);
+  const path = new Int32Array(totalCells);
+  for (let start = 0; start < totalCells; start++) {
+    if (!Number.isNaN(drainageElevation[start])) continue;
+    let length = 0;
+    let cell = start;
+    let reached = Number.POSITIVE_INFINITY;
+    while (length < totalCells) {
+      if (!Number.isNaN(drainageElevation[cell])) {
+        reached = drainageElevation[cell];
+        break;
+      }
+      if (drainageMask[cell] === 1) {
+        reached = elevation[cell];
+        drainageElevation[cell] = reached;
+        break;
+      }
+      path[length++] = cell;
+      const direction = flowDirection[cell];
+      if (direction < 0) break;
+      const x = (cell % width) + d8Offsets[direction][0];
+      const y = Math.floor(cell / width) + d8Offsets[direction][1];
+      if (x < 0 || x >= width || y < 0 || y >= height) break;
+      cell = y * width + x;
+    }
+    for (let index = 0; index < length; index++) drainageElevation[path[index]] = reached;
+  }
+  const nearest = exactEuclideanDistanceTransform(drainageMask, width, height);
+  const hand = new Float32Array(totalCells);
+  for (let index = 0; index < totalCells; index++) {
+    const drainage = drainageElevation[index];
+    let heightAbove = Number.isFinite(drainage)
+      ? elevation[index] - drainage
+      : Number.POSITIVE_INFINITY;
+    if (nearest.distance[index] <= REM_MAX_DISTANCE_CELLS && nearest.nearestX[index] >= 0) {
+      const nearestIndex = nearest.nearestY[index] * width + nearest.nearestX[index];
+      heightAbove = Math.min(heightAbove, elevation[index] - elevation[nearestIndex]);
+    }
+    hand[index] = Math.max(0, heightAbove);
+  }
+  return hand;
+}
+
+/**
+ * Ground beside a river or lake with a shallow water table (HAND below 15 m,
+ * Rennó's waterlogged and ecotone classes) is not short of water whatever the
+ * climate: desert there becomes oasis, steppe and grassland become riparian
+ * shrubland. Runs after the smoothing passes so the narrow banks survive.
+ */
+function applyWaterloggedBankBiomes(
+  biomeType: Uint8Array,
+  heightAboveDrainageM: Float32Array,
+  isOcean: Uint8Array,
+  isRiverChannel: Uint8Array,
+): void {
+  for (let index = 0; index < biomeType.length; index++) {
+    if (isOcean[index] === 1 || isRiverChannel[index] === 1) continue;
+    if (!(heightAboveDrainageM[index] < SHALLOW_WATER_TABLE_HAND_M)) continue;
+    const biome = biomeType[index];
+    if (biome === 15 || biome === 16) biomeType[index] = 19;
+    else if (biome === 17 || biome === 18) biomeType[index] = 5;
+  }
+}
+
 function classifyCoastalBiomes(
   width: number,
   height: number,
@@ -886,7 +1062,7 @@ export function getHeightmapFitResolution(
 }
 
 function isWarpableLandBiome(biome: number): boolean {
-  return biome >= 1 && biome <= 5 || biome === 7;
+  return biome >= 1 && biome <= 5 || biome === 7 || biome >= 15 && biome <= 18 || biome === 20;
 }
 
 /**
@@ -2069,10 +2245,9 @@ export function processMountainBaseDEM(
   const domainHeightKm = options.domainHeightKm ?? 45.0 * (height / width);
   const minElevM = options.minElevationM ?? 80.0;
   const maxElevM = options.maxElevationM ?? 3850.0;
-  const oceanElevationM = Math.max(
-    -100.0,
-    Math.min(100.0, options.oceanElevationM ?? -10.0),
-  );
+  // Inspector values may be typed beyond their slider range; only physically
+  // meaningless values are rejected below.
+  const oceanElevationM = options.oceanElevationM ?? -10.0;
 
   const sunAzimuth = options.sunAzimuthDeg ?? 315.0;
   const sunAltitude = options.sunAltitudeDeg ?? 45.0;
@@ -2082,14 +2257,8 @@ export function processMountainBaseDEM(
   const basePrecip = options.basePrecipitationMmYr ?? 1400.0;
   const baseTempC = options.baseTemperatureC ?? 18.0;
   const riverThresholdKm2 = options.riverThresholdKm2 ?? 0.8;
-  const wetlandElevationThresholdM = Math.max(
-    0.0,
-    Math.min(6000.0, options.wetlandElevationThresholdM ?? 400.0),
-  );
-  const biomeRegionScaleKm = Math.max(
-    0.0,
-    Math.min(1.0, options.biomeRegionScaleKm ?? 1.0),
-  );
+  const wetlandElevationThresholdM = Math.max(0.0, options.wetlandElevationThresholdM ?? 400.0);
+  const biomeRegionScaleKm = Math.max(0.0, options.biomeRegionScaleKm ?? 1.0);
 
   const totalCells = width * height;
   if (options.oceanMask && options.oceanMask.length !== totalCells) {
@@ -2265,36 +2434,37 @@ export function processMountainBaseDEM(
   // 3. Orographic precipitation and local runoff. Climate must be solved
   // before drainage accumulation: otherwise every cell contributes the same
   // amount of water and the wind/rain controls can only recolor the map.
-  const windRad = (windAzimuth * Math.PI) / 180.0;
-  const upwindX = Math.sin(windRad);
-  const upwindY = -Math.cos(windRad);
-  const climateCellSizeM = Math.max(1, Math.min(dxMeters, dyMeters));
-  const rainShadowFetchCells = Math.max(
-    1,
-    Math.min(Math.max(width, height), Math.round(8000 / climateCellSizeM)),
-  );
-  const rainShadowSamples = Math.max(1, Math.min(16, rainShadowFetchCells));
-  // The horizon ray geometry is constant for the whole DEM. Precompute the
-  // rounded source coordinates once instead of repeating the same multipliers
-  // and Math.round calls for every cell/sample pair. The loop below retains
-  // the original sample order and bounds checks, so the resulting floats are
-  // unchanged.
-  const rainShadowSampleX = new Int32Array(width * rainShadowSamples);
-  const rainShadowSampleY = new Int32Array(height * rainShadowSamples);
-  const rainShadowDistanceM = new Float64Array(rainShadowSamples);
-  for (let sample = 1; sample <= rainShadowSamples; sample++) {
-    const sampleIndex = sample - 1;
-    const distanceCells = (sample / rainShadowSamples) * rainShadowFetchCells;
-    rainShadowDistanceM[sampleIndex] = distanceCells * climateCellSizeM;
-    const xOffset = upwindX * distanceCells;
-    const yOffset = upwindY * distanceCells;
-    for (let x = 0; x < width; x++) {
-      rainShadowSampleX[sampleIndex * width + x] = Math.round(x + xOffset);
-    }
-    for (let y = 0; y < height; y++) {
-      rainShadowSampleY[sampleIndex * height + y] = Math.round(y + yOffset);
-    }
+  // Smith & Barstad (2004) linear orographic precipitation. Rain varies over
+  // the cloud drift distance (wind × ~1000 s, kilometres), so the model runs
+  // on a coarse grid and is resampled to the DEM. The base precipitation is
+  // the background annual total on flat ground; relief scales it by the
+  // ratio of the orographic event rate to the background event rate.
+  const orographicLongEdge = Math.min(512, Math.max(width, height));
+  const orographicScale = orographicLongEdge / Math.max(width, height);
+  const orographicWidth = Math.max(1, Math.round(width * orographicScale));
+  const orographicHeight = Math.max(1, Math.round(height * orographicScale));
+  const surfaceElevation = new Float32Array(totalCells);
+  for (let index = 0; index < totalCells; index++) {
+    // Sea level is the reference surface; water bodies count as flat water.
+    surfaceElevation[index] = isOcean[index] === 1
+      ? Math.max(0, oceanElevationM)
+      : Math.max(0, analysisElevation[index]);
   }
+  const coarseRate = computeOrographicPrecipitationRate(
+    resampleHeightmapLuminance(surfaceElevation, width, height, orographicWidth, orographicHeight),
+    orographicWidth,
+    orographicHeight,
+    (dxMeters * width) / orographicWidth,
+    (dyMeters * height) / orographicHeight,
+    { windSpeedMs: windSpeed, windFromDeg: windAzimuth },
+  );
+  const orographicRatio = resampleHeightmapLuminance(
+    coarseRate.map((rate) => rate / OROGRAPHIC_DEFAULTS.backgroundRateMmH),
+    orographicWidth,
+    orographicHeight,
+    width,
+    height,
+  );
 
   const climateStop = profiler?.begin("DEM climate and runoff");
   onStage?.("Calculating climate and runoff");
@@ -2304,37 +2474,8 @@ export function processMountainBaseDEM(
       const z = analysisElevation[idx];
       const slope = slopeDeg[idx];
       const aspect = aspectDeg[idx];
-      const aspectRad = (aspect * Math.PI) / 180.0;
       const slopeFactor = Math.sin((slope * Math.PI) / 180.0);
-      const windwardFacing = Math.cos(aspectRad - windRad);
-      const orographicLift = windwardFacing * slopeFactor * windSpeed;
-      const elevationMoisture = 0.5 + 0.5 * (z / maxElevM);
-      const liftFactor = Math.max(-0.55, Math.min(1.5, orographicLift * 0.08));
-
-      // Look toward the wind source for intervening ridges. A ridge above the
-      // local air column removes moisture from cells behind it, producing a
-      // spatially coherent rain shadow rather than only an aspect tint.
-      let maximumBarrierM = 0;
-      for (let sample = 1; sample <= rainShadowSamples; sample++) {
-        const sampleIndex = sample - 1;
-        const sampleX = rainShadowSampleX[sampleIndex * width + x];
-        const sampleY = rainShadowSampleY[sampleIndex * height + y];
-        if (sampleX < 0 || sampleX >= width || sampleY < 0 || sampleY >= height)
-          continue;
-        const barrierM =
-          elevation[sampleY * width + sampleX] - z - rainShadowDistanceM[sampleIndex] * 0.012;
-        if (barrierM > maximumBarrierM) maximumBarrierM = barrierM;
-      }
-      const shadowStrength = Math.max(0.55, Math.min(1.35, windSpeed / 15));
-      const rainShadowFactor = Math.exp(
-        -(maximumBarrierM / 1050) * shadowStrength,
-      );
-      const precipitation = Math.max(
-        120.0,
-        basePrecip *
-          Math.max(0.08, elevationMoisture + liftFactor) *
-          rainShadowFactor,
-      );
+      const precipitation = basePrecip * orographicRatio[idx];
       precipitationMmYr[idx] = precipitation;
 
       const sunFacing = Math.cos(((aspect - 180.0) * Math.PI) / 180.0);
@@ -2609,14 +2750,8 @@ export function processMountainBaseDEM(
     drainageAreaKm2[i] = flowAccumulation[i] * cellAreaKm2;
   }
 
-  const waterStageScale = Math.max(
-    0.2,
-    Math.min(3.0, options.waterStageScale ?? 1.0),
-  );
-  const flowRateScale = Math.max(
-    0.2,
-    Math.min(1.0, options.flowRateScale ?? 0.55),
-  );
+  const waterStageScale = Math.max(MIN_POSITIVE_SCALE, options.waterStageScale ?? 1.0);
+  const flowRateScale = Math.max(MIN_POSITIVE_SCALE, options.flowRateScale ?? 0.55);
   // This is a static water-stage approximation: slower flow retains more water
   // over each raster cell, raising the stage and allowing the bounded channel
   // corridor to wet its banks instead of leaving only a fast thalweg line.
@@ -2820,6 +2955,7 @@ export function processMountainBaseDEM(
   const biomeStop = profiler?.begin("DEM regional biomes and coasts");
   onStage?.("Classifying biomes and coasts");
   const wetlandCandidates = new Uint8Array(totalCells);
+  const holdridgeZone = new Uint8Array(totalCells).fill(255);
 
   // Relief is intentionally high frequency, but vegetation zones are not.
   // Classifying directly from z/slope/aspect made every small DEM facet a
@@ -2848,6 +2984,31 @@ export function processMountainBaseDEM(
     height,
     dxMeters,
     dyMeters,
+  );
+  // Meadows follow the local flats the eye reads, lightly smoothed so single
+  // DEM facets do not become meadow patches.
+  const meadowSlopeDeg = smoothBiomeField(
+    slopeDeg,
+    width,
+    height,
+    Math.max(1, Math.round(biomeRegionRadius / 4)),
+  );
+  const elevationRangeM = Math.max(1, maxElevM - minElevM);
+
+  // Perennial drainage: routed river channels and lakes, not the sea.
+  const drainageMask = new Uint8Array(totalCells);
+  for (let index = 0; index < totalCells; index++) {
+    if (isOcean[index] === 0 && (isRiverChannel[index] === 1 || lakeDepthM[index] > 0)) {
+      drainageMask[index] = 1;
+    }
+  }
+  const heightAboveDrainageM = computeHeightAboveNearestDrainage(
+    width,
+    height,
+    conditionedElevation,
+    flowDirection,
+    drainageMask,
+    d8Offsets,
   );
 
   for (let y = 0; y < height; y++) {
@@ -2878,43 +3039,49 @@ export function processMountainBaseDEM(
         (biomeElevation >= climateSnowlineM - 350.0 &&
           biomeTemp <= 0.0 &&
           biomePrecipitation > 900.0);
-      const isAridRainShadow = biomePrecipitation < 600 && biomeSlope > 15.0;
+      // Holdridge life zone from biotemperature and the rain-shadowed annual
+      // precipitation. Only the annual mean temperature is simulated, so it
+      // stands in for the monthly means of the biotemperature definition.
+      const biotemperature = holdridgeBiotemperatureFromAnnualMean(biomeTemp);
+      const lifeZone = classifyHoldridgeLifeZone(biotemperature, biomePrecipitation);
+      holdridgeZone[idx] = HOLDRIDGE_ZONE_CODES.indexOf(lifeZone);
+      const petRatio = holdridgePetRatio(biotemperature, biomePrecipitation);
+      const holdridgeBiome = mountainBiomeForHoldridgeZone(lifeZone, biotemperature, petRatio, biomeSlope);
+      const isMeadow =
+        !isRiver &&
+        (holdridgeBiome === 2 || holdridgeBiome === 3 || holdridgeBiome === 4) &&
+        meadowSlopeDeg[idx] < MEADOW_MAX_SLOPE_DEG &&
+        (biomeElevation - minElevM) / elevationRangeM < MEADOW_MAX_NORMALIZED_ELEVATION;
+      const climateBiome: MountainBiomeId = isMeadow ? 20 : holdridgeBiome;
+      const isDesertClimate = climateBiome === 15 || climateBiome === 16;
+      // Wetlands need at least a subhumid climate (PET ratio below 2, the
+      // semi-arid boundary) or a water table at the surface.
+      const supportsWetland =
+        petRatio < 2 || heightAboveDrainageM[idx] < WATERLOGGED_HAND_M;
 
       if (isGlacial) {
         biomeType[idx] = 0; // Permanent Glacier / Ice Horn
-      } else if (
-        biomeSlope > 38.0 ||
-        (biomeElevation > 2400 && isAridRainShadow)
-      ) {
+      } else if (biomeSlope > 38.0) {
         biomeType[idx] = 1; // Alpine Bare Rock & Arête Scree
       } else if (isRiver && strahler >= 3) {
         biomeType[idx] = 6; // Braided River Channel & Gravel Bars
+      } else if (isRiver && isDesertClimate) {
+        biomeType[idx] = 19; // Desert Oasis
       } else if (isRiver && biomeElevation < 1000) {
         biomeType[idx] = 5; // Riparian Canyon Shrubland
       } else if (
         !isRiver &&
+        supportsWetland &&
         biomeElevation < wetlandElevationThresholdM &&
         biomeSlope < 8.0
       ) {
         // Hold the candidate until the whole field has been classified so
-        // isolated threshold hits can be removed as a spatial pass.
+        // isolated threshold hits can be removed as a spatial pass; rejected
+        // candidates keep their climate biome.
         wetlandCandidates[idx] = 1;
-        biomeType[idx] =
-          biomeElevation > 2000
-            ? 2
-            : biomeElevation > 1100
-              ? isAridRainShadow
-                ? 4
-                : 3
-              : isAridRainShadow
-                ? 5
-                : 4;
-      } else if (biomeElevation > 2000 || biomeTemp < 2.0) {
-        biomeType[idx] = 2; // Alpine Tundra & Meadow
-      } else if (biomeElevation > 1100 || biomeTemp < 10.0) {
-        biomeType[idx] = isAridRainShadow ? 4 : 3; // Dense Conifer if wet, Montane woodland if dry
+        biomeType[idx] = climateBiome;
       } else {
-        biomeType[idx] = isAridRainShadow ? 5 : 4; // Montane Woodland / Arid Shrubland
+        biomeType[idx] = climateBiome;
       }
     }
   }
@@ -2937,9 +3104,11 @@ export function processMountainBaseDEM(
     isRiverChannel,
     dxMeters,
     dyMeters,
-    Math.max(50, options.biomeEdgeNoiseScaleM ?? DEFAULT_BIOME_EDGE_NOISE_SCALE_M),
-    Math.max(0, Math.min(INSPECTOR_BOUNDS.biomeBorder, options.biomeEdgeStrength ?? 1)),
+    Math.max(1, options.biomeEdgeNoiseScaleM ?? DEFAULT_BIOME_EDGE_NOISE_SCALE_M),
+    Math.max(0, options.biomeEdgeStrength ?? 1),
   );
+
+  applyWaterloggedBankBiomes(biomeType, heightAboveDrainageM, isOcean, isRiverChannel);
 
   // Add shoreline materials after regional smoothing, preserving routed water.
   classifyCoastalBiomes(
@@ -2955,8 +3124,8 @@ export function processMountainBaseDEM(
     maxElevM,
     dxMeters,
     dyMeters,
-    Math.max(50, options.biomeEdgeNoiseScaleM ?? DEFAULT_BIOME_EDGE_NOISE_SCALE_M),
-    Math.max(0, Math.min(INSPECTOR_BOUNDS.biomeBorder, options.biomeEdgeStrength ?? 1)),
+    Math.max(1, options.biomeEdgeNoiseScaleM ?? DEFAULT_BIOME_EDGE_NOISE_SCALE_M),
+    Math.max(0, options.biomeEdgeStrength ?? 1),
   );
   biomeStop?.();
 
@@ -2966,8 +3135,8 @@ export function processMountainBaseDEM(
     domainWidthKm,
     domainHeightKm,
     biomeRegionScaleKm,
-    biomeEdgeNoiseScaleM: Math.max(50, options.biomeEdgeNoiseScaleM ?? DEFAULT_BIOME_EDGE_NOISE_SCALE_M),
-    biomeEdgeStrength: Math.max(0, Math.min(INSPECTOR_BOUNDS.biomeBorder, options.biomeEdgeStrength ?? 1)),
+    biomeEdgeNoiseScaleM: Math.max(1, options.biomeEdgeNoiseScaleM ?? DEFAULT_BIOME_EDGE_NOISE_SCALE_M),
+    biomeEdgeStrength: Math.max(0, options.biomeEdgeStrength ?? 1),
     dxMeters,
     dyMeters,
     minElevationM: minElevM,
@@ -3000,6 +3169,8 @@ export function processMountainBaseDEM(
     solarInsolation,
     temperatureC,
     biomeType,
+    holdridgeZone,
+    heightAboveDrainageM,
     isOcean,
     lakeDepthM,
   };

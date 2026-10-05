@@ -102,16 +102,17 @@ describe('selective mountain projection', () => {
       ridgeDensity: MOUNTAIN_RIDGE_DENSITY_DEFAULT,
       ridgeThickness: MOUNTAIN_RIDGE_THICKNESS_DEFAULT,
     });
+    // Typed overrides may exceed the slider ranges; only validity limits apply.
     expect(normalizeMountainLineworkSettings(20, 3, -1, 10, 10, 0)).toEqual({
-      scale: 4,
+      scale: 20,
       opacity: 1,
       hatchOpacity: 1,
       horizontalHatchOpacity: 1,
       verticalHatchOpacity: 1,
       hatchDensity: 0,
-      hatchThickness: 6,
-      ridgeDensity: 6,
-      ridgeThickness: 0.25,
+      hatchThickness: 10,
+      ridgeDensity: 10,
+      ridgeThickness: 0.01,
     });
     expect(normalizeMountainLineworkSettings(1, 0.2, 1, 1, 1, 1, 0.65, 0.25, 0.9))
       .toMatchObject({ hatchOpacity: 0.65, horizontalHatchOpacity: 0.25, verticalHatchOpacity: 0.9 });
@@ -124,8 +125,12 @@ describe('selective mountain projection', () => {
     expect(mountainProjectionLiftCoefficient(78, 1.5))
       .toBeCloseTo(defaultCoefficient * 1.5, 8);
     expect(normalizeMountainProjectionSettings(40, 8)).toEqual({
-      viewAngleDeg: 75,
-      heightExaggeration: 2,
+      viewAngleDeg: 40,
+      heightExaggeration: 8,
+    });
+    expect(normalizeMountainProjectionSettings(120, -1)).toEqual({
+      viewAngleDeg: 90,
+      heightExaggeration: 0,
     });
     expect(normalizeMountainProjectionSettings(undefined, undefined)).toEqual({
       viewAngleDeg: MOUNTAIN_VIEW_ANGLE_DEFAULT_DEG,
