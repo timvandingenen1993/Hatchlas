@@ -21,6 +21,7 @@ import {
   MAX_MOUNTAIN_RENDER_RESOLUTION,
   MOUNTAIN_WATER_EVOLUTION_STEPS,
   resampleHeightmapLuminance,
+  type HeightmapGeoMetadata,
   type HeightmapRaster,
   type MountainDEMData,
 } from "../terrain/mountainBaseDEM";
@@ -895,6 +896,8 @@ export function MountainDetailStudio({
   const [heightmapSourceName, setHeightmapSourceName] = useState<string>(
     "nz-linz-dem.tif",
   );
+  /** Real-world scale of the current heightmap; null for plain images and the bundled map. */
+  const [heightmapMetadata, setHeightmapMetadata] = useState<HeightmapGeoMetadata | null>(null);
   const [globalDemOpen, setGlobalDemOpen] = useState(false);
   const [previewMetadata, setPreviewMetadata] =
     useState<MountainPreviewMetadata | null>(null);
@@ -2133,6 +2136,7 @@ export function MountainDetailStudio({
         if (requestId !== sourceLoadIdRef.current) return;
         setRawLuminance({ width, height, data: calibrateBundledMountainHeightmap(data), oceanMask });
         setHeightmapSourceName("nz-linz-dem.tif");
+        setHeightmapMetadata(null);
       })
       .catch((err) => {
         if (requestId !== sourceLoadIdRef.current) return;
@@ -2152,6 +2156,14 @@ export function MountainDetailStudio({
     return ++sourceLoadIdRef.current;
   };
 
+  /** Sets valley floor, summit and map width to a georeferenced heightmap's real values. */
+  const applyHeightmapScale = (metadata: HeightmapGeoMetadata) => {
+    const floor = Math.round(metadata.minElevationM);
+    setMinElevM(floor);
+    setMaxElevM(Math.max(floor + 1, Math.round(metadata.maxElevationM)));
+    setDomainWidthKm(Math.round(metadata.widthKm * 100) / 100);
+  };
+
   /** Shows a user-chosen heightmap; a georeferenced one also sets its real width and relief. */
   const applyLoadedHeightmap = (
     { width, height, rawLuminance: data, oceanMask, metadata }: HeightmapRaster,
@@ -2159,11 +2171,8 @@ export function MountainDetailStudio({
   ) => {
     setRawLuminance({ width, height, data, oceanMask });
     setHeightmapSourceName(sourceName);
-    if (!metadata) return;
-    const floor = Math.round(metadata.minElevationM);
-    setMinElevM(floor);
-    setMaxElevM(Math.max(floor + 1, Math.round(metadata.maxElevationM)));
-    setDomainWidthKm(Math.round(metadata.widthKm * 100) / 100);
+    setHeightmapMetadata(metadata ?? null);
+    if (metadata) applyHeightmapScale(metadata);
   };
 
   const handleHeightmapFile = (event: ChangeEvent<HTMLInputElement>) => {
@@ -4194,7 +4203,13 @@ export function MountainDetailStudio({
               onChange={(passes) => { setHeightmapSmoothingPasses(passes); commitAnalysisControls(); }} />
           </InspectorSection>
 
-          <InspectorSection title="Elevation and scale">
+          <InspectorSection title="Elevation and scale" aside={
+            <button type="button" disabled={!heightmapMetadata}
+              onClick={() => { if (heightmapMetadata) { applyHeightmapScale(heightmapMetadata); commitAnalysisControls(); } }}
+              title={heightmapMetadata
+                ? `Use the heightmap's real values: summit ${Math.round(heightmapMetadata.maxElevationM)} m, valley floor ${Math.round(heightmapMetadata.minElevationM)} m, width ${Math.round(heightmapMetadata.widthKm * 100) / 100} km`
+                : "Only a GeoTIFF or a map from Get map carries real elevations and size"}
+              className="rounded border border-white/10 bg-white/5 px-2 py-0.5 text-[11px] text-slate-200 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-white/5">From heightmap</button>}>
             {num("Summit height", maxElevM, (next) => { setMaxElevM(next); setMinElevM((floor) => Math.min(floor, next - 1)); }, 1500, 6000, 50, { unit: "m", key: "maxElevM", commit: true, limits: [1, Infinity] })}
             {num("Valley floor", minElevM, (next) => { setMinElevM(next); setMaxElevM((summit) => Math.max(summit, next + 1)); }, 0, 1500, 10, { unit: "m", key: "minElevM", commit: true })}
             {num("Sea level", oceanElevationM, setOceanElevationM, -100, 100, 1, { unit: "m", key: "oceanElevationM", commit: true })}
