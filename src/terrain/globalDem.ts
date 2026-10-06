@@ -3,6 +3,7 @@
  * elevation tiles in the browser, cropped on the source grid to a WGS84 box.
  * Both providers serve CORS-enabled tiles, so no server is involved.
  */
+import { openDrainageToFloor } from "./drainageOpening";
 import { heightmapFromElevations, type HeightmapRaster } from "./mountainBaseDEM";
 
 export interface BBox {
@@ -15,8 +16,15 @@ export interface BBox {
 export const MERCATOR_MAX_LAT = 85.0511287798066;
 const EARTH_RADIUS_M = 6378137;
 const HALF_WORLD_M = Math.PI * EARTH_RADIUS_M;
-/** Source pixels per download; 64 Mapzen-sized 512 px tiles, as in the Heightmap app. */
+/** Pixels in the output grid; 64 Mapzen-sized 512 px tiles, as in the Heightmap app. */
 const MAX_SOURCE_PIXELS = 64 * 512 * 512;
+/**
+ * Full-resolution pixels streamed for one download. Each tile is reduced to
+ * the output grid as it arrives, so this bounds download time, not memory.
+ */
+const MAX_DETAIL_PIXELS = 4096 * 512 * 512;
+/** Ground spacing of the sources' native data (Copernicus GLO-30, SRTM). */
+const NATIVE_GROUND_M = 30;
 const TERRARIUM_MISSING_BELOW_M = -12000;
 const GEOTIFF_NODATA = -32768;
 
@@ -62,8 +70,16 @@ export interface DemTile {
 
 export interface GlobalDemPlan {
   source: DemSource;
+  /** Zoom of the output grid. */
   zoom: number;
+  /** Tiles covering the crop window at `zoom`. */
   tiles: DemTile[];
+  /**
+   * Zoom actually downloaded: the native ~30 m data, so valleys narrower than
+   * an output cell stay open. Each output cell averages a power-of-two block.
+   */
+  detailZoom: number;
+  detailTiles: DemTile[];
   /** Crop window in global pixel coordinates at `zoom`. */
   left: number;
   top: number;
@@ -134,17 +150,30 @@ export function planGlobalDem(bbox: BBox, source: DemSource, requestedGroundM = 
     return tiles(w.left, w.right) * tiles(w.top, w.bottom);
   };
 
-  let zoom = Math.ceil(Math.log2((2 * HALF_WORLD_M * groundScale) / (source.tileSize * requestedGroundM)));
-  zoom = Math.max(0, Math.min(source.maxZoom, zoom));
+  const zoomFor = (groundM: number) => Math.max(0, Math.min(source.maxZoom,
+    Math.ceil(Math.log2((2 * HALF_WORLD_M * groundScale) / (source.tileSize * groundM))),
+  ));
+  let zoom = zoomFor(requestedGroundM);
   while (zoom > 0 && tileCount(zoom) > maxTiles) zoom--;
 
-  const { left, right, top, bottom } = window(zoom);
-  const tiles: DemTile[] = [];
-  for (let y = Math.floor(top / source.tileSize); y <= Math.floor((bottom - 1) / source.tileSize); y++) {
-    for (let x = Math.floor(left / source.tileSize); x <= Math.floor((right - 1) / source.tileSize); x++) {
-      tiles.push({ z: zoom, x, y });
+  // A block of detail pixels must fit inside one tile so each tile reduces on its own.
+  let detailZoom = Math.max(zoom, Math.min(zoomFor(NATIVE_GROUND_M), zoom + Math.log2(source.tileSize)));
+  const maxDetailTiles = Math.max(1, Math.floor(MAX_DETAIL_PIXELS / source.tileSize ** 2));
+  while (detailZoom > zoom && tileCount(detailZoom) > maxDetailTiles) detailZoom--;
+
+  const tilesAt = (z: number) => {
+    const w = window(z);
+    const list: DemTile[] = [];
+    for (let y = Math.floor(w.top / source.tileSize); y <= Math.floor((w.bottom - 1) / source.tileSize); y++) {
+      for (let x = Math.floor(w.left / source.tileSize); x <= Math.floor((w.right - 1) / source.tileSize); x++) {
+        list.push({ z, x, y });
+      }
     }
-  }
+    return list;
+  };
+  const { left, right, top, bottom } = window(zoom);
+  const tiles = tilesAt(zoom);
+  const detailTiles = detailZoom === zoom ? tiles : tilesAt(detailZoom);
   const projectedCellSize = (2 * HALF_WORLD_M) / (source.tileSize * 2 ** zoom);
   // Measure at the centre of the snapped window, which is what gets exported.
   const centreY = HALF_WORLD_M - ((top + bottom) / 2) * projectedCellSize;
@@ -152,7 +181,7 @@ export function planGlobalDem(bbox: BBox, source: DemSource, requestedGroundM = 
   const width = right - left;
   const height = bottom - top;
   return {
-    source, zoom, tiles, left, top, width, height, projectedCellSize, groundCellSize,
+    source, zoom, tiles, detailZoom, detailTiles, left, top, width, height, projectedCellSize, groundCellSize,
     widthKm: (width * groundCellSize) / 1000,
     heightKm: (height * groundCellSize) / 1000,
   };
@@ -205,7 +234,11 @@ export function maskEdgeConnectedSea(values: Float32Array, width: number, height
 /** Loads one tile's elevations (tileSize² cells), or null when the provider has none. */
 export type DemTileLoader = (tile: DemTile, signal: AbortSignal) => Promise<Float32Array | null>;
 
-/** Downloads every planned tile with limited concurrency and copies its overlap into the crop window. */
+/**
+ * Downloads the full-resolution tiles with limited concurrency. Each tile is
+ * reduced straight into the output grid (mean for the surface, minimum for
+ * the valley floor) and then released, so memory does not grow with detail.
+ */
 export async function assembleGlobalDem(
   plan: GlobalDemPlan,
   loadTile: DemTileLoader,
@@ -214,37 +247,60 @@ export async function assembleGlobalDem(
   concurrency = 6,
 ): Promise<GlobalDemMosaic> {
   const { tileSize } = plan.source;
+  const factor = 2 ** (plan.detailZoom - plan.zoom);
   const values = new Float32Array(plan.width * plan.height).fill(Number.NaN);
+  const floor = factor > 1 ? new Float32Array(plan.width * plan.height).fill(Number.NaN) : values;
+  const tiles = plan.detailTiles;
   let next = 0;
   let loaded = 0;
-  onProgress?.(0, plan.tiles.length);
+  onProgress?.(0, tiles.length);
 
-  const copyTile = (tile: DemTile, elevations: Float32Array) => {
+  const reduceTile = (tile: DemTile, elevations: Float32Array) => {
     if (elevations.length !== tileSize * tileSize) throw new Error("Terrain tile has an unexpected size.");
     const tileLeft = tile.x * tileSize;
     const tileTop = tile.y * tileSize;
-    const x0 = Math.max(plan.left, tileLeft);
-    const x1 = Math.min(plan.left + plan.width, tileLeft + tileSize);
-    for (let row = Math.max(plan.top, tileTop); row < Math.min(plan.top + plan.height, tileTop + tileSize); row++) {
-      const source = (row - tileTop) * tileSize + (x0 - tileLeft);
-      values.set(elevations.subarray(source, source + x1 - x0), (row - plan.top) * plan.width + (x0 - plan.left));
+    // Output cells whose detail block lies in this tile, clipped to the crop.
+    const x0 = Math.max(plan.left, tileLeft / factor);
+    const x1 = Math.min(plan.left + plan.width, (tileLeft + tileSize) / factor);
+    const y0 = Math.max(plan.top, tileTop / factor);
+    const y1 = Math.min(plan.top + plan.height, (tileTop + tileSize) / factor);
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        let sum = 0;
+        let count = 0;
+        let lowest = Number.POSITIVE_INFINITY;
+        for (let row = y * factor - tileTop; row < (y + 1) * factor - tileTop; row++) {
+          for (let column = x * factor - tileLeft; column < (x + 1) * factor - tileLeft; column++) {
+            const value = elevations[row * tileSize + column];
+            if (Number.isNaN(value)) continue;
+            sum += value;
+            count++;
+            if (value < lowest) lowest = value;
+          }
+        }
+        if (count === 0) continue;
+        const index = (y - plan.top) * plan.width + (x - plan.left);
+        values[index] = sum / count;
+        floor[index] = lowest;
+      }
     }
   };
   const worker = async () => {
-    while (next < plan.tiles.length) {
-      const tile = plan.tiles[next++];
+    while (next < tiles.length) {
+      const tile = tiles[next++];
       signal.throwIfAborted();
       const elevations = await loadTile(tile, signal);
       signal.throwIfAborted();
-      if (elevations) copyTile(tile, elevations);
-      onProgress?.(++loaded, plan.tiles.length);
+      if (elevations) reduceTile(tile, elevations);
+      onProgress?.(++loaded, tiles.length);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(concurrency, plan.tiles.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(concurrency, tiles.length) }, worker));
   if (!values.some((value) => !Number.isNaN(value))) {
     throw new Error("The provider returned no elevation data for this area.");
   }
   maskEdgeConnectedSea(values, plan.width, plan.height);
+  if (factor > 1) openDrainageToFloor(values, floor, plan.width, plan.height);
 
   let minElevationM = Number.POSITIVE_INFINITY;
   let maxElevationM = Number.NEGATIVE_INFINITY;

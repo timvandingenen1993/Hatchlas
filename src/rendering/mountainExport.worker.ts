@@ -4,10 +4,10 @@
 import {
   extractDeepOpenOceanMask,
   getHeightmapExportAnalysisResolution,
+  prepareAnalysisHeightmap,
   processMountainBaseDEM,
   resampleHeightmapLuminance,
   resampleHeightmapMask,
-  smoothHeightmapLuminance,
   type BaseDEMOptions,
   type MountainDEMData,
 } from "../terrain/mountainBaseDEM";
@@ -444,28 +444,15 @@ function prepareGlobalDEM(
     request.outputHeight,
     request.analysisLongEdge,
   );
-  const analysisHeightmap = resampleHeightmapLuminance(
+  const { luminance: denoised, oceanMask: analysisOceanMask } = prepareAnalysisHeightmap(
     source.luminance,
+    source.oceanMask,
     source.width,
     source.height,
     analysisSize.width,
     analysisSize.height,
-  );
-  const denoised = smoothHeightmapLuminance(
-    analysisHeightmap,
-    analysisSize.width,
-    analysisSize.height,
     Number(request.heightmapSmoothingPasses ?? 0),
   );
-  const analysisOceanMask = source.oceanMask
-    ? resampleHeightmapMask(
-        source.oceanMask,
-        source.width,
-        source.height,
-        analysisSize.width,
-        analysisSize.height,
-      )
-    : undefined;
   const options: BaseDEMOptions = {
     ...request.analysis,
     oceanMask: analysisOceanMask,

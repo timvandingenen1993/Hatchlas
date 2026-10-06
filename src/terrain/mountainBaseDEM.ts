@@ -15,6 +15,7 @@ import { MIN_POSITIVE_SCALE } from "../config/inspectorBounds";
  */
 
 import { biomeEdgeNoise, DEFAULT_BIOME_EDGE_NOISE_SCALE_M } from "./biomeEdgeNoise";
+import { openDrainageToFloor } from "./drainageOpening";
 import {
   computeOrographicPrecipitationRate,
   OROGRAPHIC_DEFAULTS,
@@ -697,6 +698,22 @@ export const getOpenOceanMask = extractDeepOpenOceanMask;
 export const DEFAULT_RIVER_THRESHOLD_KM2 = 3.2;
 
 /**
+ * Analysis cell size, in metres, that the raster-cell water widths were tuned
+ * on (45–80 km maps at the 2048 px preview). Coarser cells keep that ground
+ * width rather than the cell count, so a regional map does not paint every
+ * river, pool and coastal shallow kilometres wide.
+ */
+export const WATER_REFERENCE_CELL_M = 40;
+
+/**
+ * Factor for a water width tuned in cells: 1 up to the reference cell size,
+ * then shrinking so the width stays the same on the ground.
+ */
+export function waterWidthCellScale(cellSizeM: number): number {
+  return cellSizeM > 0 ? Math.min(1, WATER_REFERENCE_CELL_M / cellSizeM) : 1;
+}
+
+/**
  * Lee-side rainfall floor, as a fraction of the base precipitation. The linear
  * orographic model removes moisture without limit (its raw floor is 0.14% of
  * the background rate), so any large ridge produced hyper-arid desert. Real
@@ -995,7 +1012,12 @@ function classifyCoastalBiomes(
     height,
   );
 
-  const maximumCoastWidthM = 600;
+  // On coarse cells a real shore is narrower than one cell. Like a river's
+  // thalweg it still keeps the first coastal row (1.5 cells reaches diagonals)
+  // so the coast reads as a band, not as scattered sand where noise widens it.
+  const minimumShoreWidthM =
+    cellSizeM > WATER_REFERENCE_CELL_M ? 1.5 * cellSizeM : 0;
+  const maximumCoastWidthM = Math.max(600, minimumShoreWidthM);
   const elevationRangeM = Math.max(1, maxElevationM - minElevationM);
 
   // 2. Outer Coastline processing:
@@ -1014,7 +1036,10 @@ function classifyCoastalBiomes(
       const noise = biomeEdgeNoise((index % width) * dxMeters,
         Math.floor(index / width) * dyMeters, noiseScaleM);
       const widthVariation = Math.exp(noise * Math.min(3, edgeStrength) * 1.6);
-      const shoreWidthM = Math.min(maximumCoastWidthM, 180 * widthVariation);
+      const shoreWidthM = Math.max(
+        minimumShoreWidthM,
+        Math.min(maximumCoastWidthM, 180 * widthVariation),
+      );
       const localSlope = slopeDeg[index];
       // Coastal material follows physical terrain, not climate-region smoothing.
       const materialSlope = localSlope;
@@ -1030,7 +1055,10 @@ function classifyCoastalBiomes(
       } else if (materialSlope >= 14.0) {
         biomeType[index] = 13; // Rocky Shore
       } else if (coastalReliefM <= 12 + 8 * (noise + 1) &&
-        coastDistanceCells * cellSizeM <= shoreWidthM / (1 + materialSlope * 0.12)) {
+        coastDistanceCells * cellSizeM <= Math.max(
+          minimumShoreWidthM,
+          shoreWidthM / (1 + materialSlope * 0.12),
+        )) {
         biomeType[index] = 11; // Sandy Beach
       }
     }
@@ -1442,6 +1470,74 @@ export function resampleHeightmapMask(
     }
   }
   return target;
+}
+
+/**
+ * Lowest source sample under each target cell, on the same corner-aligned
+ * grid as `resampleHeightmapLuminance`; footprints cover every source sample.
+ */
+export function resampleHeightmapMinimum(
+  source: Float32Array,
+  sourceWidth: number,
+  sourceHeight: number,
+  targetWidth: number,
+  targetHeight: number,
+): Float32Array {
+  const xScale = sourceWidth > 1 ? (sourceWidth - 1) / (targetWidth - 1 || 1) : 0;
+  const yScale = sourceHeight > 1 ? (sourceHeight - 1) / (targetHeight - 1 || 1) : 0;
+  const span = (index: number, scale: number, size: number) => [
+    Math.max(0, Math.round(index * scale - scale / 2)),
+    Math.min(size - 1, Math.round(index * scale + scale / 2)),
+  ];
+  const target = new Float32Array(targetWidth * targetHeight);
+  for (let y = 0; y < targetHeight; y++) {
+    const [y0, y1] = span(y, yScale, sourceHeight);
+    for (let x = 0; x < targetWidth; x++) {
+      const [x0, x1] = span(x, xScale, sourceWidth);
+      let lowest = Number.POSITIVE_INFINITY;
+      for (let sy = y0; sy <= y1; sy++) {
+        for (let sx = x0; sx <= x1; sx++) {
+          lowest = Math.min(lowest, source[sy * sourceWidth + sx]);
+        }
+      }
+      target[y * targetWidth + x] = lowest;
+    }
+  }
+  return target;
+}
+
+/**
+ * Resamples and denoises a heightmap for analysis. When it shrinks, valleys
+ * narrower than the new cells are reopened against the lowest source sample,
+ * so resampling cannot dam a river into a false lake.
+ */
+export function prepareAnalysisHeightmap(
+  luminance: Float32Array,
+  oceanMask: Uint8Array | undefined,
+  sourceWidth: number,
+  sourceHeight: number,
+  targetWidth: number,
+  targetHeight: number,
+  smoothingPasses: number,
+): { luminance: Float32Array; oceanMask?: Uint8Array } {
+  const prepared = smoothHeightmapLuminance(
+    resampleHeightmapLuminance(luminance, sourceWidth, sourceHeight, targetWidth, targetHeight),
+    targetWidth,
+    targetHeight,
+    smoothingPasses,
+  );
+  const targetOcean = oceanMask
+    ? resampleHeightmapMask(oceanMask, sourceWidth, sourceHeight, targetWidth, targetHeight)
+    : undefined;
+  if (targetWidth < sourceWidth || targetHeight < sourceHeight) {
+    const floor = resampleHeightmapMinimum(luminance, sourceWidth, sourceHeight, targetWidth, targetHeight);
+    // Ocean cells are the outlets (NaN) and keep their resampled bed.
+    const bed = targetOcean ? prepared.slice() : undefined;
+    targetOcean?.forEach((ocean, index) => { if (ocean === 1) prepared[index] = Number.NaN; });
+    openDrainageToFloor(prepared, floor, targetWidth, targetHeight);
+    targetOcean?.forEach((ocean, index) => { if (ocean === 1) prepared[index] = bed![index]; });
+  }
+  return { luminance: prepared, oceanMask: targetOcean };
 }
 
 /**
@@ -3088,6 +3184,8 @@ export function processMountainBaseDEM(
     Math.max(2, Math.min(dxMeters, dyMeters) * 0.035),
   );
   const stageWidthScale = Math.sqrt(effectiveWaterStageScale);
+  // Radius 0 keeps only the thalweg once a cell is wider than the channel.
+  const channelRadiusCellScale = waterWidthCellScale(Math.min(dxMeters, dyMeters));
 
   for (let i = 0; i < totalCells; i++) {
     const area = rainfallWeightedAreaKm2[i];
@@ -3124,7 +3222,7 @@ export function processMountainBaseDEM(
       const waterSurfaceM = elevation[i] + depth + rasterStageAllowanceM;
       centerlineMask[i] = 1;
       distanceToCenterline[i] = 0;
-      inheritedChannelRadius[i] = radius;
+      inheritedChannelRadius[i] = Math.round(radius * channelRadiusCellScale);
       inheritedChannelOrder[i] = displayOrder;
       inheritedWaterSurfaceM[i] = waterSurfaceM;
       isRiverChannel[i] = 1;

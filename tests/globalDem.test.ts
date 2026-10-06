@@ -12,6 +12,7 @@ import {
   planGlobalDem,
   type DemTile,
 } from '../src/terrain/globalDem';
+import { openDrainageToFloor } from '../src/terrain/drainageOpening';
 import { decodeTiffHeightmap } from '../src/terrain/mountainBaseDEM';
 
 const montBlanc = { west: 6.75, south: 45.75, east: 7.05, north: 45.98 };
@@ -116,9 +117,55 @@ describe('global DEM assembly', () => {
     expect(raster.oceanMask?.[mosaic.values.length - 1]).toBe(0);
   });
 
+  it('downloads native detail and averages it into each coarser output cell', async () => {
+    const plan = planGlobalDem(montBlanc, DEM_SOURCES.mapzen, 120);
+    const factor = 2 ** (plan.detailZoom - plan.zoom);
+    expect(factor).toBeGreaterThan(1);
+    expect(plan.detailTiles.every((tile) => tile.z === plan.detailZoom)).toBe(true);
+    // Flat 500 m land with one 100 m pixel in every output block.
+    const mosaic = await assembleGlobalDem(plan, async () => {
+      const values = new Float32Array(256 * 256).fill(500);
+      for (let row = 0; row < 256; row += factor) {
+        for (let col = 0; col < 256; col += factor) values[row * 256 + col] = 100;
+      }
+      return values;
+    }, signal);
+    expect(mosaic.values.length).toBe(plan.width * plan.height);
+    expect(new Set(mosaic.values)).toEqual(new Set([500 - 400 / factor ** 2]));
+  });
+
   it('fails when the provider has no data at all', async () => {
     const plan = planGlobalDem(montBlanc, DEM_SOURCES.mapzen, 120);
     await expect(assembleGlobalDem(plan, async () => null, signal)).rejects.toThrow(/no elevation data/);
+  });
+});
+
+describe('drainage from the full-resolution floor', () => {
+  // A basin at 30 m drains west to the sea through one averaged cell (60 m).
+  const valley = (damFloor: number) => {
+    const wall = 100;
+    const rows = [
+      [wall, wall, wall, wall, wall, wall],
+      [Number.NaN, 60, 30, 30, 30, wall],
+      [wall, wall, wall, wall, wall, wall],
+    ];
+    const values = new Float32Array(rows.flat());
+    const floor = values.map((value) => (value === 60 ? damFloor : value));
+    openDrainageToFloor(values, floor, 6, 3);
+    return Array.from(values);
+  };
+
+  it('opens a gorge that averaging closed, only as far as the basin needs', () => {
+    expect(valley(10).slice(6, 12)).toEqual([Number.NaN, 30, 30, 30, 30, 100]);
+  });
+
+  it('keeps a barrier that is real at full resolution at its true pass height', () => {
+    expect(valley(40).slice(6, 12)).toEqual([Number.NaN, 40, 30, 30, 30, 100]);
+  });
+
+  it('never raises a cell and leaves walls alone', () => {
+    const walls = valley(10).filter((_, index) => index < 6 || index >= 12);
+    expect(walls.every((value) => value === 100)).toBe(true);
   });
 });
 
@@ -189,7 +236,8 @@ describe('sea masking', () => {
 
 describe('global DEM heightmap metadata', () => {
   const synthetic = async () => {
-    const plan = planGlobalDem(montBlanc, DEM_SOURCES.mapzen, 60);
+    // At native spacing each pixel is kept as is, so the bathymetry sample survives.
+    const plan = planGlobalDem(montBlanc, DEM_SOURCES.mapzen, 30);
     const mosaic = await assembleGlobalDem(plan, async () => {
       const values = new Float32Array(256 * 256);
       for (let i = 0; i < values.length; i++) values[i] = 1000 + (i % 3800);

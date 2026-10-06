@@ -7,6 +7,7 @@ import {
   DEFAULT_RIVER_THRESHOLD_KM2,
   extractDeepOpenOceanMask,
   filterSmallOceanComponents,
+  waterWidthCellScale,
 } from "../terrain/mountainBaseDEM";
 import { buildRiverSiltCreaseField, buildRiverSiltDepth } from "./riverSilt";
 import {
@@ -2335,6 +2336,12 @@ export function buildWetlandPuddleContours(
     20,
     Math.min(180, minimumDimension * 0.19),
   ) * coordinateScale;
+  // Pools keep their ground size on coarse maps; spacing stays in pixels so
+  // a regional map gets as many pools, only smaller. A tile's cells times its
+  // coordinate scale give the analysis cell size.
+  const poolRadiusCellScale = waterWidthCellScale(
+    Math.min(dem.dxMeters, dem.dyMeters) * coordinateScale,
+  );
   const cacheKey = [
     width,
     height,
@@ -2344,6 +2351,7 @@ export function buildWetlandPuddleContours(
     sizeMax.toFixed(3),
     coastDistance.toFixed(3),
     coordinateScale.toFixed(3),
+    poolRadiusCellScale.toFixed(4),
     coordinateOffsetX,
     coordinateOffsetY,
     coordinateDomainWidth,
@@ -2453,7 +2461,8 @@ export function buildWetlandPuddleContours(
         : hash01(cellKey, 437) * 0.2;
     const majorAxis = 1.08 + hash01(cellKey, 445) * 0.34;
     const minorAxis = 0.62 + hash01(cellKey, 451) * 0.27;
-    const radius = cellSize * (sizeMin + (sizeMax - sizeMin) * sizeT);
+    const radius =
+      cellSize * (sizeMin + (sizeMax - sizeMin) * sizeT) * poolRadiusCellScale;
     // The warped boundary can extend farther than the nominal ellipse. Use a
     // generous clearance margin so the union is never cut flat by the mask.
     const requiredClearance =
@@ -3824,7 +3833,7 @@ type WaveSeed = {
   maxRadius?: number;
 };
 
-interface OceanWavePathPoint {
+export interface OceanWavePathPoint {
   x: number;
   y: number;
   along: number;
@@ -4081,7 +4090,7 @@ function paintOceanWaveInkDot(
   }
 }
 
-function paintOceanWavePath(
+export function paintOceanWavePath(
   path: OceanWavePathPoint[],
   alpha: Uint8Array,
   tone: Uint8Array,
@@ -4154,8 +4163,13 @@ function paintOceanWavePath(
     const b = pass.points[segment + 1];
     const dx = b.x - a.x;
     const dy = b.y - a.y;
-    const lengthSquared = dx * dx + dy * dy || 1;
+    // A stalled sample has no direction; its neighbours cover the point, and
+    // painting it would sweep a strip along the shore normal.
+    if (dx === 0 && dy === 0) continue;
+    const lengthSquared = dx * dx + dy * dy;
     const segmentLength = Math.sqrt(lengthSquared);
+    const segmentNormalX = -dy / segmentLength;
+    const segmentNormalY = dx / segmentLength;
     let reach = pass.reach + 1.5 * markScale;
     if (!pass.shading) {
       // Bound the thin marks even when the shore normal is tilted against
@@ -4204,8 +4218,23 @@ function paintOceanWavePath(
         const rawNx = a.shoreNormalX + (b.shoreNormalX - a.shoreNormalX) * t;
         const rawNy = a.shoreNormalY + (b.shoreNormalY - a.shoreNormalY) * t;
         const normalLength = Math.hypot(rawNx, rawNy) || 1;
-        const nx = rawNx / normalLength;
-        const ny = rawNy / normalLength;
+        let nx = rawNx / normalLength;
+        let ny = rawNy / normalLength;
+        // The normal comes from the path before its wobble offset, so where
+        // that offset folds the path it can lie along the segment. `across`
+        // then stays near zero on the whole perpendicular line, which painted
+        // straight streaks out to the full reach. Turn such normals back
+        // toward the segment's own perpendicular.
+        const alignment = nx * segmentNormalX + ny * segmentNormalY;
+        const correction = 1 - smoothstep(0.2, 0.5, Math.abs(alignment));
+        if (correction > 0) {
+          const side = alignment < 0 ? -1 : 1;
+          const correctedX = nx + (side * segmentNormalX - nx) * correction;
+          const correctedY = ny + (side * segmentNormalY - ny) * correction;
+          const correctedLength = Math.hypot(correctedX, correctedY) || 1;
+          nx = correctedX / correctedLength;
+          ny = correctedY / correctedLength;
+        }
         const across = (x - centerX) * nx + (y - centerY) * ny;
         const acrossMagnitude = Math.abs(across);
         if (acrossMagnitude >= pass.limit) continue;
@@ -7325,6 +7354,14 @@ function renderWaterOverlayInternal(
   // routed flow geometry remain intact right up to the shared mouth boundary.
   const finalToneStop = profiler?.begin("water final ocean tone");
   const markScale = Math.max(0.25, options.oceanPixelScale ?? 1);
+  // The shallow wash stands for coastal depth, so it keeps its ground width;
+  // a tile's cells times its pixel scale give the analysis cell size.
+  const coastWashPixels =
+    95.0 *
+    markScale *
+    waterWidthCellScale(
+      Math.min(dem.dxMeters, dem.dyMeters) * (options.oceanPixelScale ?? 1),
+    );
   for (let index = 0; index < totalCells; index++) {
     if (oceanDetailMask[index] !== 1) continue;
     // Keep the bilinear edge coverage in tiled exports instead of snapping
@@ -7345,7 +7382,7 @@ function renderWaterOverlayInternal(
     const dist = distanceToCoast[index];
     const coastT = Math.max(
       0,
-      Math.min(1.0, dist / (95.0 * markScale)),
+      Math.min(1.0, dist / coastWashPixels),
     );
     // Keep the broad coast-depth wash; wave shading now follows the actual
     // traced ridges in oceanWaveLightAlpha and oceanWaveShadowAlpha.

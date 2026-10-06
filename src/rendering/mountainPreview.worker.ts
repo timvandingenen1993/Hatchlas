@@ -8,9 +8,8 @@ import {
   recomputeMountainLighting,
   resampleHeightmapLuminance,
   DEFAULT_RIVER_THRESHOLD_KM2,
-  resampleHeightmapMask,
+  prepareAnalysisHeightmap,
   sampleMountainElevationProfile,
-  smoothHeightmapLuminance,
   type BaseDEMOptions,
   type MountainDEMData,
   type MountainEvolutionState,
@@ -1142,31 +1141,18 @@ function analyze(request: Extract<MountainPreviewRequest, { type: "analyze" }>):
       request.analysisLongEdge,
       4096,
     );
-    const resized = resampleHeightmapLuminance(
-      source.luminance,
-      source.width,
-      source.height,
-      size.width,
-      size.height,
-    );
     preparedSource = {
       width: size.width,
       height: size.height,
-      luminance: smoothHeightmapLuminance(
-        resized,
+      ...prepareAnalysisHeightmap(
+        source.luminance,
+        source.oceanMask,
+        source.width,
+        source.height,
         size.width,
         size.height,
         request.heightmapSmoothingPasses,
       ),
-      oceanMask: source.oceanMask
-        ? resampleHeightmapMask(
-            source.oceanMask,
-            source.width,
-            source.height,
-            size.width,
-            size.height,
-          )
-        : undefined,
     };
     preparedSourceKey = preparedKey;
     coreAnalysisKey = "";

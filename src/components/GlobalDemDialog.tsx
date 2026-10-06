@@ -88,7 +88,7 @@ export default function GlobalDemDialog({ onClose, onLoad }: {
     const controller = new AbortController();
     abortRef.current = controller;
     setError(null);
-    setProgress({ loaded: 0, total: plan.tiles.length });
+    setProgress({ loaded: 0, total: plan.detailTiles.length });
     try {
       const mosaic = await assembleGlobalDem(plan, terrariumTileLoader(plan.source), controller.signal,
         (loaded, total) => setProgress({ loaded, total }));
@@ -166,10 +166,15 @@ export default function GlobalDemDialog({ onClose, onLoad }: {
                 <dt className="text-slate-500">Spacing</dt>
                 <dd className="text-right tabular-nums">≈ {plan.groundCellSize.toFixed(0)} m</dd>
                 <dt className="text-slate-500">Download</dt>
-                <dd className="text-right tabular-nums">{plan.tiles.length} tiles</dd>
+                <dd className="text-right tabular-nums">{plan.detailTiles.length.toLocaleString()} tiles</dd>
               </dl>}
               {plan && plan.groundCellSize > spacingM * 1.5 &&
                 <InspectorNote>This box is large, so it uses coarser tiles to stay within the download limit.</InspectorNote>}
+              {plan && plan.detailZoom > plan.zoom &&
+                <InspectorNote>
+                  Downloads the full ≈ {(plan.groundCellSize / 2 ** (plan.detailZoom - plan.zoom)).toFixed(0)} m data and
+                  averages it to this grid, so valleys narrower than a cell keep draining instead of turning into lakes.
+                </InspectorNote>}
               <InspectorToggle label="Also save as GeoTIFF" checked={saveGeoTiff} disabled={busy}
                 onChange={(next) => update({ saveGeoTiff: next })} />
             </section>
