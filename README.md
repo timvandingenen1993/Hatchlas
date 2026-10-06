@@ -17,9 +17,9 @@
 
 ## About
 
-Load a heightmap (PNG or GeoTIFF), or pick any place on Earth to download real 30 m terrain, and Hatchlas works out rivers, lakes, snow lines and biomes (including deserts and dry steppe) from the terrain. It then paints the result as an illustrated map, with inked mountain faces, charcoal-style river and shore lines, forest stands, wetlands and wash colors.
+Load a heightmap (PNG or GeoTIFF) and Hatchlas works out rivers, lakes, snow lines and biomes (including deserts and dry steppe) from the terrain. It then paints the result as an illustrated map, with inked mountain faces, charcoal-style river and shore lines, forest stands, wetlands and wash colors.
 
-Everything runs client-side. There is nothing to install, and your heightmaps never leave your machine. Downloading real terrain fetches public elevation tiles straight from the provider. A desktop browser works best.
+Everything runs client-side. There is nothing to install, and your heightmaps never leave your machine. A desktop browser works best.
 
 > [!NOTE]
 > The style is visually inspired by Mike Schley's regional maps. No artwork from his maps is included, and this project is not affiliated with or endorsed by him or any publisher.
@@ -51,8 +51,7 @@ Everything runs client-side. There is nothing to install, and your heightmaps ne
 
 | Feature | Details |
 |---|---|
-| **Heightmap in, map out** | 16-bit PNG, or single-band uncompressed TIFF/GeoTIFF. A GeoTIFF also sets the map width, summit and valley floor. A sample New Zealand DEM is bundled. |
-| **Real terrain worldwide** | **Get map** opens a world map: draw a box and load Copernicus 30 m (via Mapterhorn) or Mapzen terrain, optionally saved as a GeoTIFF. |
+| **Heightmap in, map out** | 16-bit PNG, or single-band uncompressed TIFF/GeoTIFF. A sample New Zealand DEM is bundled. |
 | **Terrain analysis** | Drainage, river order, floodplain silt, lakes, slope, snow line, orographic rainfall and biomes, all derived from the elevation data. Biomes follow Holdridge life zones. Each layer can be inspected. |
 | **Illustrated mountains** | Ridge-aware mountain faces with ink lines, hatching, snow and wash, plus a tilted full-terrain camera view. |
 | **Water** | Rivers, shorelines, wave marks and wetland pools drawn as ink strokes. |
@@ -77,7 +76,7 @@ npm install
 npm run dev
 ```
 
-Open the address Vite prints (usually http://localhost:5173). Mountain Studio loads with the sample heightmap. Use **Get map** to download real terrain, or **Replace** to load your own file.
+Open the address Vite prints (usually http://localhost:5173). Mountain Studio loads with the sample heightmap. Use the file picker to load your own.
 
 ### Scripts
 
@@ -148,5 +147,3 @@ Licensed under the [GNU Affero General Public License v3.0 or later](LICENSE), w
 ## Acknowledgements
 
 Elevation data contains data sourced from the [LINZ Data Service](https://data.linz.govt.nz/), licensed for reuse under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
-
-Downloaded terrain comes from [Mapterhorn](https://mapterhorn.com/attribution) (Copernicus DEM GLO-30) or the [Mapzen terrain tiles on AWS](https://registry.opendata.aws/terrain-tiles/); the area picker uses [OpenFreeMap](https://openfreemap.org/) and [OpenStreetMap](https://www.openstreetmap.org/copyright) data. See [NOTICE.md](NOTICE.md).
