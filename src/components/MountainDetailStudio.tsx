@@ -612,7 +612,7 @@ export function MountainDetailStudio({
   }, [onMountainBackendStatusChange]);
 
   // Active 2D Cartographic Layer & Palette
-  const [inspectorTab, setInspectorTab] = useState<"Terrain" | "Vegetation" | "Water" | "Lighting">("Vegetation");
+  const [inspectorTab, setInspectorTab] = useState<"Terrain" | "Ink" | "Water" | "Lighting">("Ink");
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
   const [activeLayer, setActiveLayer] =
@@ -1219,7 +1219,7 @@ export function MountainDetailStudio({
         ),
       );
       const restoredLayer = readStoredEnum(stored, "activeLayer", "vegetation_patterns", PERSISTED_MOUNTAIN_LAYERS);
-      setInspectorTab(restoredLayer === "vegetation_patterns" ? "Vegetation" : restoredLayer === "drainage_network" ? "Water" : "Terrain");
+      setInspectorTab(restoredLayer === "vegetation_patterns" ? "Ink" : restoredLayer === "drainage_network" ? "Water" : "Terrain");
       setActivePalette(
         readStoredEnum(
           stored,
@@ -2477,7 +2477,7 @@ export function MountainDetailStudio({
         terrainFollowing: vegetationTerrainFollowing,
         desertDunes: vegetationDesertDunes,
         desertDuneSpacingKm: vegetationDesertDuneSpacingKm,
-        // Crests run across the climate wind (Rivers and climate > Wind direction).
+        // Crests run across the climate wind (Terrain › Climate › Wind direction).
         desertWindFromDeg: windAzimuthDeg,
         desertHighlight: vegetationDesertHighlight,
         desertWashShadow: vegetationDesertWashShadow,
@@ -3423,7 +3423,7 @@ export function MountainDetailStudio({
           terrainFollowing: vegetationTerrainFollowing,
         desertDunes: vegetationDesertDunes,
         desertDuneSpacingKm: vegetationDesertDuneSpacingKm,
-        // Crests run across the climate wind (Rivers and climate > Wind direction).
+        // Crests run across the climate wind (Terrain › Climate › Wind direction).
         desertWindFromDeg: windAzimuthDeg,
         desertHighlight: vegetationDesertHighlight,
         desertWashShadow: vegetationDesertWashShadow,
@@ -3760,7 +3760,7 @@ export function MountainDetailStudio({
             {PRIMARY_VIEWS.map(([id, label]) => {
               const selected = activeLayer === id || (id === "raw_heightmap" && isHeightmapView);
               return <button type="button" role="radio" key={id} aria-checked={selected}
-                onClick={() => { setActiveLayer(id); setInspectorTab(id === "vegetation_patterns" ? "Vegetation" : id === "drainage_network" ? "Water" : "Terrain"); }}
+                onClick={() => { setActiveLayer(id); setInspectorTab(id === "vegetation_patterns" ? "Ink" : id === "drainage_network" ? "Water" : "Terrain"); }}
                 className={`rounded px-2.5 py-1 ${selected ? "bg-slate-600 text-white shadow" : "text-slate-400 hover:text-slate-100"}`}>{label}</button>;
             })}
           </div>
@@ -4179,7 +4179,7 @@ export function MountainDetailStudio({
       <aside aria-label="Inspector" className={`map-inspector ${inspectorOpen ? "lg:flex" : "lg:hidden"} ${mobileInspectorOpen ? "fixed inset-y-0 right-0 flex" : "hidden"} lg:static z-40 w-[min(360px,100vw)] shrink-0 flex-col border-l border-white/5 bg-[#1f232b] text-slate-200 shadow-2xl lg:w-[360px] lg:shadow-none`}>
         <div className="flex h-10 shrink-0 items-stretch gap-4 border-b border-white/5 px-4">
           <div role="tablist" aria-label="Inspector category" className="flex items-stretch gap-4">
-            {(["Terrain", "Vegetation", "Water", "Lighting"] as const).map((tab) =>
+            {(["Terrain", "Ink", "Water", "Lighting"] as const).map((tab) =>
               <button type="button" role="tab" key={tab} aria-selected={inspectorTab === tab} onClick={() => setInspectorTab(tab)}
                 className={`-mb-px border-b-2 text-[12px] ${inspectorTab === tab ? "border-sky-500 text-white" : "border-transparent text-slate-400 hover:text-slate-200"}`}>{tab}</button>)}
           </div>
@@ -4220,8 +4220,26 @@ export function MountainDetailStudio({
             ]} />
           </InspectorSection>
 
+          <InspectorSection title="Climate">
+            {num("Temperature", baseTemperatureC, setBaseTemperatureC, -10, 30, 1, { unit: "°C", key: "baseTemperatureC", commit: true, title: "Lower temperatures bring snow to lower elevations" })}
+            {num("Precipitation", basePrecipMm, setBasePrecipMm, 100, 4000, 100, { unit: "mm/yr", key: "basePrecipMm", commit: true, log: false, title: "Drier and hotter climates turn valleys into steppe and desert" })}
+            {num("Wind direction", windAzimuthDeg, setWindAzimuthDeg, 0, 360, 15, { unit: `° ${compassLabel(windAzimuthDeg)}`, key: "windAzimuthDeg", commit: true, title: "Where the wind comes from; it drives rain shadows and desert dune orientation" })}
+            {num("Wind speed", windSpeedMs, setWindSpeedMs, 2, 40, 1, { unit: "m/s", key: "windSpeedMs", commit: true, log: false })}
+          </InspectorSection>
+
+          <InspectorSection title="Rivers and erosion">
+            {num("Water evolution", waterEvolutionStep, (next) => setWaterEvolutionStep(Math.round(next)), 0, MOUNTAIN_WATER_EVOLUTION_STEPS, 1, { key: "waterEvolutionStep", commit: true, limits: [0, MOUNTAIN_WATER_EVOLUTION_STEPS], title: "0 is the initial terrain; later steps reroute rivers and erode the terrain" })}
+            {num("River catchment", riverThresholdKm2, setRiverThresholdKm2, 1, 200, 0.01, { unit: "km²", key: "riverThresholdKm2", commit: true, log: true, title: "Wet-climate catchment area needed before a river appears. 1 km² carries about 24 L/s in the reference climate; raise it for fewer, longer rivers" })}
+            {num("Erosion strength", waterLandscapeImpact, setWaterLandscapeImpact, 0.1, 1, 0.05, { unit: "%", key: "waterLandscapeImpact", commit: true, log: false })}
+            <InspectorFold title="Channels and flow">
+              {num("Channel width", waterStageScale, setWaterStageScale, 0.3, 3, 0.1, { unit: "×", key: "waterStageScale", commit: true })}
+              {num("Flow rate", flowRateScale, setFlowRateScale, 0.2, 1, 0.05, { unit: "×", key: "flowRateScale", commit: true, title: "Lower flow retains water longer and fills the banks" })}
+            </InspectorFold>
+          </InspectorSection>
+
           <InspectorSection title="Biomes">
-            <InspectorNote>These settings apply to every biome.</InspectorNote>
+            {num("Wetland ceiling", wetlandElevationThresholdM, setWetlandElevationThresholdM, 0, 3000, 1, { unit: "m", key: "wetlandElevationThresholdM", commit: true, power: 2, title: "Flat terrain below this elevation can become wetland" })}
+            {num("Region scale", biomeRegionScaleKm, setBiomeRegionScaleKm, 0.01, 1, 0.001, { unit: "km", key: "biomeRegionScaleKm", commit: true, log: true })}
             {num("Border noise scale", biomeEdgeNoiseScaleM, setBiomeEdgeNoiseScaleM, 50, 5000, 50, { unit: "m", key: "biomeEdgeNoiseScaleM", commit: true, log: true, limits: [1, Infinity] })}
             {num("Border irregularity", vegetationBiomeTransitionStrength, setVegetationBiomeTransitionStrength, 0, INSPECTOR_BOUNDS.biomeBorder, 0.05, { unit: "×", key: "vegetationBiomeTransitionStrength", commit: true })}
             <InspectorFold title="Biome colors">
@@ -4230,41 +4248,9 @@ export function MountainDetailStudio({
                   onChange={(color) => setVegetationBiomeColors((previous) => ({ ...previous, [biomeId]: color }))} />)}
             </InspectorFold>
           </InspectorSection>
-
-          <InspectorSection title="Contours" aside={<input type="checkbox" aria-label="Show contours" checked={showContours} onChange={(event) => setShowContours(event.target.checked)} />}>
-            {showContours ? <>
-              <InspectorSelect label="Interval" value={contourIntervalM} options={[25, 50, 100, 250].map((m) => [m, `${m} m`] as const)} onChange={setContourIntervalM} />
-              <InspectorSelect label="Smoothing" value={contourSmoothingPasses} options={SMOOTHING_LABELS.map((label, passes) => [passes, label] as const)} onChange={setContourSmoothingPasses} />
-              {num("Minor line weight", contourThicknessM, setContourThicknessM, 1, 16, 1, { unit: "m", key: "contourThicknessM" })}
-              {num("Opacity", contourOpacity, setContourOpacity, 0.1, 1, 0.05, { unit: "%", key: "contourOpacity", log: false })}
-              <InspectorColor label="Minor color" value={contourColor} onChange={setContourColor} />
-              <InspectorToggle label="Index lines" checked={showIndexContours} onChange={setShowIndexContours} />
-              {showIndexContours && <>
-                <InspectorSelect label="Index every" value={contourIndexEvery} options={[2, 5, 10].map((n) => [n, `${n}th`] as const)} onChange={setContourIndexEvery} />
-                {num("Index line weight", contourIndexThicknessM, setContourIndexThicknessM, 1, 20, 1, { unit: "m", key: "contourIndexThicknessM", log: false })}
-                <InspectorColor label="Index color" value={contourIndexColor} onChange={setContourIndexColor} />
-              </>}
-            </> : <InspectorNote>Off</InspectorNote>}
-          </InspectorSection>
-
-          <InspectorSection title="Rivers and climate">
-            {num("Water evolution", waterEvolutionStep, (next) => setWaterEvolutionStep(Math.round(next)), 0, MOUNTAIN_WATER_EVOLUTION_STEPS, 1, { key: "waterEvolutionStep", commit: true, limits: [0, MOUNTAIN_WATER_EVOLUTION_STEPS], title: "0 is the initial terrain; later steps reroute rivers and erode the terrain" })}
-            {num("River catchment", riverThresholdKm2, setRiverThresholdKm2, 1, 200, 0.01, { unit: "km²", key: "riverThresholdKm2", commit: true, log: true, title: "Wet-climate catchment area needed before a river appears. 1 km² carries about 24 L/s in the reference climate; raise it for fewer, longer rivers" })}
-            <InspectorFold title="Advanced climate and terrain evolution">
-              {num("Wetland ceiling", wetlandElevationThresholdM, setWetlandElevationThresholdM, 0, 3000, 1, { unit: "m", key: "wetlandElevationThresholdM", commit: true, power: 2, title: "Flat terrain below this elevation can become wetland" })}
-              {num("Biome region scale", biomeRegionScaleKm, setBiomeRegionScaleKm, 0.01, 1, 0.001, { unit: "km", key: "biomeRegionScaleKm", commit: true, log: true })}
-              {num("Channel width", waterStageScale, setWaterStageScale, 0.3, 3, 0.1, { unit: "×", key: "waterStageScale", commit: true })}
-              {num("Flow rate", flowRateScale, setFlowRateScale, 0.2, 1, 0.05, { unit: "×", key: "flowRateScale", commit: true, title: "Lower flow retains water longer and fills the banks" })}
-              {num("Erosion strength", waterLandscapeImpact, setWaterLandscapeImpact, 0.1, 1, 0.05, { unit: "%", key: "waterLandscapeImpact", commit: true, log: false })}
-              {num("Wind direction", windAzimuthDeg, setWindAzimuthDeg, 0, 360, 15, { unit: "°", key: "windAzimuthDeg", commit: true })}
-              {num("Wind speed", windSpeedMs, setWindSpeedMs, 2, 40, 1, { unit: "m/s", key: "windSpeedMs", commit: true, log: false })}
-              {num("Precipitation", basePrecipMm, setBasePrecipMm, 100, 4000, 100, { unit: "mm/yr", key: "basePrecipMm", commit: true, log: false, title: "Drier and hotter climates turn valleys into steppe and desert" })}
-              {num("Temperature", baseTemperatureC, setBaseTemperatureC, -10, 30, 1, { unit: "°C", key: "baseTemperatureC", commit: true, title: "Lower temperatures bring snow to lower elevations" })}
-            </InspectorFold>
-          </InspectorSection>
         </>}
 
-        {inspectorTab === "Vegetation" && <>
+        {inspectorTab === "Ink" && <>
           <InspectorSection title="Ground pattern" aside={<span className={`text-[11px] ${vegetationMotifLoadError ? "text-red-300" : "text-slate-500"}`}>
             {vegetationMotifLoadError ? "Motif load error" : vegetationMotifAssets ? `${vegetationMotifAssets.length} motifs` : "Loading motifs…"}</span>}>
             {num("Density", vegetationDensity, setVegetationDensity, 0, INSPECTOR_BOUNDS.groundDensity, 0.05, { unit: "×", key: "vegetationDensity" })}
@@ -4303,7 +4289,7 @@ export function MountainDetailStudio({
               <InspectorNote>Sand desert only. Each dune is one crest line with hatching on its downwind slip face.</InspectorNote>
               <InspectorFold title="Shape" defaultOpen>
                 {num("Dune spacing", vegetationDesertDuneSpacingKm, setVegetationDesertDuneSpacingKm, 0.2, 8, 0.05, { unit: "km", key: "vegetationDesertDuneSpacingKm", log: true, title: "Distance between crests" })}
-                <InspectorNote>{`Wind from ${compassLabel(windAzimuthDeg)} (${Math.round(windAzimuthDeg)}°): crests run across it and slip faces face downwind. Change it under Terrain › Rivers and climate › Wind direction.`}</InspectorNote>
+                <InspectorNote>{`Wind from ${compassLabel(windAzimuthDeg)} (${Math.round(windAzimuthDeg)}°): crests run across it and slip faces face downwind. Change it under Terrain › Climate › Wind direction.`}</InspectorNote>
                 {num("Crest scallops", vegetationDesertCrestScallop, setVegetationDesertCrestScallop, 0, 1, 0.05, { unit: "%", key: "vegetationDesertCrestScallop", title: "0 gives straight crests, higher values deep crescents with horns" })}
                 {num("Terrain bend", vegetationDesertTerrainFollowing, setVegetationDesertTerrainFollowing, 0, 1, 0.05, { unit: "%", key: "vegetationDesertTerrainFollowing", title: "How much large landforms bend the crests" })}
               </InspectorFold>
@@ -4386,6 +4372,41 @@ export function MountainDetailStudio({
                 onChange={(color) => setForestSettings((previous) => ({ ...previous, wetlandWoodColor: color }))} />
               <InspectorColor label="Outline" value={forestOutlineColor} onChange={setForestOutlineColor} />
             </InspectorFold>
+          </InspectorSection>
+
+          <InspectorSection title="Mountain linework">
+            {num("Line scale", mountainLineworkScale, setMountainLineworkScale, MOUNTAIN_LINEWORK_SCALE_MIN, MOUNTAIN_LINEWORK_SCALE_MAX, 0.05, { unit: "×", key: "mountainLineworkScale" })}
+            {num("Ridge density", mountainRidgeDensity, setMountainRidgeDensity, MOUNTAIN_RIDGE_DENSITY_MIN, MOUNTAIN_RIDGE_DENSITY_MAX, 0.05, { unit: "×", key: "mountainRidgeDensity" })}
+            {num("Ridge thickness", mountainRidgeThickness, setMountainRidgeThickness, MOUNTAIN_RIDGE_THICKNESS_MIN, MOUNTAIN_RIDGE_THICKNESS_MAX, 0.01, { unit: "×", key: "mountainRidgeThickness" })}
+            {num("Ridge opacity", mountainLineworkOpacity, setMountainLineworkOpacity, MOUNTAIN_LINEWORK_OPACITY_MIN, MOUNTAIN_LINEWORK_OPACITY_MAX, 0.05, { unit: "%", key: "mountainLineworkOpacity" })}
+            {num("Hatch density", mountainHatchDensity, setMountainHatchDensity, MOUNTAIN_HATCH_DENSITY_MIN, MOUNTAIN_HATCH_DENSITY_MAX, 0.05, { unit: "×", key: "mountainHatchDensity" })}
+            {num("Hatch thickness", mountainHatchThickness, setMountainHatchThickness, MOUNTAIN_HATCH_THICKNESS_MIN, MOUNTAIN_HATCH_THICKNESS_MAX, 0.01, { unit: "×", key: "mountainHatchThickness" })}
+            {num("Contour hatch opacity", mountainHatchHorizontalOpacity, setMountainHatchHorizontalOpacity, MOUNTAIN_HATCH_OPACITY_MIN, MOUNTAIN_HATCH_OPACITY_MAX, 0.05, { unit: "%", key: "mountainHatchHorizontalOpacity" })}
+            {num("Downhill hatch opacity", mountainHatchVerticalOpacity, setMountainHatchVerticalOpacity, MOUNTAIN_HATCH_OPACITY_MIN, MOUNTAIN_HATCH_OPACITY_MAX, 0.05, { unit: "%", key: "mountainHatchVerticalOpacity" })}
+            <InspectorColor label="Ridge color" value={mountainRidgeColor} onChange={setMountainRidgeColor} />
+            <InspectorColor label="Hatch color" value={mountainHatchColor} onChange={setMountainHatchColor} />
+            <InspectorFold title="Advanced local mountain detail">
+              <InspectorNote>Adds marks on lower-relief faces on top of the 1× mountain baseline.</InspectorNote>
+              {num("Detail ceiling", mountainLocalDetailDensityMax, setMountainLocalDetailDensityMax, MOUNTAIN_LOCAL_DETAIL_DENSITY_MIN, MOUNTAIN_LOCAL_DETAIL_DENSITY_MAX, 0.05, { unit: "×", key: "mountainLocalDetailDensityMax", limits: [MOUNTAIN_LOCAL_DETAIL_DENSITY_MIN, Infinity] })}
+              {num("Foothill multiplier", mountainFoothillDetailMultiplier, setMountainFoothillDetailMultiplier, MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_MIN, MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_MAX, 0.05, { unit: "×", key: "mountainFoothillDetailMultiplier", limits: [MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_MIN, Infinity] })}
+              {num("Biome multiplier", mountainBiomeDetailMultiplier, setMountainBiomeDetailMultiplier, MOUNTAIN_BIOME_DETAIL_MULTIPLIER_MIN, MOUNTAIN_BIOME_DETAIL_MULTIPLIER_MAX, 0.05, { unit: "×", key: "mountainBiomeDetailMultiplier" })}
+            </InspectorFold>
+          </InspectorSection>
+
+          <InspectorSection title="Contours" aside={<input type="checkbox" aria-label="Show contours" checked={showContours} onChange={(event) => setShowContours(event.target.checked)} />}>
+            {showContours ? <>
+              <InspectorSelect label="Interval" value={contourIntervalM} options={[25, 50, 100, 250].map((m) => [m, `${m} m`] as const)} onChange={setContourIntervalM} />
+              <InspectorSelect label="Smoothing" value={contourSmoothingPasses} options={SMOOTHING_LABELS.map((label, passes) => [passes, label] as const)} onChange={setContourSmoothingPasses} />
+              {num("Minor line weight", contourThicknessM, setContourThicknessM, 1, 16, 1, { unit: "m", key: "contourThicknessM" })}
+              {num("Opacity", contourOpacity, setContourOpacity, 0.1, 1, 0.05, { unit: "%", key: "contourOpacity", log: false })}
+              <InspectorColor label="Minor color" value={contourColor} onChange={setContourColor} />
+              <InspectorToggle label="Index lines" checked={showIndexContours} onChange={setShowIndexContours} />
+              {showIndexContours && <>
+                <InspectorSelect label="Index every" value={contourIndexEvery} options={[2, 5, 10].map((n) => [n, `${n}th`] as const)} onChange={setContourIndexEvery} />
+                {num("Index line weight", contourIndexThicknessM, setContourIndexThicknessM, 1, 20, 1, { unit: "m", key: "contourIndexThicknessM", log: false })}
+                <InspectorColor label="Index color" value={contourIndexColor} onChange={setContourIndexColor} />
+              </>}
+            </> : <InspectorNote>Off</InspectorNote>}
           </InspectorSection>
 
           <InspectorSection title="Diagnostics">
@@ -4495,25 +4516,6 @@ export function MountainDetailStudio({
               {num("Mountain height", mountainHeightExaggeration, setMountainHeightExaggeration, 1, 2, 0.1, { unit: "×", key: "mountainHeightExaggeration" })}
             </>}
           </InspectorSection>
-
-          <InspectorSection title="Mountain linework">
-            {num("Line scale", mountainLineworkScale, setMountainLineworkScale, MOUNTAIN_LINEWORK_SCALE_MIN, MOUNTAIN_LINEWORK_SCALE_MAX, 0.05, { unit: "×", key: "mountainLineworkScale" })}
-            {num("Ridge density", mountainRidgeDensity, setMountainRidgeDensity, MOUNTAIN_RIDGE_DENSITY_MIN, MOUNTAIN_RIDGE_DENSITY_MAX, 0.05, { unit: "×", key: "mountainRidgeDensity" })}
-            {num("Ridge thickness", mountainRidgeThickness, setMountainRidgeThickness, MOUNTAIN_RIDGE_THICKNESS_MIN, MOUNTAIN_RIDGE_THICKNESS_MAX, 0.01, { unit: "×", key: "mountainRidgeThickness" })}
-            {num("Ridge opacity", mountainLineworkOpacity, setMountainLineworkOpacity, MOUNTAIN_LINEWORK_OPACITY_MIN, MOUNTAIN_LINEWORK_OPACITY_MAX, 0.05, { unit: "%", key: "mountainLineworkOpacity" })}
-            {num("Hatch density", mountainHatchDensity, setMountainHatchDensity, MOUNTAIN_HATCH_DENSITY_MIN, MOUNTAIN_HATCH_DENSITY_MAX, 0.05, { unit: "×", key: "mountainHatchDensity" })}
-            {num("Hatch thickness", mountainHatchThickness, setMountainHatchThickness, MOUNTAIN_HATCH_THICKNESS_MIN, MOUNTAIN_HATCH_THICKNESS_MAX, 0.01, { unit: "×", key: "mountainHatchThickness" })}
-            {num("Contour hatch opacity", mountainHatchHorizontalOpacity, setMountainHatchHorizontalOpacity, MOUNTAIN_HATCH_OPACITY_MIN, MOUNTAIN_HATCH_OPACITY_MAX, 0.05, { unit: "%", key: "mountainHatchHorizontalOpacity" })}
-            {num("Downhill hatch opacity", mountainHatchVerticalOpacity, setMountainHatchVerticalOpacity, MOUNTAIN_HATCH_OPACITY_MIN, MOUNTAIN_HATCH_OPACITY_MAX, 0.05, { unit: "%", key: "mountainHatchVerticalOpacity" })}
-            <InspectorColor label="Ridge color" value={mountainRidgeColor} onChange={setMountainRidgeColor} />
-            <InspectorColor label="Hatch color" value={mountainHatchColor} onChange={setMountainHatchColor} />
-            <InspectorFold title="Advanced local mountain detail">
-              <InspectorNote>Adds marks on lower-relief faces on top of the 1× mountain baseline.</InspectorNote>
-              {num("Detail ceiling", mountainLocalDetailDensityMax, setMountainLocalDetailDensityMax, MOUNTAIN_LOCAL_DETAIL_DENSITY_MIN, MOUNTAIN_LOCAL_DETAIL_DENSITY_MAX, 0.05, { unit: "×", key: "mountainLocalDetailDensityMax", limits: [MOUNTAIN_LOCAL_DETAIL_DENSITY_MIN, Infinity] })}
-              {num("Foothill multiplier", mountainFoothillDetailMultiplier, setMountainFoothillDetailMultiplier, MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_MIN, MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_MAX, 0.05, { unit: "×", key: "mountainFoothillDetailMultiplier", limits: [MOUNTAIN_FOOTHILL_DETAIL_MULTIPLIER_MIN, Infinity] })}
-              {num("Biome multiplier", mountainBiomeDetailMultiplier, setMountainBiomeDetailMultiplier, MOUNTAIN_BIOME_DETAIL_MULTIPLIER_MIN, MOUNTAIN_BIOME_DETAIL_MULTIPLIER_MAX, 0.05, { unit: "×", key: "mountainBiomeDetailMultiplier" })}
-            </InspectorFold>
-          </InspectorSection>
         </>}
         </div>
 
@@ -4535,7 +4537,7 @@ export function MountainDetailStudio({
                 className="rounded p-1 text-slate-400 hover:bg-white/5 hover:text-slate-100"><X size={15} /></button>
             </div>
 
-            <InspectorSection title="Resolution" aside={<span className="text-[11px] tabular-nums text-slate-400">
+            <InspectorSection title="Resolution" collapsible={false} aside={<span className="text-[11px] tabular-nums text-slate-400">
               {outputSize ? `${outputSize.width} × ${outputSize.height} px` : "—"}</span>}>
               <div role="radiogroup" aria-label="Resolution preset" className="flex rounded-md bg-black/30 p-0.5">
                 {MOUNTAIN_RESOLUTION_PRESETS.map((resolution) => (
