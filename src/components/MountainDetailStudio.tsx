@@ -48,6 +48,7 @@ import {
 } from "../rendering/forestCanvasRenderer";
 import { ForestRenderControls } from "./ForestRenderControls";
 import { NumericControl } from "./NumericControl";
+import { PreviewStatus, type PreviewStatusValue } from "./PreviewStatus";
 import { InspectorColor, InspectorFold, InspectorNote, InspectorSection, InspectorSeed, InspectorSelect, InspectorToggle } from "./InspectorParts";
 import { Check, ChevronDown, Crop, Download, Hand, Minus, PanelRightClose, PanelRightOpen, Plus, RotateCcw, Ruler, X } from "lucide-react";
 import {
@@ -903,7 +904,7 @@ export function MountainDetailStudio({
     useState<MountainPreviewFlowSnapshot | null>(null);
   const [analysisRevision, setAnalysisRevision] = useState(0);
   const [frameVersion, setFrameVersion] = useState(0);
-  const [previewPhase, setPreviewPhase] = useState<string | null>(null);
+  const [previewStatus, setPreviewStatus] = useState<PreviewStatusValue | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewWorkerGeneration, setPreviewWorkerGeneration] = useState(0);
   const [analysisCommitVersion, setAnalysisCommitVersion] = useState(0);
@@ -1020,7 +1021,12 @@ export function MountainDetailStudio({
             (response.settingsRevision === undefined ||
               response.settingsRevision === settingsRevisionRef.current)
           )
-            setPreviewPhase(response.phase);
+            setPreviewStatus({
+              phase: response.phase,
+              step: response.step,
+              stepIndex: response.stepIndex,
+              stepCount: response.stepCount,
+            });
           return;
         }
         if (response.type === "analysisReady") {
@@ -1092,7 +1098,7 @@ export function MountainDetailStudio({
           } else {
             previewRequestSentAtRef.current.delete(response.requestId);
           }
-          setPreviewPhase(null);
+          setPreviewStatus(null);
           return;
         }
         if (response.type === "inspectResult") {
@@ -1149,7 +1155,7 @@ export function MountainDetailStudio({
         heightmapResolversRef.current.get(response.requestId)?.(null);
         heightmapResolversRef.current.delete(response.requestId);
         setPreviewError(response.message);
-        setPreviewPhase(null);
+        setPreviewStatus(null);
       };
       worker.onerror = () => {
         if (disposed) return;
@@ -1167,7 +1173,7 @@ export function MountainDetailStudio({
             setLoadError("Mountain preview worker failed");
             setIsLoading(false);
           }
-          setPreviewPhase(null);
+          setPreviewStatus(null);
         }
       };
     };
@@ -2534,9 +2540,9 @@ export function MountainDetailStudio({
       // the complete water, vegetation, mountain-pattern, and illustration
       // pipelines before the final request can run on this single worker.
       renderRequestIdRef.current = finalRequestId;
-      setPreviewPhase(
-        activeLayer === "vegetation_patterns" ? "vegetation" : "rendering",
-      );
+      setPreviewStatus({
+        phase: activeLayer === "vegetation_patterns" ? "vegetation" : "rendering",
+      });
       const baseOptions: MountainRenderOptions = {
         ...renderOpts,
         vegetation: renderOpts.vegetation
@@ -4145,11 +4151,8 @@ export function MountainDetailStudio({
             </div>
           </div>
         )}
-        <footer className="flex h-7 shrink-0 items-center gap-3 border-t border-white/5 bg-[#1b1f26] px-3 text-[11px] text-slate-400">
-          <span className={`flex items-center gap-1.5 ${previewPhase ? "text-sky-300" : ""}`}>
-            <span className={`h-1.5 w-1.5 rounded-full ${previewPhase ? "animate-pulse bg-sky-400" : "bg-emerald-500"}`} />
-            {previewPhase ? `Updating ${previewPhase}…` : "Ready"}
-          </span>
+        <footer className="relative flex h-7 shrink-0 items-center gap-3 border-t border-white/5 bg-[#1b1f26] px-3 text-[11px] text-slate-400">
+          <PreviewStatus status={previewStatus} />
           {hoverInfo && <span className="tabular-nums">x {hoverInfo.x} · y {hoverInfo.y}</span>}
           <div className="ml-auto flex items-center gap-0.5">
             <button type="button" onClick={() => setZoom((z) => Math.max(0.4, z * 0.8))} aria-label="Zoom out" title="Zoom out"

@@ -107,6 +107,29 @@ input[type="range"] {
   cursor: default;
 }
 
+/* Status-bar loading: a slow breathing fade while busy, a quick fade-in on
+   each new label so step changes read as progress. */
+@keyframes preview-status-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+@keyframes preview-status-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.preview-status-breathe {
+  animation: preview-status-breathe 1.6s ease-in-out infinite;
+}
+.preview-status-enter {
+  animation: preview-status-enter 250ms ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .preview-status-breathe,
+  .preview-status-enter {
+    animation: none;
+  }
+}
+
 /* Parchment text shadow and fantasy glow */
 .fantasy-glow-amber {
   text-shadow: 0 0 12px rgba(245, 158, 11, 0.4), 0 0 24px rgba(217, 119, 6, 0.2);

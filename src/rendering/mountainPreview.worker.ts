@@ -285,6 +285,10 @@ function recordGpuMountainRasterEvent(
   profiler?.recordMetric(`gpu mountain raster ${event}`, 1, "count");
 }
 
+// Coarse render stages reported to the status bar: terrain, mountain fields,
+// wind, mountain illustration, water/vegetation, compositing, finishing.
+const RENDER_STEP_COUNT = 7;
+
 function post(
   response: MountainPreviewResponse,
   transfer: Transferable[] = [],
@@ -1057,7 +1061,16 @@ function analyze(request: Extract<MountainPreviewRequest, { type: "analyze" }>):
   // the first render even when no separate source message was sent.
   warmLayerWorker();
   warmFieldBackend();
-  post({ type: "status", requestId: request.requestId, phase: "analysis" });
+  const postAnalysisStep = (step: string, stepIndex: number) =>
+    post({
+      type: "status",
+      requestId: request.requestId,
+      phase: "analysis",
+      step,
+      stepIndex,
+      stepCount: 2,
+    });
+  postAnalysisStep("Preparing heightmap", 1);
   const profilingEnabled = request.profile === true;
   const analysisSettings = profilingEnabled
     ? profileAnalysisSettings(request)
@@ -1132,6 +1145,7 @@ function analyze(request: Extract<MountainPreviewRequest, { type: "analyze" }>):
   profiler?.recordCache("DEM processing", !coreChanged);
   const demProcessingStop = profiler?.begin("DEM processing");
   if (coreChanged) {
+    postAnalysisStep("Processing terrain", 2);
     profiler?.recordCache("lighting updates", false);
     const demOptions: BaseDEMOptions = {
       ...split.core,
@@ -1290,14 +1304,19 @@ const renderCoordinator = new LatestRequestCoordinator<
     parallelLayerPipelineRevision: "worker-budget-512-v2",
   });
   try {
-  post({
-    type: "status",
-    requestId: request.requestId,
-    settingsRevision: request.settingsRevision,
-    quality: request.quality ?? "final",
-    phase:
-      options.layer === "vegetation_patterns" ? "vegetation" : "rendering",
-  });
+  const postRenderStep = (step: string, stepIndex: number) =>
+    post({
+      type: "status",
+      requestId: request.requestId,
+      settingsRevision: request.settingsRevision,
+      quality: request.quality ?? "final",
+      phase:
+        options.layer === "vegetation_patterns" ? "vegetation" : "rendering",
+      step,
+      stepIndex,
+      stepCount: RENDER_STEP_COUNT,
+    });
+  postRenderStep("Preparing terrain", 1);
    const fullRenderDem = getVisualWaterDem(options, profiler);
    let renderDem = fullRenderDem;
    if (request.quality === "draft") {
@@ -1472,6 +1491,7 @@ const renderCoordinator = new LatestRequestCoordinator<
         "ms",
       );
     } else if (!stageInputs.illustrationCacheHit || gpuMountainLayerPreflight) {
+      postRenderStep("Building mountain fields", 2);
       postBackendStatus(request.requestId, "initializing");
       if (!sharedGpuSession?.prepareFieldSet && !mountainFieldBackend) {
         mountainFieldBackend = acquireFieldBackend(
@@ -1625,6 +1645,7 @@ const renderCoordinator = new LatestRequestCoordinator<
     return;
   }
   if (windPreparationPromise) {
+    postRenderStep("Computing wind", 3);
     try {
       const windResult = await windPreparationPromise;
       if (execution.cancelled()) {
@@ -1671,6 +1692,7 @@ const renderCoordinator = new LatestRequestCoordinator<
       profiler,
     );
     if (!execution.cancelled() && !gpuMountainLayerPreflight) {
+      postRenderStep("Drawing mountains", 4);
       const overlapStarted = performance.now();
       renderMountainIllustrationStageFromInputs(
         stageInputs,
@@ -1685,6 +1707,14 @@ const renderCoordinator = new LatestRequestCoordinator<
     }
   }
   if (parallelLayerPromise) {
+    postRenderStep(
+      parallelLayerPreparation?.mode === "water"
+        ? "Tracing water"
+        : parallelLayerPreparation?.mode === "vegetationGeometry"
+          ? "Placing vegetation"
+          : "Water & vegetation",
+      5,
+    );
     const parallelLayerWaitStop = profiler?.begin("parallel layer wait");
     try {
       const parallelLayers = await parallelLayerPromise;
@@ -1866,6 +1896,7 @@ const renderCoordinator = new LatestRequestCoordinator<
       skipMountainIllustrationStage: true,
     }
     : options;
+  postRenderStep("Compositing layers", 6);
   const renderedImageData = renderMountainDetailDEMWithCache(
     renderDem,
     mountainRenderOptions,
@@ -1877,6 +1908,7 @@ const renderCoordinator = new LatestRequestCoordinator<
     releaseOversizedPreparedFields(activeRenderCache);
   }
   if (execution.cancelled()) return;
+  postRenderStep("Finishing frame", 7);
   let imageData = request.quality === "draft"
     ? downsamplePreviewImage(renderedImageData, 768)
     : renderDem === fullRenderDem

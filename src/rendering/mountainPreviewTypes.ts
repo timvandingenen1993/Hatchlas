@@ -158,6 +158,11 @@ export type MountainPreviewResponse =
       settingsRevision?: number;
       quality?: "draft" | "final";
       phase: "analysis" | "lighting" | "water" | "vegetation" | "rendering";
+      // Optional finer progress within the phase. Indices are 1-based; a
+      // step whose work is cached is skipped, so the index can jump.
+      step?: string;
+      stepIndex?: number;
+      stepCount?: number;
     }
   | {
       type: "backendStatus";
