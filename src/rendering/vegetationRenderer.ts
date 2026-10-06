@@ -27,6 +27,7 @@ import {
 } from "./cartographicStrokeRenderer";
 import { VEGETATION_MOTIF_DEFINITIONS } from "./vegetationMotifs";
 import {
+  DESERT_DUNE_BIOME_ID,
   desertDuneSignature,
   isDesertDunePixel,
   paintDesertDunes,
@@ -7350,8 +7351,12 @@ export function renderVegetationOverlay(
     options.wetlandDryNoiseStrength,
     options.wetlandImagePropDrynessBias,
     desertDuneSignature(options.desertDunes),
-    // The dune wash is lit by the sun.
-    options.desertDunes.enabled ? sunAzimuthDeg : null,
+    // The dune wash is lit by the sun. Dunes are on by default, so key the
+    // sun only when this map has dune cells; otherwise a sun edit would
+    // rebuild a background it cannot affect.
+    options.desertDunes.enabled && dem.biomeType.includes(DESERT_DUNE_BIOME_ID)
+      ? sunAzimuthDeg
+      : null,
   ]);
   let background =
     stageCache?.backgroundKey === backgroundKey &&

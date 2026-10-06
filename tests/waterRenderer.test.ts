@@ -10,6 +10,8 @@ import {
   buildDistanceToCoast,
   buildSmoothShoreDistance,
   getContourTangentAt,
+  paintOceanWavePath,
+  type OceanWavePathPoint,
   suppressMicroKinks,
   simplifyRiverRDP,
   mergeCloseRiverPoints,
@@ -1627,6 +1629,40 @@ describe('water renderer', () => {
       }
     }
     expect(hasNonZeroWave).toBe(true);
+  });
+
+  it('keeps ocean wave marks on the stroke where a shore normal lies along it', () => {
+    // A wobble offset that folds the path leaves a point's normal (taken from
+    // the unfolded path) nearly along the stroke; marks then streaked straight
+    // across the sea, perpendicular to the wave.
+    const size = 320;
+    const markScale = 2;
+    const cases: Array<[string, (i: number) => [number, number], boolean]> = [
+      ['tilted normal', (i) => (i === 40 ? [Math.sqrt(1 - 0.05 ** 2), 0.05] : [0, 1]), false],
+      ['zero normal', (i) => (i === 40 ? [0, 0] : [0, 1]), false],
+      // A stalled sample: a zero-length segment has no direction to bound it.
+      ['stalled sample', () => [1, 0], true],
+    ];
+    for (const [label, normalAt, stall] of cases) {
+      const path: OceanWavePathPoint[] = Array.from({ length: 80 }, (_, i) => {
+        const [shoreNormalX, shoreNormalY] = normalAt(i);
+        const step = stall && i > 40 ? i - 1 : i;
+        return { x: 140 + step * 0.45, y: 160, along: step * 0.45, shoreNormalX, shoreNormalY, coastDistance: 100 };
+      });
+      const total = size * size;
+      const [alpha, tone, light, shadow, foam, ink] = Array.from({ length: 6 }, () => new Uint8Array(total));
+      paintOceanWavePath(
+        path, alpha, tone, light, shadow, foam, ink, new Uint8Array(total).fill(1),
+        size, size, 777, markScale, markScale, 4.5, 1, 0, 0, 0, size,
+      );
+      for (const [name, field] of [['ridge', alpha], ['foam', foam], ['ink', ink]] as const) {
+        let farthest = 0;
+        for (let index = 0; index < total; index++) {
+          if (field[index] > 20) farthest = Math.max(farthest, Math.abs(Math.floor(index / size) - 160));
+        }
+        expect(farthest, `${label} ${name}`).toBeLessThanOrEqual(3 * markScale);
+      }
+    }
   });
 
 

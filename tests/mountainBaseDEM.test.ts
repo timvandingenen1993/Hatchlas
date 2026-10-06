@@ -10,7 +10,9 @@ import {
   rebuildMountainEvolutionStep,
   applyRiparianCorridors,
   separateDesertFromWetland,
+  prepareAnalysisHeightmap,
   resampleHeightmapMask,
+  WATER_REFERENCE_CELL_M,
   type MountainEvolutionState,
   resampleHeightmapLuminance,
   sampleMountainElevationProfile,
@@ -1023,21 +1025,28 @@ describe('2D Mountain Base DEM & Geomorphic Pipeline', () => {
       }
     }
 
+    // Channels widen by whole cells only at the scale the radii were tuned on.
+    const domainWidthKm = (W * WATER_REFERENCE_CELL_M) / 1000;
+    const riverThresholdKm2 = 1;
     const lowStage = processMountainBaseDEM(rawLuminance, W, H, {
-      riverThresholdKm2: 4,
+      domainWidthKm,
+      riverThresholdKm2,
       waterStageScale: 0.35,
     });
     const highStage = processMountainBaseDEM(rawLuminance, W, H, {
-      riverThresholdKm2: 4,
+      domainWidthKm,
+      riverThresholdKm2,
       waterStageScale: 3,
     });
     const fastFlow = processMountainBaseDEM(rawLuminance, W, H, {
-      riverThresholdKm2: 4,
+      domainWidthKm,
+      riverThresholdKm2,
       waterStageScale: 3,
       flowRateScale: 1.0,
     });
     const slowFlow = processMountainBaseDEM(rawLuminance, W, H, {
-      riverThresholdKm2: 4,
+      domainWidthKm,
+      riverThresholdKm2,
       waterStageScale: 3,
       flowRateScale: 0.25,
     });
@@ -1072,6 +1081,72 @@ describe('2D Mountain Base DEM & Geomorphic Pipeline', () => {
       }
     }
     expect(wetNeighbors).toBeGreaterThan(0);
+  });
+
+  it('does not dam a one-pixel valley when shrinking a heightmap for analysis', () => {
+    // A 0.3 basin (x >= 5) drains west to sea (x = 0) along a channel in row 3 only.
+    const W = 9;
+    const H = 9;
+    const source = new Float32Array(W * H).fill(0.9);
+    const ocean = new Uint8Array(W * H);
+    for (let y = 0; y < H; y++) {
+      source[y * W] = 0;
+      ocean[y * W] = 1;
+      for (let x = 5; x < W; x++) if (y >= 2 && y <= 4) source[y * W + x] = 0.3;
+    }
+    for (let x = 1; x < 5; x++) source[3 * W + x] = 0.24 + x * 0.01;
+
+    // Target row 1 samples source row 2, so plain resampling skips the channel.
+    const row = (values: Float32Array) => Array.from(values.slice(5, 10));
+    expect(row(resampleHeightmapLuminance(source, W, H, 5, 5))[1]).toBeCloseTo(0.9);
+    const prepared = prepareAnalysisHeightmap(source, ocean, W, H, 5, 5, 0);
+    const opened = row(prepared.luminance);
+    expect(opened[1]).toBeLessThanOrEqual(opened[3] + 1e-6);
+    expect(opened[2]).toBeLessThanOrEqual(opened[3] + 1e-6);
+    expect(opened[3]).toBeCloseTo(0.3);
+    expect(prepared.oceanMask?.[5]).toBe(1);
+    expect(opened[0]).toBe(0);
+
+    const unchanged = prepareAnalysisHeightmap(source, ocean, W, H, W, H, 0);
+    expect(Array.from(unchanged.luminance)).toEqual(Array.from(source));
+  });
+
+  it('keeps river ground width on coarse regional cells instead of flooding lowland banks', () => {
+    const W = 60;
+    const H = 90;
+    const rawLuminance = new Float32Array(W * H);
+    // A gently sloping lowland with a shallow valley: every bank lies within
+    // the bank-full stage, so only the channel radius limits the river.
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const nx = Math.abs(x / (W - 1) - 0.5);
+        rawLuminance[y * W + x] = 0.02 + 0.01 * (1 - y / (H - 1)) + 0.001 * nx;
+      }
+    }
+    const bankCells = (cellM: number) => {
+      const domainWidthKm = (W * cellM) / 1000;
+      const dem = processMountainBaseDEM(rawLuminance, W, H, {
+        domainWidthKm,
+        minElevationM: 0,
+        maxElevationM: 2000,
+        riverThresholdKm2: 0.2 * (cellM / 1000) ** 2 * W * H,
+      });
+      let banks = 0;
+      let centerlines = 0;
+      for (let i = 0; i < W * H; i++) {
+        if (dem.isOcean[i] === 1) continue;
+        if (dem.riverCenterlineMask[i] === 1) centerlines++;
+        else if (dem.isRiverChannel[i] === 1) banks++;
+      }
+      return { banks, centerlines };
+    };
+
+    const reference = bankCells(WATER_REFERENCE_CELL_M);
+    const regional = bankCells(400);
+    expect(reference.centerlines).toBeGreaterThan(0);
+    expect(reference.banks).toBeGreaterThan(reference.centerlines);
+    expect(regional.centerlines).toBeGreaterThan(0);
+    expect(regional.banks).toBe(0);
   });
 
   it('routes flow through a valid receiver graph and exposes confluence-based stream order', () => {

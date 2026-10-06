@@ -3,13 +3,44 @@ import { Check, ChevronDown, ChevronRight, Shuffle } from "lucide-react";
 
 /** Small layout pieces shared by the map inspector. */
 
-export function InspectorSection({ title, aside, children }: { title: string; aside?: ReactNode; children: ReactNode }) {
+const COLLAPSED_SECTIONS_KEY = "hatchlas.inspector.collapsed";
+
+function readCollapsedSections(): Set<string> {
+  try {
+    const stored = JSON.parse(localStorage.getItem(COLLAPSED_SECTIONS_KEY) ?? "[]");
+    return new Set(Array.isArray(stored) ? stored.filter((title) => typeof title === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+/** Collapsible inspector section; the collapsed state is remembered per title in this browser. */
+export function InspectorSection({ title, aside, children, collapsible = true }: {
+  title: string; aside?: ReactNode; children: ReactNode; collapsible?: boolean;
+}) {
+  const [open, setOpen] = useState(() => !collapsible || !readCollapsedSections().has(title));
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    try {
+      const collapsed = readCollapsedSections();
+      if (next) collapsed.delete(title); else collapsed.add(title);
+      localStorage.setItem(COLLAPSED_SECTIONS_KEY, JSON.stringify([...collapsed]));
+    } catch { /* Storage unavailable: the section still toggles for this session. */ }
+  };
+  const heading = <h3 className={`text-[11px] font-semibold uppercase tracking-wide ${collapsible ? "" : "text-slate-400"}`}>{title}</h3>;
   return <section className="flex flex-col gap-1.5 border-b border-white/5 px-4 py-3">
     <div className="flex min-h-6 items-center justify-between gap-2">
-      <h3 className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{title}</h3>
+      {collapsible
+        ? <button type="button" onClick={toggle} aria-expanded={open}
+          className="-ml-1 flex min-w-0 flex-1 items-center gap-1 self-stretch text-left text-slate-400 hover:text-slate-200">
+          <ChevronRight size={13} className={`shrink-0 transition-transform ${open ? "rotate-90" : ""}`} />
+          {heading}
+        </button>
+        : heading}
       {aside}
     </div>
-    {children}
+    {open && children}
   </section>;
 }
 

@@ -1,0 +1,29 @@
+/* Leaflet area picker in the global terrain dialog. */
+.global-dem-map {
+  position: relative;
+  overflow: hidden;
+  background: #cbd5e1;
+  z-index: 0;
+}
+.global-dem-map.is-drawing,
+.global-dem-map.is-drawing .leaflet-container {
+  cursor: crosshair;
+  touch-action: none;
+}
+.global-dem-map .leaflet-gl-layer { pointer-events: none; }
+.global-dem-map .leaflet-control-attribution { color: #334155; font-size: 10px; }
+.global-dem-map .extent-handle {
+  background: #f0f9ff;
+  border: 2px solid #0284c7;
+  border-radius: 3px;
+  box-shadow: 0 1px 5px #0006;
+}
+.global-dem-map .extent-move-handle {
+  color: #082f49;
+  background: #e0f2fe;
+  border: 1px solid #0284c7;
+  border-radius: 50%;
+  text-align: center;
+  font-size: 18px;
+  line-height: 22px;
+}

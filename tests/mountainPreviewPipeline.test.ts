@@ -428,6 +428,84 @@ describe("mountain preview staged rendering", () => {
     expect(cache.stats.vegetationOverlayBuilds).toBe(1);
   });
 
+  it("reuses the crest network when only mountain pen opacity changes", () => {
+    // Ridged terrain so the crest pass finds real chains to cache.
+    const width = 96, height = 72;
+    const raw = new Float32Array(width * height);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        raw[y * width + x] = Math.max(0, Math.min(1,
+          0.35 + 0.25 * Math.sin(x / 7) * Math.cos(y / 11)));
+      }
+    }
+    // All land, with sparse rivers, so water does not mask the crests.
+    const dem = processMountainBaseDEM(raw, width, height, {
+      domainWidthKm: 12,
+      minElevationM: 200,
+      maxElevationM: 2600,
+      oceanElevationM: 0,
+      riverThresholdKm2: 5,
+    });
+    const cache = createMountainRenderStageCache();
+    const base = options({
+      layer: "vegetation_patterns",
+      riverThresholdKm2: 5,
+      vegetation: { seed: 17, density: 0.35 },
+      mountainLineworkOpacity: 0.8,
+      mountainHatchOpacity: 0.8,
+    });
+    const crestNetwork = () =>
+      cache.mountainFieldCache.entries.get("pattern crest network")?.value as
+        | { crests: unknown[] }
+        | undefined;
+    renderMountainDetailDEMWithCache(dem, base, cache);
+    const network = crestNetwork();
+    expect(network?.crests.length).toBeGreaterThan(0);
+    const firstPattern = cache.mountainPattern;
+
+    const edited = { ...base, mountainHatchOpacity: 0.45, mountainLineworkOpacity: 0.6 };
+    const actual = renderMountainDetailDEMWithCache(dem, edited, cache);
+    // The pattern itself is rebuilt (opacity is inked into it) on the cached
+    // crest network, and must match a render that rebuilt everything.
+    expect(cache.mountainPattern).not.toBe(firstPattern);
+    expect(crestNetwork()).toBe(network);
+    expect(Array.from(actual.data)).toEqual(
+      Array.from(renderMountainDetailDEM(dem, edited).data),
+    );
+
+    renderMountainDetailDEMWithCache(dem, { ...edited, mountainRidgeDensity: 1.8 }, cache);
+    expect(crestNetwork()).not.toBe(network);
+  });
+
+  it("reuses the vegetation background for sun edits unless the map has dunes", () => {
+    const backgroundHits = (
+      dem: ReturnType<typeof makeDem>,
+      cache: ReturnType<typeof createMountainRenderStageCache>,
+      sunAzimuthDeg: number,
+    ) => {
+      const profiler = new MountainProfiler(true);
+      renderMountainDetailDEMWithCache(
+        dem,
+        options({ layer: "vegetation_patterns", sunAzimuthDeg, vegetation: { seed: 5, density: 0.35 } }),
+        cache,
+        profiler,
+      );
+      return profiler.report()!.stages
+        .find(stage => stage.stage === "vegetation flow background")!.cacheHits;
+    };
+    const dem = makeDem();
+    expect(dem.biomeType.includes(15)).toBe(false);
+    const cache = createMountainRenderStageCache();
+    backgroundHits(dem, cache, 315);
+    expect(backgroundHits(dem, cache, 200)).toBe(1);
+
+    // Dune wash is lit by the sun, so a desert map must still rebuild it.
+    const duneDem = { ...dem, biomeType: dem.biomeType.map(() => 15) };
+    const duneCache = createMountainRenderStageCache();
+    backgroundHits(duneDem, duneCache, 315);
+    expect(backgroundHits(duneDem, duneCache, 200)).toBe(0);
+  });
+
   it("reuses the smoothed contour field for color changes", () => {
     const dem = makeDem();
     const cache = createMountainRenderStageCache();

@@ -15,6 +15,7 @@ import { MIN_POSITIVE_SCALE } from "../config/inspectorBounds";
  */
 
 import { biomeEdgeNoise, DEFAULT_BIOME_EDGE_NOISE_SCALE_M } from "./biomeEdgeNoise";
+import { openDrainageToFloor } from "./drainageOpening";
 import {
   computeOrographicPrecipitationRate,
   OROGRAPHIC_DEFAULTS,
@@ -697,6 +698,22 @@ export const getOpenOceanMask = extractDeepOpenOceanMask;
 export const DEFAULT_RIVER_THRESHOLD_KM2 = 3.2;
 
 /**
+ * Analysis cell size, in metres, that the raster-cell water widths were tuned
+ * on (45–80 km maps at the 2048 px preview). Coarser cells keep that ground
+ * width rather than the cell count, so a regional map does not paint every
+ * river, pool and coastal shallow kilometres wide.
+ */
+export const WATER_REFERENCE_CELL_M = 40;
+
+/**
+ * Factor for a water width tuned in cells: 1 up to the reference cell size,
+ * then shrinking so the width stays the same on the ground.
+ */
+export function waterWidthCellScale(cellSizeM: number): number {
+  return cellSizeM > 0 ? Math.min(1, WATER_REFERENCE_CELL_M / cellSizeM) : 1;
+}
+
+/**
  * Lee-side rainfall floor, as a fraction of the base precipitation. The linear
  * orographic model removes moisture without limit (its raw floor is 0.14% of
  * the background rate), so any large ridge produced hyper-arid desert. Real
@@ -995,7 +1012,12 @@ function classifyCoastalBiomes(
     height,
   );
 
-  const maximumCoastWidthM = 600;
+  // On coarse cells a real shore is narrower than one cell. Like a river's
+  // thalweg it still keeps the first coastal row (1.5 cells reaches diagonals)
+  // so the coast reads as a band, not as scattered sand where noise widens it.
+  const minimumShoreWidthM =
+    cellSizeM > WATER_REFERENCE_CELL_M ? 1.5 * cellSizeM : 0;
+  const maximumCoastWidthM = Math.max(600, minimumShoreWidthM);
   const elevationRangeM = Math.max(1, maxElevationM - minElevationM);
 
   // 2. Outer Coastline processing:
@@ -1014,7 +1036,10 @@ function classifyCoastalBiomes(
       const noise = biomeEdgeNoise((index % width) * dxMeters,
         Math.floor(index / width) * dyMeters, noiseScaleM);
       const widthVariation = Math.exp(noise * Math.min(3, edgeStrength) * 1.6);
-      const shoreWidthM = Math.min(maximumCoastWidthM, 180 * widthVariation);
+      const shoreWidthM = Math.max(
+        minimumShoreWidthM,
+        Math.min(maximumCoastWidthM, 180 * widthVariation),
+      );
       const localSlope = slopeDeg[index];
       // Coastal material follows physical terrain, not climate-region smoothing.
       const materialSlope = localSlope;
@@ -1030,7 +1055,10 @@ function classifyCoastalBiomes(
       } else if (materialSlope >= 14.0) {
         biomeType[index] = 13; // Rocky Shore
       } else if (coastalReliefM <= 12 + 8 * (noise + 1) &&
-        coastDistanceCells * cellSizeM <= shoreWidthM / (1 + materialSlope * 0.12)) {
+        coastDistanceCells * cellSizeM <= Math.max(
+          minimumShoreWidthM,
+          shoreWidthM / (1 + materialSlope * 0.12),
+        )) {
         biomeType[index] = 11; // Sandy Beach
       }
     }
@@ -1445,6 +1473,74 @@ export function resampleHeightmapMask(
 }
 
 /**
+ * Lowest source sample under each target cell, on the same corner-aligned
+ * grid as `resampleHeightmapLuminance`; footprints cover every source sample.
+ */
+export function resampleHeightmapMinimum(
+  source: Float32Array,
+  sourceWidth: number,
+  sourceHeight: number,
+  targetWidth: number,
+  targetHeight: number,
+): Float32Array {
+  const xScale = sourceWidth > 1 ? (sourceWidth - 1) / (targetWidth - 1 || 1) : 0;
+  const yScale = sourceHeight > 1 ? (sourceHeight - 1) / (targetHeight - 1 || 1) : 0;
+  const span = (index: number, scale: number, size: number) => [
+    Math.max(0, Math.round(index * scale - scale / 2)),
+    Math.min(size - 1, Math.round(index * scale + scale / 2)),
+  ];
+  const target = new Float32Array(targetWidth * targetHeight);
+  for (let y = 0; y < targetHeight; y++) {
+    const [y0, y1] = span(y, yScale, sourceHeight);
+    for (let x = 0; x < targetWidth; x++) {
+      const [x0, x1] = span(x, xScale, sourceWidth);
+      let lowest = Number.POSITIVE_INFINITY;
+      for (let sy = y0; sy <= y1; sy++) {
+        for (let sx = x0; sx <= x1; sx++) {
+          lowest = Math.min(lowest, source[sy * sourceWidth + sx]);
+        }
+      }
+      target[y * targetWidth + x] = lowest;
+    }
+  }
+  return target;
+}
+
+/**
+ * Resamples and denoises a heightmap for analysis. When it shrinks, valleys
+ * narrower than the new cells are reopened against the lowest source sample,
+ * so resampling cannot dam a river into a false lake.
+ */
+export function prepareAnalysisHeightmap(
+  luminance: Float32Array,
+  oceanMask: Uint8Array | undefined,
+  sourceWidth: number,
+  sourceHeight: number,
+  targetWidth: number,
+  targetHeight: number,
+  smoothingPasses: number,
+): { luminance: Float32Array; oceanMask?: Uint8Array } {
+  const prepared = smoothHeightmapLuminance(
+    resampleHeightmapLuminance(luminance, sourceWidth, sourceHeight, targetWidth, targetHeight),
+    targetWidth,
+    targetHeight,
+    smoothingPasses,
+  );
+  const targetOcean = oceanMask
+    ? resampleHeightmapMask(oceanMask, sourceWidth, sourceHeight, targetWidth, targetHeight)
+    : undefined;
+  if (targetWidth < sourceWidth || targetHeight < sourceHeight) {
+    const floor = resampleHeightmapMinimum(luminance, sourceWidth, sourceHeight, targetWidth, targetHeight);
+    // Ocean cells are the outlets (NaN) and keep their resampled bed.
+    const bed = targetOcean ? prepared.slice() : undefined;
+    targetOcean?.forEach((ocean, index) => { if (ocean === 1) prepared[index] = Number.NaN; });
+    openDrainageToFloor(prepared, floor, targetWidth, targetHeight);
+    targetOcean?.forEach((ocean, index) => { if (ocean === 1) prepared[index] = bed![index]; });
+  }
+  return { luminance: prepared, oceanMask: targetOcean };
+}
+
+/**
  * Applies an edge-preserving denoise pass to normalized height samples.
  * A cross-shaped neighborhood is used so narrow terrain features retain
  * their banks while small, isolated pixel-scale variations are averaged out.
@@ -1543,6 +1639,8 @@ interface TiffHeightmapHeader {
   stripOffsets: number[];
   stripByteCounts: number[];
   noDataValue: number | null;
+  /** Ground footprint of a GeoTIFF; absent for plain TIFF images. */
+  groundExtent: { widthKm: number; heightKm: number } | null;
 }
 
 const TIFF_FIELD_TYPE_SIZES: readonly number[] = [
@@ -1560,6 +1658,14 @@ const TIFF_TAG_SAMPLES_PER_PIXEL = 277;
 const TIFF_TAG_PLANAR_CONFIGURATION = 284;
 const TIFF_TAG_SAMPLE_FORMAT = 339;
 const TIFF_TAG_GDAL_NODATA = 42113;
+const TIFF_TAG_MODEL_PIXEL_SCALE = 33550;
+const TIFF_TAG_MODEL_TIEPOINT = 33922;
+const TIFF_TAG_GEO_KEY_DIRECTORY = 34735;
+const GEO_KEY_MODEL_TYPE = 1024;
+const GEO_KEY_PROJECTED_CRS = 3072;
+const GEO_KEY_PROJECTED_LINEAR_UNITS = 3076;
+const WEB_MERCATOR_CRS_CODES = new Set([3857, 3785, 900913, 102100, 102113]);
+const WGS84_RADIUS_M = 6378137;
 const MIN_TIFF_ELEVATION_M = -10;
 
 function isTiff(bytes: Uint8Array): boolean {
@@ -1648,6 +1754,63 @@ function readTiffAscii(view: DataView, field: TiffField): string {
     .join("")
     .replace(/\0+$/, "")
     .trim();
+}
+
+/**
+ * Reads the ground footprint from GeoTIFF pixel scale, tiepoint and GeoKeys.
+ * Geographic rasters are measured at their centre latitude, and Web Mercator
+ * spans are shrunk by the Mercator scale at their centre, so both report
+ * approximate ground kilometres. Unknown linear units are not guessed.
+ */
+function readTiffGroundExtent(
+  view: DataView,
+  fields: Map<number, TiffField>,
+  littleEndian: boolean,
+  width: number,
+  height: number,
+): { widthKm: number; heightKm: number } | null {
+  const scaleField = fields.get(TIFF_TAG_MODEL_PIXEL_SCALE);
+  const tiepointField = fields.get(TIFF_TAG_MODEL_TIEPOINT);
+  const keyField = fields.get(TIFF_TAG_GEO_KEY_DIRECTORY);
+  if (!scaleField || !tiepointField || !keyField) return null;
+  const [scaleX, scaleY] = readTiffFieldValues(view, scaleField, littleEndian);
+  const tiepoint = readTiffFieldValues(view, tiepointField, littleEndian);
+  if (!(scaleX > 0) || !(scaleY > 0) || tiepoint.length < 6) return null;
+
+  const directory = readTiffFieldValues(view, keyField, littleEndian);
+  const geoKeys = new Map<number, number>();
+  for (let entry = 4; entry + 3 < directory.length && entry < 4 + directory[3] * 4; entry += 4) {
+    // Location 0 stores the SHORT value inline; the keys used here all do.
+    if (directory[entry + 1] === 0) geoKeys.set(directory[entry], directory[entry + 3]);
+  }
+
+  const spanX = scaleX * width;
+  const spanY = scaleY * height;
+  const centerY = tiepoint[4] - tiepoint[1] * scaleY - spanY / 2;
+  const modelType = geoKeys.get(GEO_KEY_MODEL_TYPE);
+  if (modelType === 2) {
+    if (Math.abs(centerY) > 90) return null;
+    const metresPerDegree = (Math.PI * WGS84_RADIUS_M) / 180;
+    return {
+      widthKm: (spanX * metresPerDegree * Math.cos((centerY * Math.PI) / 180)) / 1000,
+      heightKm: (spanY * metresPerDegree) / 1000,
+    };
+  }
+  if (modelType !== 1) return null;
+
+  const linearUnit = geoKeys.get(GEO_KEY_PROJECTED_LINEAR_UNITS) ?? 9001;
+  const metresPerUnit =
+    linearUnit === 9001 ? 1 : linearUnit === 9002 ? 0.3048 : linearUnit === 9003 ? 1200 / 3937 : null;
+  if (metresPerUnit === null) return null;
+  const crs = geoKeys.get(GEO_KEY_PROJECTED_CRS);
+  const groundScale =
+    crs !== undefined && WEB_MERCATOR_CRS_CODES.has(crs)
+      ? 1 / Math.cosh((centerY * metresPerUnit) / WGS84_RADIUS_M)
+      : 1;
+  return {
+    widthKm: (spanX * metresPerUnit * groundScale) / 1000,
+    heightKm: (spanY * metresPerUnit * groundScale) / 1000,
+  };
 }
 
 function readTiffHeader(buffer: ArrayBuffer): TiffHeightmapHeader | null {
@@ -1794,6 +1957,7 @@ function readTiffHeader(buffer: ArrayBuffer): TiffHeightmapHeader | null {
     stripOffsets,
     stripByteCounts,
     noDataValue,
+    groundExtent: readTiffGroundExtent(view, fields, littleEndian, width, height),
   };
 }
 
@@ -1830,11 +1994,66 @@ function isTiffMissingSample(
   return sampleFormat !== 1 && sample === -9999;
 }
 
+/**
+ * Real-world scale of a georeferenced heightmap. `rawLuminance` spans
+ * `minElevationM`..`maxElevationM`, so using them as valley floor and summit
+ * restores the source elevations.
+ */
+export interface HeightmapGeoMetadata {
+  minElevationM: number;
+  maxElevationM: number;
+  widthKm: number;
+  heightKm: number;
+}
+
 export interface HeightmapRaster {
   width: number;
   height: number;
   rawLuminance: Float32Array;
   oceanMask?: Uint8Array;
+  /** Present only for georeferenced sources, never for plain images. */
+  metadata?: HeightmapGeoMetadata;
+}
+
+/**
+ * Normalizes a grid of elevations in metres (NaN = missing) with the same
+ * rules as the GeoTIFF decoder: missing or deep cells become ocean at the
+ * minimum elevation, and the range is recorded as metadata.
+ */
+export function heightmapFromElevations(
+  elevations: Float32Array,
+  width: number,
+  height: number,
+  extent: { widthKm: number; heightKm: number },
+): HeightmapRaster {
+  if (elevations.length !== width * height)
+    throw new Error("Elevation grid size does not match its dimensions");
+  const rawLuminance = new Float32Array(elevations.length);
+  const oceanMask = new Uint8Array(elevations.length);
+  let minimum = Number.POSITIVE_INFINITY;
+  let maximum = Number.NEGATIVE_INFINITY;
+  for (let i = 0; i < elevations.length; i++) {
+    const sample = elevations[i];
+    if (isTiffMissingSample(sample, null, 3)) {
+      oceanMask[i] = 1;
+      rawLuminance[i] = MIN_TIFF_ELEVATION_M;
+    } else {
+      rawLuminance[i] = sample;
+    }
+    minimum = Math.min(minimum, rawLuminance[i]);
+    maximum = Math.max(maximum, rawLuminance[i]);
+  }
+  const range = maximum - minimum;
+  for (let i = 0; i < rawLuminance.length; i++) {
+    rawLuminance[i] = range <= 0 ? 0 : (rawLuminance[i] - minimum) / range;
+  }
+  return {
+    width,
+    height,
+    rawLuminance,
+    oceanMask,
+    metadata: { minElevationM: minimum, maxElevationM: maximum, ...extent },
+  };
 }
 
 /** Decodes an uncompressed, single-band classic TIFF/GeoTIFF DEM. */
@@ -1925,11 +2144,18 @@ export function decodeTiffHeightmap(
         : Math.max(0, Math.min(1, normalized));
   });
 
+  // Only a GeoTIFF's samples are trusted as metres; a plain 16-bit image
+  // TIFF would otherwise claim a 65 km summit.
+  const metadata =
+    header.groundExtent && header.photometricInterpretation === 1
+      ? { minElevationM: minimum, maxElevationM: maximum, ...header.groundExtent }
+      : undefined;
   return {
     width: header.width,
     height: header.height,
     rawLuminance,
     oceanMask,
+    metadata,
   };
 }
 
@@ -2958,6 +3184,8 @@ export function processMountainBaseDEM(
     Math.max(2, Math.min(dxMeters, dyMeters) * 0.035),
   );
   const stageWidthScale = Math.sqrt(effectiveWaterStageScale);
+  // Radius 0 keeps only the thalweg once a cell is wider than the channel.
+  const channelRadiusCellScale = waterWidthCellScale(Math.min(dxMeters, dyMeters));
 
   for (let i = 0; i < totalCells; i++) {
     const area = rainfallWeightedAreaKm2[i];
@@ -2994,7 +3222,7 @@ export function processMountainBaseDEM(
       const waterSurfaceM = elevation[i] + depth + rasterStageAllowanceM;
       centerlineMask[i] = 1;
       distanceToCenterline[i] = 0;
-      inheritedChannelRadius[i] = radius;
+      inheritedChannelRadius[i] = Math.round(radius * channelRadiusCellScale);
       inheritedChannelOrder[i] = displayOrder;
       inheritedWaterSurfaceM[i] = waterSurfaceM;
       isRiverChannel[i] = 1;

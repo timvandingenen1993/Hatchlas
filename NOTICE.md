@@ -35,6 +35,28 @@ digital elevation models published by Land Information New Zealand (LINZ).
 The data has been cleaned, cropped and resampled for this project. LINZ does
 not endorse this project.
 
+### Downloaded terrain (Get map)
+
+Terrain loaded with **Get map** is downloaded at run time from the provider
+you choose; none of it ships with this project. If you publish a map made
+from it, credit the source:
+
+- **Mapterhorn**: Copernicus DEM GLO-30, © DLR e.V. 2010-2014 and © Airbus
+  Defence and Space GmbH 2014-2018, provided under COPERNICUS by the European
+  Union and ESA; all rights reserved. Regional sources are listed in the
+  [Mapterhorn attribution](https://mapterhorn.com/attribution).
+- **Mapzen / AWS Terrain Tiles**: open elevation sources listed in the
+  [Mapzen attribution](https://github.com/tilezen/joerd/blob/master/docs/attribution.md),
+  served through the [AWS Open Data registry](https://registry.opendata.aws/terrain-tiles/).
+
+The area picker's reference map uses [OpenFreeMap](https://openfreemap.org/)
+cartography, © [OpenMapTiles](https://www.openmaptiles.org/), map data ©
+[OpenStreetMap contributors](https://www.openstreetmap.org/copyright), and
+[Mapterhorn](https://mapterhorn.com/attribution) relief.
+
+The picker and tile stitching are ported from the author's own Heightmap
+Stitcher app.
+
 ## Third-party code and algorithms
 
 - **Simplex noise** in `src/core/noise.ts` follows Stefan Gustavson's
@@ -57,6 +79,9 @@ Runtime dependencies and their licenses:
 | clsx | MIT |
 | lucide-react | ISC |
 | canvas-confetti | ISC |
+| leaflet | BSD-2-Clause |
+| maplibre-gl | BSD-3-Clause |
+| @maplibre/maplibre-gl-leaflet | ISC |
 
 Build and test tooling (Vite, Vitest, TypeScript, Tailwind CSS, oxlint) is
 not distributed with the app. All of the above are compatible with the AGPL.
