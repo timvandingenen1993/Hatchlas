@@ -1390,13 +1390,20 @@ export function validateMountainRenderStageCache(
   if (!cache) return;
   const demElevationFingerprint = getMountainFieldFingerprint(dem.elevation);
   const demSlopeFingerprint = getMountainFieldFingerprint(dem.slopeDeg);
-  const lineworkInput = Uint8Array.from(dem.elevation, (_, index) => (
-    dem.isOcean[index] > 0
-    || dem.isRiverChannel[index] > 0
-    || (dem.visualWaterMask?.[index] ?? 0) > 0
-    || dem.biomeType[index] === 6
-    || dem.biomeType[index] === 8
-  ) ? 1 : 0);
+  // Runs on every render: a plain loop is ~20x faster than the callback form
+  // of `Uint8Array.from` over a full DEM.
+  const { isOcean, isRiverChannel, visualWaterMask, biomeType } = dem;
+  const lineworkInput = new Uint8Array(dem.elevation.length);
+  for (let index = 0; index < lineworkInput.length; index++) {
+    const biome = biomeType[index];
+    lineworkInput[index] = (
+      isOcean[index] > 0
+      || isRiverChannel[index] > 0
+      || (visualWaterMask?.[index] ?? 0) > 0
+      || biome === 6
+      || biome === 8
+    ) ? 1 : 0;
+  }
   const demLineworkFingerprint = getMountainFieldFingerprint(lineworkInput);
   const demSourceChanged = cache.dem === dem && (
     cache.demElevationFingerprint !== demElevationFingerprint

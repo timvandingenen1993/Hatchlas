@@ -91,8 +91,27 @@ export interface MountainFieldCacheSession {
   misses: number;
 }
 
+/** Stable cache source standing in for a DEM without a visual water mask. */
+const NO_VISUAL_WATER_MASK = new Uint8Array(0);
+
 export function createMountainFieldCache(): MountainFieldCache {
   return { entries: new Map() };
+}
+
+/**
+ * `Float32Array.from(source, map)` with an indexed loop. The callback form of
+ * `TypedArray.from` is roughly 20x slower on full-DEM arrays; the stored
+ * values are identical.
+ */
+export function mapToFloat32(
+  source: ArrayLike<number>,
+  map: (value: number, index: number) => number,
+): Float32Array {
+  const result = new Float32Array(source.length);
+  for (let index = 0; index < result.length; index++) {
+    result[index] = map(source[index], index);
+  }
+  return result;
 }
 
 /** Deterministic content fingerprint used only to detect in-place edits. */
@@ -102,19 +121,19 @@ export function getMountainFieldFingerprint(source: ArrayLike<number>): number {
   // representation catches every in-place bit change; the byte path also
   // handles Float64Array inputs without collapsing fractional values through
   // a 32-bit integer cast.
+  // Indexed loops: iterator-based `for...of` over these multi-million-cell
+  // arrays was ~6x slower and runs on every preview render.
   if (source instanceof Float32Array) {
     const floatBits = new Uint32Array(source.buffer, source.byteOffset, source.length);
-    for (const value of floatBits) {
-      hash ^= value;
-      hash = Math.imul(hash, 16777619) >>> 0;
+    for (let index = 0; index < floatBits.length; index++) {
+      hash = Math.imul(hash ^ floatBits[index], 16777619);
     }
     return hash >>> 0;
   }
   if (ArrayBuffer.isView(source) && !(source instanceof DataView)) {
     const bytes = new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
-    for (const byte of bytes) {
-      hash ^= byte;
-      hash = Math.imul(hash, 16777619) >>> 0;
+    for (let index = 0; index < bytes.length; index++) {
+      hash = Math.imul(hash ^ bytes[index], 16777619);
     }
     return hash >>> 0;
   }
@@ -675,17 +694,8 @@ export function renderMountainPatternOverlay(
   const stride = options.stride ?? width;
   const seed = options.seed ?? 23817;
   const noise = new SimplexNoise(seed);
-  const coverage = new Uint8Array(width * height);
-  // Line eligibility is a geometric question. Keep a separate dry-land mask
-  // so a lowland cliff can be inked even when its biome contributes no rock
-  // material to the mountain footprint.
-  const lineworkCoverage = new Uint8Array(width * height);
   const lineworkExcludedBiomes = new Set(options.lineworkExcludedBiomeIds ?? []);
-  const lineworkFeatureStrength = new Float32Array(width * height);
-  const crestSupportCoverage = new Uint8Array(width * height);
-  let snow: Float32Array = new Float32Array(width * height);
   const ink = new Uint8Array(width * height);
-  const wash = new Float32Array(width * height);
   const legacyStrokeThickness = Math.max(0, options.strokeThickness ?? 1);
   const thickness = Math.max(0, options.hatchThickness ?? legacyStrokeThickness);
   const opacity = clamp01(options.strokeOpacity ?? 0.8);
@@ -714,7 +724,6 @@ export function renderMountainPatternOverlay(
       ?? (options.ridgeThickness !== undefined
         ? mainRidgeThickness
         : legacyStrokeThickness * mainRidgeThickness));
-  const crests: MountainLinePoint[] = [];
   const paths: MountainStrokePath[] = [];
   // The illustration is built from three terrain scales. The broad field
   // decides whether a landform belongs to the mountain range, the face field
@@ -794,9 +803,9 @@ export function renderMountainPatternOverlay(
       width,
       height,
       `cellSize:${dem.dxMeters},${dem.dyMeters}:range:${elevationRange}`,
-      () => Float32Array.from(geometryNormalized!, value => value * elevationRange),
+      () => mapToFloat32(geometryNormalized!, value => value * elevationRange),
     )
-    : Float32Array.from(localElevation, value => Math.floor(value));
+    : mapToFloat32(localElevation, value => Math.floor(value));
   const terrainFieldsStop = profiler?.begin('mountain pattern terrain fields');
   const broadElevation = cachedMountainField(
     fieldSession,
@@ -869,7 +878,7 @@ export function renderMountainPatternOverlay(
     [broadElevation, regionalElevation], width, height,
     `cellSize:${dem.dxMeters},${dem.dyMeters}:radius:${18 * scale}`,
     () => smoothMountainField(
-      Float32Array.from(broadElevation, (value, index) =>
+      mapToFloat32(broadElevation, (value, index) =>
         Math.abs(value - regionalElevation[index])),
       width, height, 18 * scale,
     ),
@@ -894,7 +903,7 @@ export function renderMountainPatternOverlay(
   const slopeAt = (index: number): number => staleSlopeOnFlatTerrain ? 0 : slopes[index];
   const normalizedElevation = hasNormalizedGeometry
     ? geometryNormalized!
-    : Float32Array.from(localElevation,
+    : mapToFloat32(localElevation,
       value => clamp01((value - dem.minElevationM) / elevationRange));
   // Approximate the paper's crest-oriented importance field before the
   // explicit crest pass. Broad, low-relief terrain should stay on a stable
@@ -939,7 +948,7 @@ export function renderMountainPatternOverlay(
     height,
     `cellSize:${dem.dxMeters},${dem.dyMeters}:radius:${8 * scale}`,
     () => smoothMountainField(
-      Float32Array.from(localBiomeType, value => mountainBiomeDetailBoost(Math.round(value))),
+      mapToFloat32(localBiomeType, value => mountainBiomeDetailBoost(Math.round(value))),
       width,
       height,
       8 * scale,
@@ -1091,311 +1100,402 @@ export function renderMountainPatternOverlay(
     noiseY19[y] = worldY / noiseDenominator19;
     noiseY53[y] = worldY / noiseDenominator53;
   }
-  const waterMask = new Uint8Array(totalCells);
-  for (let index = 0; index < totalCells; index++) {
-    const biome = dem.biomeType[index];
-    waterMask[index] = dem.isOcean[index] > 0
-      || (dem.visualWaterMask?.[index] ?? 0) > 0
-      || dem.isRiverChannel[index] > 0
-      || biome === 6
-      || biome === 8
-      ? 1
-      : 0;
-  }
-
-  // Crests below this broad prominence are lower spurs/shoulders whose main
-  // line should follow the cliff edge rather than the spur centre.
-  const lowerCrestBrinkProminence = 0.45;
-  const brinkStep = Math.max(0.75, scale);
-  const brinkReach = 2 * radius;
-  const brinkCurvatureSpan = Math.max(1, 2 * scale);
-  const brinkSample = (x: number, y: number) => sampleScalarField(faceElevation, width, height, x, y);
-  /** Return the convex slope break on the steeper side of a crest transect. */
-  const findCrestBrink = (
-    cx: number, cy: number, ux: number, uy: number, reliefScale: number,
-  ): { x: number; y: number } | undefined => {
-    const at = (t: number) => brinkSample(cx + ux * t, cy + uy * t);
-    const convexity = (t: number) =>
-      2 * at(t) - at(t - brinkCurvatureSpan) - at(t + brinkCurvatureSpan);
-    const centerZ = at(0);
-    const side = centerZ - at(brinkReach) >= centerZ - at(-brinkReach) ? 1 : -1;
-    let bestT = 0;
-    let bestConvexity = -Infinity;
-    for (let t = brinkCurvatureSpan; t <= brinkReach; t += brinkStep) {
-      const value = convexity(side * t);
-      if (value > bestConvexity) { bestConvexity = value; bestT = side * t; }
+  // Crest detection and ridge chaining are the most expensive part of the
+  // pattern (seconds at preview size). They depend only on the terrain and
+  // these geometry settings, never on pen opacity, thickness or colour, so
+  // cache them and let those edits re-trace and re-ink only the strokes.
+  const crestNetworkSignature = JSON.stringify([
+    scale, ox, oy, sourceStride, seed, ridgeDensity,
+    [...lineworkExcludedBiomes].sort((a, b) => a - b),
+    dem.dxMeters, dem.dyMeters, dem.minElevationM, dem.maxElevationM,
+    hasNormalizedGeometry,
+  ]);
+  const crestNetworkMissesBefore = fieldSession?.misses ?? 0;
+  const crestNetwork = cachedMountainField(
+    fieldSession,
+    'pattern crest network',
+    [
+      localElevation, localSlope, normalizedElevation, dem.biomeType,
+      dem.isOcean, dem.isRiverChannel, dem.temperatureC,
+      dem.visualWaterMask ?? NO_VISUAL_WATER_MASK,
+    ],
+    width,
+    height,
+    crestNetworkSignature,
+    () => {
+    const coverage = new Uint8Array(width * height);
+    // Line eligibility is a geometric question. Keep a separate dry-land mask
+    // so a lowland cliff can be inked even when its biome contributes no rock
+    // material to the mountain footprint.
+    const lineworkCoverage = new Uint8Array(width * height);
+    const lineworkFeatureStrength = new Float32Array(width * height);
+    const crestSupportCoverage = new Uint8Array(width * height);
+    let snow: Float32Array = new Float32Array(width * height);
+    const wash = new Float32Array(width * height);
+    const crests: MountainLinePoint[] = [];
+    const waterMask = new Uint8Array(totalCells);
+    for (let index = 0; index < totalCells; index++) {
+      const biome = dem.biomeType[index];
+      waterMask[index] = dem.isOcean[index] > 0
+        || (dem.visualWaterMask?.[index] ?? 0) > 0
+        || dem.isRiverChannel[index] > 0
+        || biome === 6
+        || biome === 8
+        ? 1
+        : 0;
     }
-    const centerConvexity = convexity(0);
-    if (bestT === 0 || bestConvexity < 0.05
-      || bestConvexity <= Math.max(0, centerConvexity) * 1.2) return undefined;
-    // The ground past the brink must actually fall away as a face.
-    const drop = at(bestT) - at(bestT + side * radius);
-    if (drop < reliefScale * 0.05) return undefined;
-    return {
-      x: Math.max(0, Math.min(width - 1, cx + ux * bestT)),
-      y: Math.max(0, Math.min(height - 1, cy + uy * bestT)),
-    };
-  };
-  const crestDetectionStop = profiler?.begin('mountain pattern crest detection and chaining');
-  for (let y = 0; y < height; y++) {
-    const rowOffset = rowOffsets[y];
-    const rowAboveOffset = rowAboveOffsets[y];
-    const rowBelowOffset = rowBelowOffsets[y];
-    for (let x = 0; x < width; x++) {
-      const i = rowOffset + x;
-      const biome = dem.biomeType[i];
-      if (waterMask[i]) continue;
-      // Every dry terrain cell is available to the geometric linework pass,
-      // except biomes drawn by their own linework (sand desert dunes).
-      // Material coverage below may still be zero for a meadow, floodplain,
-      // or other non-mountain biome.
-      lineworkCoverage[i] = lineworkExcludedBiomes.has(biome) ? 0 : 255;
-      const materialSlope = staleSlopeOnFlatTerrain && (biome === 3 || biome === 4 || biome === 5 || biome >= 15)
-        ? 0
-        : slopes[i];
-      // Bare alpine rock and glaciers, with a soft transition into steep tundra.
-      // Alpine tundra carries the same broad mountain base as bare rock, but
-      // its flat meadows remain a translucent footprint so hatching still
-      // begins only on real faces below. This keeps the illustrated relief
-      // continuous across the biome boundary.
-      const tundraElevation = clamp01((normalizedElevation[i] - 0.28) / 0.58);
-      const tundraSlope = clamp01((slopeAt(i) - 4) / 34);
-      // Keep the high alpine surface opaque, but let low-slope shoulders fade
-      // into foothills. A full biome fill made the mountain a soft-edged blob
-      // before any crest or face stroke was visible.
-      // Derive this from the local elevation array instead of
-      // `normalizedElevation`: export crops intentionally omit the latter,
-      // and the raw elevation remains globally consistent at the crop origin.
-      const localElevationNormalized = clamp01(
-        (localElevation[i] - dem.minElevationM) / localElevationRange,
-      );
-      const alpineProminence = clamp01((localElevationNormalized - 0.36) / 0.42);
-      const alpineSlope = clamp01((materialSlope - 7) / 30);
-      const woodlandSlope = clamp01((materialSlope - 5) / 28);
-      const broadProminence = clamp01((localElevation[i] - broadElevation[i]) / (elevationRange * 0.16));
-      // The biome remains a material hint, not a boundary. Keep a small
-      // summit contribution for flat glacier/alpine cells (so cold caps still
-      // exist), but make ordinary alpine rock depend mostly on its local face
-      // rather than on an elevation-shaped biome disk.
-      const biomeMountain = biome === 0
-        ? clamp01(alpineProminence * 0.58 + alpineSlope * 0.74 + broadProminence * 0.16)
-        : biome === 1
-          ? clamp01(alpineProminence * 0.18 + alpineSlope * 0.62 + broadProminence * 0.16)
-          : biome === 2
-            ? clamp01(tundraElevation * 0.12 + tundraSlope * 0.52 + broadProminence * 0.12)
-            : biome === 3 || biome === 4 || biome === 15 || biome === 17 || biome === 18 || biome === 20
-              ? clamp01(woodlandSlope * 0.72 + broadProminence * 0.18)
-              : biome === 5 || biome === 19
-                ? clamp01(woodlandSlope * 0.78 + broadProminence * 0.2)
-                // Desert hamada reads as broken rock on its slopes.
-                : biome === 16
-                  ? clamp01(alpineProminence * 0.12 + alpineSlope * 0.62 + broadProminence * 0.16)
-                  : 0;
-      // The hatch/ridge layer follows the physical heightmap across every
-      // land biome. There is deliberately no highland/elevation gate here:
-      // elevation only changes the strength of a local face, while slope and
-      // relief decide whether that face gets broken rock and linework. This
-      // keeps steep lowland cliffs eligible and removes the circular mountain
-      // cutoff from the surrounding grassland.
-      const leftElevation = faceElevation[rowOffset + columnLeft[x]];
-      const rightElevation = faceElevation[rowOffset + columnRight[x]];
-      const upElevation = faceElevation[rowAboveOffset + x];
-      const downElevation = faceElevation[rowBelowOffset + x];
-      const gradientX = (rightElevation - leftElevation) / gradientDxDenominator;
-      const gradientY = (downElevation - upElevation) / gradientDyDenominator;
-      const heightmapGradient = Math.sqrt(gradientX * gradientX + gradientY * gradientY);
-      const heightmapSlopeDeg = Math.atan(heightmapGradient) * 180 / Math.PI;
-      const heightmapSteepness = clamp01((heightmapSlopeDeg - 5) / 34);
-      const heightmapProminence = clamp01(
-        (localElevation[i] - broadElevation[i]) / localProminenceDenominator,
-      );
-      const steepRidge = clamp01((heightmapSlopeDeg - 18) / 27);
-      // Local feature strength is independent of biome and absolute altitude.
-      // It keeps real folds eligible in foothills while remaining quiet on
-      // broad flat ground. The curvature term uses physical cell spacing,
-      // rather than the DEM's global elevation range.
-      const localTraceCenter = traceElevation[i];
-      const localCurvatureX = (
-        traceElevation[rowOffset + columnRight[x]]
-        + traceElevation[rowOffset + columnLeft[x]]
-        - 2 * localTraceCenter
-      )
-        / curvatureDxDenominator;
-      const localCurvatureY = (
-        traceElevation[rowBelowOffset + x]
-        + traceElevation[rowAboveOffset + x]
-        - 2 * localTraceCenter
-      )
-        / curvatureDyDenominator;
-      const localCurvatureSignal = clamp01(
-        Math.abs(localCurvatureX + localCurvatureY)
-          * physicalFeatureScale * 5,
-      );
-      lineworkFeatureStrength[i] = clamp01(Math.max(
-        heightmapSteepness * 0.78,
-        localCurvatureSignal * 0.82,
-      ));
-      // A chain may bridge a short raster gap only when the terrain between
-      // its endpoints still behaves like a crest or saddle. Positive local
-      // relief (TPI in the regional field) and the negative Laplacian branch
-      // (the DEM's convex/crest sign) provide that support without treating
-      // a steep valley wall as a summit merely because it has high slope.
-      const localReliefScale = Math.max(
-        24,
-        regionalReliefMagnitude[i] * 0.68,
-        physicalFeatureScale * 1.8,
-      );
-      const crestReliefSignal = clamp01(
-        (geometryElevation[i] - regionalElevation[i] + localReliefScale * 0.02)
-          / Math.max(1, localReliefScale * 0.14),
-      );
-      const convexSignal = clamp01(
-        -(localCurvatureX + localCurvatureY)
-          * physicalFeatureScale * 5,
-      );
-      crestSupportCoverage[i] = lineworkFeatureStrength[i] >= 0.08
-        && Math.max(crestReliefSignal, convexSignal) >= 0.12 ? 255 : 0;
-      // Low-frequency terrain noise breaks the material into patches while
-      // remaining anchored to world coordinates for tiled exports. It changes
-      // the amount of exposed rock; it never turns a flat cell into a ridge.
-      const patchNoise = clamp01(
-        0.5 + 0.5 * noise.noise2D(noiseX46[x], noiseY46[y]),
-      );
-      const patchFactor = 0.72 + patchNoise * 0.5;
-      const heightmapRidge = clamp01(
-        heightmapSteepness * 0.74
-          + heightmapProminence * (0.2 + localElevationNormalized * 0.18)
-          + steepRidge * 0.16,
-      );
-      const terrainRidge = clamp01(heightmapRidge * patchFactor);
-      const mountain = clamp01(Math.max(biomeMountain * patchFactor, terrainRidge));
-      coverage[i] = Math.round(mountain * 255);
-      if (mountain) {
-        const grain = noise.noise2D(noiseX19[x], noiseY19[y]);
-        wash[i] = grain * 0.55
-          + noise.noise2D(noiseX53[x], noiseY53[y]) * 0.45;
-        const upperSlopeEligibility = clamp01((normalizedElevation[i] - 0.48) / 0.28);
-        const cold = clamp01(
-          (5 - dem.temperatureC[i]) / 8 + upperSlopeEligibility * 0.32 + grain * 0.05,
-        );
-        const z = sample(x, y);
-        // Snow persists in cold accumulation areas but sheds from steep cliffs.
-        // Shelter is derived from broad curvature rather than pixel noise so a
-        // gully can carry one connected blanket while a convex rock rib stays
-        // exposed. The physical field remains deliberately generous; the
-        // illustration stage applies the final projected drift edge.
-        const retention = 1 - clamp01((slopes[i] - 38) / 27);
-        const curvatureRadius = 6 * scale;
-        const curvature = (
-          sample(x - curvatureRadius, y) + sample(x + curvatureRadius, y)
-          + sample(x, y - curvatureRadius) + sample(x, y + curvatureRadius)
-          - 4 * z
-        ) / Math.max(1, (dem.maxElevationM - dem.minElevationM) * 0.018);
-        const shelter = clamp01(0.5 + curvature * 0.75);
-        const broadRetention = 0.9 + shelter * 0.1;
-        const exposedRib = clamp01((slopes[i] - 24) / 38) * (1 - shelter * 0.55);
-        snow[i] = clamp01(
-          (biome === 0 ? Math.max(0.85, cold) : cold)
-            * retention
-            * broadRetention
-            * (1 - exposedRib * 0.22),
-        );
-      }
 
-      // Trace the range-scale summit spine, rather than the small convex
-      // folds running down its faces. Snow and hatches retain their fine field.
-      const crestZ = broadElevation[i];
-      const l = sampleFixedCrest(crestXMinus, crestYCenter, x, y);
-      const r = sampleFixedCrest(crestXPlus, crestYCenter, x, y);
-      const u = sampleFixedCrest(crestXCenter, crestYMinus, x, y);
-      const d = sampleFixedCrest(crestXCenter, crestYPlus, x, y);
-      const gx = (r - l) * 0.5 * inverseRadius;
-      const gy = (d - u) * 0.5 * inverseRadius;
-      const xx = (r + l - 2 * crestZ) * inverseRadiusSquared;
-      const yy = (d + u - 2 * crestZ) * inverseRadiusSquared;
-      const xy = (
-        sampleFixedCrest(crestXPlus, crestYPlus, x, y)
-        - sampleFixedCrest(crestXPlus, crestYMinus, x, y)
-        - sampleFixedCrest(crestXMinus, crestYPlus, x, y)
-        + sampleFixedCrest(crestXMinus, crestYMinus, x, y)
-      ) * hessianCrossScale;
-      // Most concave Hessian axis crosses a crest. Distance to its derivative
-      // zero gives a narrow ridge, even when the ridge climbs toward a peak.
-      const eigenvalue = (xx + yy - Math.sqrt((xx - yy) * (xx - yy) + (2 * xy) * (2 * xy))) / 2;
-      let ux = xy, uy = eigenvalue - xx;
-      const norm = Math.sqrt(ux * ux + uy * uy);
-      if (norm > 1e-8) { ux /= norm; uy /= norm; }
-      else { ux = xx <= yy ? 1 : 0; uy = xx <= yy ? 0 : 1; }
-      const relief = -eigenvalue * radius * radius;
-      // A main crest must stand above its surroundings. Steepness alone
-      // otherwise promotes downhill ribs to the same pen as summit chains.
-      const localReliefSupport = clamp01((relief - crestReliefThreshold) / 8);
-      if (relief > crestReliefThreshold) {
-        const displacementAlongAxis = (gx * ux + gy * uy) / Math.max(1e-8, -eigenvalue);
-        const displacementX = ux * displacementAlongAxis;
-        const displacementY = uy * displacementAlongAxis;
-        // The Hessian eigenvector is normalized above, so the displacement
-        // vector has exactly the scalar length used to construct it. Avoid a
-        // second norm and a second normalization in the candidate hot path.
-        const displacement = Math.abs(displacementAlongAxis);
-        const nx = ux;
-        const ny = uy;
-        const localProminenceScale = Math.max(
+    // Crests below this broad prominence are lower spurs/shoulders whose main
+    // line should follow the cliff edge rather than the spur centre.
+    const lowerCrestBrinkProminence = 0.45;
+    const brinkStep = Math.max(0.75, scale);
+    const brinkReach = 2 * radius;
+    const brinkCurvatureSpan = Math.max(1, 2 * scale);
+    const brinkSample = (x: number, y: number) => sampleScalarField(faceElevation, width, height, x, y);
+    /** Return the convex slope break on the steeper side of a crest transect. */
+    const findCrestBrink = (
+      cx: number, cy: number, ux: number, uy: number, reliefScale: number,
+    ): { x: number; y: number } | undefined => {
+      const at = (t: number) => brinkSample(cx + ux * t, cy + uy * t);
+      const convexity = (t: number) =>
+        2 * at(t) - at(t - brinkCurvatureSpan) - at(t + brinkCurvatureSpan);
+      const centerZ = at(0);
+      const side = centerZ - at(brinkReach) >= centerZ - at(-brinkReach) ? 1 : -1;
+      let bestT = 0;
+      let bestConvexity = -Infinity;
+      for (let t = brinkCurvatureSpan; t <= brinkReach; t += brinkStep) {
+        const value = convexity(side * t);
+        if (value > bestConvexity) { bestConvexity = value; bestT = side * t; }
+      }
+      const centerConvexity = convexity(0);
+      if (bestT === 0 || bestConvexity < 0.05
+        || bestConvexity <= Math.max(0, centerConvexity) * 1.2) return undefined;
+      // The ground past the brink must actually fall away as a face.
+      const drop = at(bestT) - at(bestT + side * radius);
+      if (drop < reliefScale * 0.05) return undefined;
+      return {
+        x: Math.max(0, Math.min(width - 1, cx + ux * bestT)),
+        y: Math.max(0, Math.min(height - 1, cy + uy * bestT)),
+      };
+    };
+    const crestDetectionStop = profiler?.begin('mountain pattern crest detection and chaining');
+    for (let y = 0; y < height; y++) {
+      const rowOffset = rowOffsets[y];
+      const rowAboveOffset = rowAboveOffsets[y];
+      const rowBelowOffset = rowBelowOffsets[y];
+      for (let x = 0; x < width; x++) {
+        const i = rowOffset + x;
+        const biome = dem.biomeType[i];
+        if (waterMask[i]) continue;
+        // Every dry terrain cell is available to the geometric linework pass,
+        // except biomes drawn by their own linework (sand desert dunes).
+        // Material coverage below may still be zero for a meadow, floodplain,
+        // or other non-mountain biome.
+        lineworkCoverage[i] = lineworkExcludedBiomes.has(biome) ? 0 : 255;
+        const materialSlope = staleSlopeOnFlatTerrain && (biome === 3 || biome === 4 || biome === 5 || biome >= 15)
+          ? 0
+          : slopes[i];
+        // Bare alpine rock and glaciers, with a soft transition into steep tundra.
+        // Alpine tundra carries the same broad mountain base as bare rock, but
+        // its flat meadows remain a translucent footprint so hatching still
+        // begins only on real faces below. This keeps the illustrated relief
+        // continuous across the biome boundary.
+        const tundraElevation = clamp01((normalizedElevation[i] - 0.28) / 0.58);
+        const tundraSlope = clamp01((slopeAt(i) - 4) / 34);
+        // Keep the high alpine surface opaque, but let low-slope shoulders fade
+        // into foothills. A full biome fill made the mountain a soft-edged blob
+        // before any crest or face stroke was visible.
+        // Derive this from the local elevation array instead of
+        // `normalizedElevation`: export crops intentionally omit the latter,
+        // and the raw elevation remains globally consistent at the crop origin.
+        const localElevationNormalized = clamp01(
+          (localElevation[i] - dem.minElevationM) / localElevationRange,
+        );
+        const alpineProminence = clamp01((localElevationNormalized - 0.36) / 0.42);
+        const alpineSlope = clamp01((materialSlope - 7) / 30);
+        const woodlandSlope = clamp01((materialSlope - 5) / 28);
+        const broadProminence = clamp01((localElevation[i] - broadElevation[i]) / (elevationRange * 0.16));
+        // The biome remains a material hint, not a boundary. Keep a small
+        // summit contribution for flat glacier/alpine cells (so cold caps still
+        // exist), but make ordinary alpine rock depend mostly on its local face
+        // rather than on an elevation-shaped biome disk.
+        const biomeMountain = biome === 0
+          ? clamp01(alpineProminence * 0.58 + alpineSlope * 0.74 + broadProminence * 0.16)
+          : biome === 1
+            ? clamp01(alpineProminence * 0.18 + alpineSlope * 0.62 + broadProminence * 0.16)
+            : biome === 2
+              ? clamp01(tundraElevation * 0.12 + tundraSlope * 0.52 + broadProminence * 0.12)
+              : biome === 3 || biome === 4 || biome === 15 || biome === 17 || biome === 18 || biome === 20
+                ? clamp01(woodlandSlope * 0.72 + broadProminence * 0.18)
+                : biome === 5 || biome === 19
+                  ? clamp01(woodlandSlope * 0.78 + broadProminence * 0.2)
+                  // Desert hamada reads as broken rock on its slopes.
+                  : biome === 16
+                    ? clamp01(alpineProminence * 0.12 + alpineSlope * 0.62 + broadProminence * 0.16)
+                    : 0;
+        // The hatch/ridge layer follows the physical heightmap across every
+        // land biome. There is deliberately no highland/elevation gate here:
+        // elevation only changes the strength of a local face, while slope and
+        // relief decide whether that face gets broken rock and linework. This
+        // keeps steep lowland cliffs eligible and removes the circular mountain
+        // cutoff from the surrounding grassland.
+        const leftElevation = faceElevation[rowOffset + columnLeft[x]];
+        const rightElevation = faceElevation[rowOffset + columnRight[x]];
+        const upElevation = faceElevation[rowAboveOffset + x];
+        const downElevation = faceElevation[rowBelowOffset + x];
+        const gradientX = (rightElevation - leftElevation) / gradientDxDenominator;
+        const gradientY = (downElevation - upElevation) / gradientDyDenominator;
+        const heightmapGradient = Math.sqrt(gradientX * gradientX + gradientY * gradientY);
+        const heightmapSlopeDeg = Math.atan(heightmapGradient) * 180 / Math.PI;
+        const heightmapSteepness = clamp01((heightmapSlopeDeg - 5) / 34);
+        const heightmapProminence = clamp01(
+          (localElevation[i] - broadElevation[i]) / localProminenceDenominator,
+        );
+        const steepRidge = clamp01((heightmapSlopeDeg - 18) / 27);
+        // Local feature strength is independent of biome and absolute altitude.
+        // It keeps real folds eligible in foothills while remaining quiet on
+        // broad flat ground. The curvature term uses physical cell spacing,
+        // rather than the DEM's global elevation range.
+        const localTraceCenter = traceElevation[i];
+        const localCurvatureX = (
+          traceElevation[rowOffset + columnRight[x]]
+          + traceElevation[rowOffset + columnLeft[x]]
+          - 2 * localTraceCenter
+        )
+          / curvatureDxDenominator;
+        const localCurvatureY = (
+          traceElevation[rowBelowOffset + x]
+          + traceElevation[rowAboveOffset + x]
+          - 2 * localTraceCenter
+        )
+          / curvatureDyDenominator;
+        const localCurvatureSignal = clamp01(
+          Math.abs(localCurvatureX + localCurvatureY)
+            * physicalFeatureScale * 5,
+        );
+        lineworkFeatureStrength[i] = clamp01(Math.max(
+          heightmapSteepness * 0.78,
+          localCurvatureSignal * 0.82,
+        ));
+        // A chain may bridge a short raster gap only when the terrain between
+        // its endpoints still behaves like a crest or saddle. Positive local
+        // relief (TPI in the regional field) and the negative Laplacian branch
+        // (the DEM's convex/crest sign) provide that support without treating
+        // a steep valley wall as a summit merely because it has high slope.
+        const localReliefScale = Math.max(
           24,
           regionalReliefMagnitude[i] * 0.68,
           physicalFeatureScale * 1.8,
         );
-        const prominence = clamp01((crestZ - regionalElevation[i]) / localProminenceScale);
-        const maxCrossingCorrection = Math.max(0.65, radius * 0.9);
-        // Most Hessian cells are rejected here. Delay the three extra
-        // candidate/cross-ridge samples until both correction distance and
-        // broad prominence already prove that a crest is plausible.
-        if (displacement > maxCrossingCorrection
-          || prominence <= prominenceSupportThreshold) continue;
-        // Evaluate the actual zero-crossing instead of accepting a Hessian
-        // sample solely because its curvature is strong. Both neighbouring
-        // faces must fall away from that crossing; this is the geometric
-        // signature shared by lit and shadowed sides of a summit.
-        let candidateX = x + displacementX;
-        let candidateY = y + displacementY;
-        const candidateZ = crestSample(candidateX, candidateY);
-        const crossProbe = Math.max(1, radius * 0.85);
-        const crossPlus = crestSample(candidateX + ux * crossProbe, candidateY + uy * crossProbe);
-        const crossMinus = crestSample(candidateX - ux * crossProbe, candidateY - uy * crossProbe);
-        const crossRelief = Math.min(candidateZ - crossPlus, candidateZ - crossMinus);
-        const crossSupport = clamp01(crossRelief / localProminenceScale);
-        if (crossRelief > Math.max(0.25, crestReliefThreshold * 0.25)) {
-          // Lower spurs are rounded by the broad crest field, so their Hessian
-          // centre lies mid-shoulder. Move those lines onto the brink where
-          // the finer face field breaks into its steeper falloff.
-          if (prominence < lowerCrestBrinkProminence) {
-            const brink = findCrestBrink(candidateX, candidateY, ux, uy, localProminenceScale);
-            if (brink) { candidateX = brink.x; candidateY = brink.y; }
+        const crestReliefSignal = clamp01(
+          (geometryElevation[i] - regionalElevation[i] + localReliefScale * 0.02)
+            / Math.max(1, localReliefScale * 0.14),
+        );
+        const convexSignal = clamp01(
+          -(localCurvatureX + localCurvatureY)
+            * physicalFeatureScale * 5,
+        );
+        crestSupportCoverage[i] = lineworkFeatureStrength[i] >= 0.08
+          && Math.max(crestReliefSignal, convexSignal) >= 0.12 ? 255 : 0;
+        // Low-frequency terrain noise breaks the material into patches while
+        // remaining anchored to world coordinates for tiled exports. It changes
+        // the amount of exposed rock; it never turns a flat cell into a ridge.
+        const patchNoise = clamp01(
+          0.5 + 0.5 * noise.noise2D(noiseX46[x], noiseY46[y]),
+        );
+        const patchFactor = 0.72 + patchNoise * 0.5;
+        const heightmapRidge = clamp01(
+          heightmapSteepness * 0.74
+            + heightmapProminence * (0.2 + localElevationNormalized * 0.18)
+            + steepRidge * 0.16,
+        );
+        const terrainRidge = clamp01(heightmapRidge * patchFactor);
+        const mountain = clamp01(Math.max(biomeMountain * patchFactor, terrainRidge));
+        coverage[i] = Math.round(mountain * 255);
+        if (mountain) {
+          const grain = noise.noise2D(noiseX19[x], noiseY19[y]);
+          wash[i] = grain * 0.55
+            + noise.noise2D(noiseX53[x], noiseY53[y]) * 0.45;
+          const upperSlopeEligibility = clamp01((normalizedElevation[i] - 0.48) / 0.28);
+          const cold = clamp01(
+            (5 - dem.temperatureC[i]) / 8 + upperSlopeEligibility * 0.32 + grain * 0.05,
+          );
+          const z = sample(x, y);
+          // Snow persists in cold accumulation areas but sheds from steep cliffs.
+          // Shelter is derived from broad curvature rather than pixel noise so a
+          // gully can carry one connected blanket while a convex rock rib stays
+          // exposed. The physical field remains deliberately generous; the
+          // illustration stage applies the final projected drift edge.
+          const retention = 1 - clamp01((slopes[i] - 38) / 27);
+          const curvatureRadius = 6 * scale;
+          const curvature = (
+            sample(x - curvatureRadius, y) + sample(x + curvatureRadius, y)
+            + sample(x, y - curvatureRadius) + sample(x, y + curvatureRadius)
+            - 4 * z
+          ) / Math.max(1, (dem.maxElevationM - dem.minElevationM) * 0.018);
+          const shelter = clamp01(0.5 + curvature * 0.75);
+          const broadRetention = 0.9 + shelter * 0.1;
+          const exposedRib = clamp01((slopes[i] - 24) / 38) * (1 - shelter * 0.55);
+          snow[i] = clamp01(
+            (biome === 0 ? Math.max(0.85, cold) : cold)
+              * retention
+              * broadRetention
+              * (1 - exposedRib * 0.22),
+          );
+        }
+
+        // Trace the range-scale summit spine, rather than the small convex
+        // folds running down its faces. Snow and hatches retain their fine field.
+        const crestZ = broadElevation[i];
+        const l = sampleFixedCrest(crestXMinus, crestYCenter, x, y);
+        const r = sampleFixedCrest(crestXPlus, crestYCenter, x, y);
+        const u = sampleFixedCrest(crestXCenter, crestYMinus, x, y);
+        const d = sampleFixedCrest(crestXCenter, crestYPlus, x, y);
+        const gx = (r - l) * 0.5 * inverseRadius;
+        const gy = (d - u) * 0.5 * inverseRadius;
+        const xx = (r + l - 2 * crestZ) * inverseRadiusSquared;
+        const yy = (d + u - 2 * crestZ) * inverseRadiusSquared;
+        const xy = (
+          sampleFixedCrest(crestXPlus, crestYPlus, x, y)
+          - sampleFixedCrest(crestXPlus, crestYMinus, x, y)
+          - sampleFixedCrest(crestXMinus, crestYPlus, x, y)
+          + sampleFixedCrest(crestXMinus, crestYMinus, x, y)
+        ) * hessianCrossScale;
+        // Most concave Hessian axis crosses a crest. Distance to its derivative
+        // zero gives a narrow ridge, even when the ridge climbs toward a peak.
+        const eigenvalue = (xx + yy - Math.sqrt((xx - yy) * (xx - yy) + (2 * xy) * (2 * xy))) / 2;
+        let ux = xy, uy = eigenvalue - xx;
+        const norm = Math.sqrt(ux * ux + uy * uy);
+        if (norm > 1e-8) { ux /= norm; uy /= norm; }
+        else { ux = xx <= yy ? 1 : 0; uy = xx <= yy ? 0 : 1; }
+        const relief = -eigenvalue * radius * radius;
+        // A main crest must stand above its surroundings. Steepness alone
+        // otherwise promotes downhill ribs to the same pen as summit chains.
+        const localReliefSupport = clamp01((relief - crestReliefThreshold) / 8);
+        if (relief > crestReliefThreshold) {
+          const displacementAlongAxis = (gx * ux + gy * uy) / Math.max(1e-8, -eigenvalue);
+          const displacementX = ux * displacementAlongAxis;
+          const displacementY = uy * displacementAlongAxis;
+          // The Hessian eigenvector is normalized above, so the displacement
+          // vector has exactly the scalar length used to construct it. Avoid a
+          // second norm and a second normalization in the candidate hot path.
+          const displacement = Math.abs(displacementAlongAxis);
+          const nx = ux;
+          const ny = uy;
+          const localProminenceScale = Math.max(
+            24,
+            regionalReliefMagnitude[i] * 0.68,
+            physicalFeatureScale * 1.8,
+          );
+          const prominence = clamp01((crestZ - regionalElevation[i]) / localProminenceScale);
+          const maxCrossingCorrection = Math.max(0.65, radius * 0.9);
+          // Most Hessian cells are rejected here. Delay the three extra
+          // candidate/cross-ridge samples until both correction distance and
+          // broad prominence already prove that a crest is plausible.
+          if (displacement > maxCrossingCorrection
+            || prominence <= prominenceSupportThreshold) continue;
+          // Evaluate the actual zero-crossing instead of accepting a Hessian
+          // sample solely because its curvature is strong. Both neighbouring
+          // faces must fall away from that crossing; this is the geometric
+          // signature shared by lit and shadowed sides of a summit.
+          let candidateX = x + displacementX;
+          let candidateY = y + displacementY;
+          const candidateZ = crestSample(candidateX, candidateY);
+          const crossProbe = Math.max(1, radius * 0.85);
+          const crossPlus = crestSample(candidateX + ux * crossProbe, candidateY + uy * crossProbe);
+          const crossMinus = crestSample(candidateX - ux * crossProbe, candidateY - uy * crossProbe);
+          const crossRelief = Math.min(candidateZ - crossPlus, candidateZ - crossMinus);
+          const crossSupport = clamp01(crossRelief / localProminenceScale);
+          if (crossRelief > Math.max(0.25, crestReliefThreshold * 0.25)) {
+            // Lower spurs are rounded by the broad crest field, so their Hessian
+            // centre lies mid-shoulder. Move those lines onto the brink where
+            // the finer face field breaks into its steeper falloff.
+            if (prominence < lowerCrestBrinkProminence) {
+              const brink = findCrestBrink(candidateX, candidateY, ux, uy, localProminenceScale);
+              if (brink) { candidateX = brink.x; candidateY = brink.y; }
+            }
+            crests.push({ x: candidateX, y: candidateY,
+              nx, ny,
+              strength: clamp01(localReliefSupport * 0.3 + prominence * 0.5 + crossSupport * 0.2),
+              prominence,
+              crossRelief });
+            const candidateIndex = Math.round(candidateY) * width + Math.round(candidateX);
+            if (candidateIndex >= 0 && candidateIndex < crestSupportCoverage.length
+              && lineworkCoverage[candidateIndex]) crestSupportCoverage[candidateIndex] = 255;
           }
-          crests.push({ x: candidateX, y: candidateY,
-            nx, ny,
-            strength: clamp01(localReliefSupport * 0.3 + prominence * 0.5 + crossSupport * 0.2),
-            prominence,
-            crossRelief });
-          const candidateIndex = Math.round(candidateY) * width + Math.round(candidateX);
-          if (candidateIndex >= 0 && candidateIndex < crestSupportCoverage.length
-            && lineworkCoverage[candidateIndex]) crestSupportCoverage[candidateIndex] = 255;
         }
       }
     }
-  }
 
-  // Accumulation forms connected snowfields; microscopic slope changes must
-  // not punch separate white flecks and black contour loops into each face.
-  snow = smoothMountainField(snow, width, height, 7 * scale);
-  for (let i = 0; i < snow.length; i++) {
-    // Preserve the climate/slope eligibility while keeping partial eligibility
-    // as one broad cartographic mass instead of erasing it at a hard 0.2
-    // threshold. The illustration stage still shapes the final edge.
-    const amount = clamp01((snow[i] - 0.04) / 0.3);
-    snow[i] = coverage[i] ? amount * amount * (3 - 2 * amount) : 0;
-  }
+    // Accumulation forms connected snowfields; microscopic slope changes must
+    // not punch separate white flecks and black contour loops into each face.
+    snow = smoothMountainField(snow, width, height, 7 * scale);
+    for (let i = 0; i < snow.length; i++) {
+      // Preserve the climate/slope eligibility while keeping partial eligibility
+      // as one broad cartographic mass instead of erasing it at a hard 0.2
+      // threshold. The illustration stage still shapes the final edge.
+      const amount = clamp01((snow[i] - 0.04) / 0.3);
+      snow[i] = coverage[i] ? amount * amount * (3 - 2 * amount) : 0;
+    }
 
+    const contourConnectStop = profiler?.begin('mountain pattern crest contour linking');
+    const ridgeSegments = connectMountainContours(
+      crests, width, height, 9 * scale, crestSupportCoverage, lineworkCoverage,
+    );
+    contourConnectStop?.();
+    const ridgeChainStop = profiler?.begin('mountain pattern ridge chain joining');
+    // Contour detection can leave a few pixel gaps at a sharp saddle. Join only
+    // facing endpoints, but allow enough room for one complete ink stroke.
+    const rawChainStop = profiler?.begin('mountain pattern ridge segment chaining');
+    const rawRidgeChains = chainMountainSegments(ridgeSegments);
+    rawChainStop?.();
+    const chainJoinStop = profiler?.begin('mountain pattern ridge endpoint joining');
+    const ridgeChains = joinMountainChains(
+      rawRidgeChains, 22 * scale, ox, oy,
+      crestSupportCoverage, width, height,
+    );
+    chainJoinStop?.();
+    // The Hessian finds every small local fold. Only retain substantial chains
+    // as structural crests; using every local sample as a distance seed makes
+    // the lower face look uniformly hairy instead of concentrating marks at the
+    // principal creases.
+    const ridgeSpanScale = 1 / Math.sqrt(Math.max(0.25, ridgeDensity));
+    const structuralCandidates = ridgeChains.filter(points => {
+      if (ridgeDensity <= 0) return false;
+      if (points.length < 10) return false;
+      let span = 0;
+      for (let i = 1; i < points.length; i++) span += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+      const first = points[0], last = points[points.length - 1];
+      const closedLoop = Math.hypot(last.x - first.x, last.y - first.y) < 4 * scale;
+      const endSpan = Math.hypot(last.x - first.x, last.y - first.y);
+      return span >= 60 * scale * ridgeSpanScale && endSpan >= 24 * scale * ridgeSpanScale
+        && span / Math.max(endSpan, 1) < 4.2
+        && !(closedLoop && span < 72 * scale * ridgeSpanScale);
+    });
+    ridgeChainStop?.();
+    const ridgeSelectStop = profiler?.begin('mountain pattern structural ridge selection');
+    const structuralRidgeChains = selectStructuralRidgeChains(structuralCandidates, scale, ridgeDensity);
+    ridgeSelectStop?.();
+    crestDetectionStop?.();
+    return {
+      coverage, lineworkCoverage, snow, wash, crests, structuralRidgeChains,
+      ridgeSegmentCount: ridgeSegments.length,
+      ridgeChainCount: ridgeChains.length,
+    };
+  });
+  profiler?.recordCache(
+    'mountain pattern crest network',
+    Boolean(fieldSession) && fieldSession!.misses === crestNetworkMissesBefore,
+  );
+  const { coverage, lineworkCoverage, snow, wash, crests, structuralRidgeChains } = crestNetwork;
+  profiler?.recordMetric('mountain pattern crest points', crests.length, 'count');
+  profiler?.recordMetric('mountain pattern ridge segments', crestNetwork.ridgeSegmentCount, 'count');
+  profiler?.recordMetric('mountain pattern ridge chains', crestNetwork.ridgeChainCount, 'count');
+  profiler?.recordMetric(
+    'mountain pattern structural ridge chains',
+    structuralRidgeChains.length,
+    'count',
+  );
   // Rasterize ridge tangents through the same pressure/tooth brush as water
   // outlines. Coverage must be complete before any brush crosses a neighbour.
   const outline = (a: MountainLinePoint, b: MountainLinePoint, snowBoundary: boolean) => {
@@ -1409,53 +1509,6 @@ export function renderMountainPatternOverlay(
       ox, oy, stride, (a.strength + b.strength) * 0.5 * opacity
         * (snowBoundary ? 1 : 1 - sampleScalarField(snow, width, height, x, y) * 0.72), drySkip * 0.3);
   };
-  const contourConnectStop = profiler?.begin('mountain pattern crest contour linking');
-  const ridgeSegments = connectMountainContours(
-    crests, width, height, 9 * scale, crestSupportCoverage, lineworkCoverage,
-  );
-  contourConnectStop?.();
-  const ridgeChainStop = profiler?.begin('mountain pattern ridge chain joining');
-  // Contour detection can leave a few pixel gaps at a sharp saddle. Join only
-  // facing endpoints, but allow enough room for one complete ink stroke.
-  const rawChainStop = profiler?.begin('mountain pattern ridge segment chaining');
-  const rawRidgeChains = chainMountainSegments(ridgeSegments);
-  rawChainStop?.();
-  const chainJoinStop = profiler?.begin('mountain pattern ridge endpoint joining');
-  const ridgeChains = joinMountainChains(
-    rawRidgeChains, 22 * scale, ox, oy,
-    crestSupportCoverage, width, height,
-  );
-  chainJoinStop?.();
-  // The Hessian finds every small local fold. Only retain substantial chains
-  // as structural crests; using every local sample as a distance seed makes
-  // the lower face look uniformly hairy instead of concentrating marks at the
-  // principal creases.
-  const ridgeSpanScale = 1 / Math.sqrt(Math.max(0.25, ridgeDensity));
-  const structuralCandidates = ridgeChains.filter(points => {
-    if (ridgeDensity <= 0) return false;
-    if (points.length < 10) return false;
-    let span = 0;
-    for (let i = 1; i < points.length; i++) span += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
-    const first = points[0], last = points[points.length - 1];
-    const closedLoop = Math.hypot(last.x - first.x, last.y - first.y) < 4 * scale;
-    const endSpan = Math.hypot(last.x - first.x, last.y - first.y);
-    return span >= 60 * scale * ridgeSpanScale && endSpan >= 24 * scale * ridgeSpanScale
-      && span / Math.max(endSpan, 1) < 4.2
-      && !(closedLoop && span < 72 * scale * ridgeSpanScale);
-  });
-  ridgeChainStop?.();
-  const ridgeSelectStop = profiler?.begin('mountain pattern structural ridge selection');
-  const structuralRidgeChains = selectStructuralRidgeChains(structuralCandidates, scale, ridgeDensity);
-  ridgeSelectStop?.();
-  profiler?.recordMetric('mountain pattern crest points', crests.length, 'count');
-  profiler?.recordMetric('mountain pattern ridge segments', ridgeSegments.length, 'count');
-  profiler?.recordMetric('mountain pattern ridge chains', ridgeChains.length, 'count');
-  profiler?.recordMetric(
-    'mountain pattern structural ridge chains',
-    structuralRidgeChains.length,
-    'count',
-  );
-  crestDetectionStop?.();
   const strokeTracingStop = profiler?.begin('mountain pattern stroke tracing and rasterization');
   const ridgeOutlineStop = profiler?.begin('mountain pattern ridge outline setup');
   for (const points of structuralRidgeChains) {
@@ -1897,7 +1950,7 @@ export function renderMountainPatternOverlay(
   profiler?.recordMetric('mountain pattern generated paths', paths.length, 'count');
   strokeTracingStop?.();
   const primaryRidgePaths = paths.filter(path => path.kind === 'ridge' && path.primary);
-  const surfaceElevation = Float32Array.from(
+  const surfaceElevation = mapToFloat32(
     elevation,
     value => value + geometryDatumOffset,
   );

@@ -19,6 +19,7 @@ import {
   chainMountainSegments,
   cachedMountainField,
   createMountainFieldCacheSession,
+  mapToFloat32,
   type MountainFieldCache,
   type MountainFieldCacheSession,
   type MountainPatternOverlay,
@@ -621,7 +622,7 @@ export function prepareMountainIllustrationFieldsCpuFromInputs(
     radii,
   } = inputs;
   const normalized = (source: ArrayLike<number>): Float32Array =>
-    Float32Array.from(source, value => value / 255);
+    mapToFloat32(source, value => value / 255);
   return {
     width,
     height,

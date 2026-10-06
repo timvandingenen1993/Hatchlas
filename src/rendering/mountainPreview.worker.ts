@@ -37,7 +37,10 @@ import {
   createMountainIllustrationFieldBackend,
   type MountainIllustrationFieldBackend,
 } from "./mountainIllustrationGpuExperiment";
-import { MOUNTAIN_ILLUSTRATION_PALETTE } from "./mountainIllustrationRenderer";
+import {
+  MOUNTAIN_ILLUSTRATION_PALETTE,
+  type MountainWindFields,
+} from "./mountainIllustrationRenderer";
 import { MountainFieldGpuCancelledError } from "./mountainFieldGpu";
 import {
   compareMountainGpuImages,
@@ -50,7 +53,10 @@ import {
   getMountainIllustrationFieldDependencySignature,
   getMountainIllustrationPreparedFieldsByteLength,
 } from "./mountainIllustrationFields";
-import { createMountainFieldCache } from "./mountainPatternRenderer";
+import {
+  createMountainFieldCache,
+  getMountainFieldFingerprint,
+} from "./mountainPatternRenderer";
 import { buildVisualWaterSurfaceDEM } from "./waterRenderer";
 import type {
   VegetationMotifAsset,
@@ -124,6 +130,18 @@ let layerWorkerPool: MountainLayerWorkerPool | null = null;
 const PREVIEW_LAYER_POOL_OPTIONS = { maxWorkers: 3, maxCpuBytes: 1024 * 1024 * 1024 };
 let retainedPreparedCache: MountainRenderStageCache | null = null;
 const CPU_PREPARED_FIELD_CACHE_BUDGET = 128 * 1024 * 1024;
+// Wind fields depend only on the render DEM's elevation grid and the wind
+// direction, but are requested whenever the mountain illustration misses its
+// cache (a colour or snow edit, for example). Keep the last result.
+let previewWindFields: {
+  elevation: Float32Array;
+  elevationFingerprint: number;
+  dxMeters: number;
+  dyMeters: number;
+  windAzimuthDeg: number;
+  gpuMode: MountainGpuRenderMode;
+  fields: MountainWindFields;
+} | null = null;
 let vegetationMotifs: VegetationMotifAsset[] | null = null;
 let rasterProps: VegetationRasterPropAsset[] | null = null;
 let previousProfileAnalysisSettings: Record<string, unknown> | undefined;
@@ -311,6 +329,26 @@ function postBackendStatus(
     backend,
     ...(reason ? { reason } : {}),
   });
+}
+
+function cachedPreviewWindFields(
+  renderDem: MountainDEMData,
+  windAzimuthDeg: number,
+  gpuMode: MountainGpuRenderMode,
+): MountainWindFields | undefined {
+  const cached = previewWindFields;
+  if (
+    !cached
+    || cached.elevation !== renderDem.elevation
+    || cached.dxMeters !== renderDem.dxMeters
+    || cached.dyMeters !== renderDem.dyMeters
+    || cached.windAzimuthDeg !== windAzimuthDeg
+    || cached.gpuMode !== gpuMode
+  ) return undefined;
+  // Identity alone would miss an in-place edit; the fingerprint is ~2 ms.
+  return getMountainFieldFingerprint(renderDem.elevation) === cached.elevationFingerprint
+    ? cached.fields
+    : undefined;
 }
 
 function fail(requestId: number, error: unknown): void {
@@ -1581,11 +1619,21 @@ const renderCoordinator = new LatestRequestCoordinator<
         throw error;
       }
     }
-    if (
+    const windAzimuthDeg = options.windAzimuthDeg ?? 225;
+    const cachedWind = !stageInputs.illustrationCacheHit
+      && !options.snowTransportOverride
+      && !options.windFieldsOverride
+      ? cachedPreviewWindFields(renderDem, windAzimuthDeg, gpuMode)
+      : undefined;
+    if (cachedWind) {
+      options = { ...options, windFieldsOverride: cachedWind };
+      profiler?.recordCache("mountain wind fields", true);
+    } else if (
       !stageInputs.illustrationCacheHit
       && !options.snowTransportOverride
       && !options.windFieldsOverride
     ) {
+      profiler?.recordCache("mountain wind fields", false);
       // Wind uses the same persistent GPU owner as support-field preparation,
       // so it is queued behind that work. Start it before waiting for the
       // independent water/vegetation helper; the helper's CPU work can then
@@ -1604,7 +1652,7 @@ const renderCoordinator = new LatestRequestCoordinator<
             elevation: renderDem.elevation,
             dxMeters: renderDem.dxMeters,
             dyMeters: renderDem.dyMeters,
-            windAzimuthDeg: options.windAzimuthDeg ?? 225,
+            windAzimuthDeg,
           },
           {
             isCancelled: execution.cancelled,
@@ -1627,7 +1675,7 @@ const renderCoordinator = new LatestRequestCoordinator<
         }))
         : mountainFieldBackend!.prepareWindFields(
           renderDem,
-          options.windAzimuthDeg ?? 225,
+          windAzimuthDeg,
           {
             isCancelled: execution.cancelled,
             checkpoint: () => execution.checkpoint(true),
@@ -1653,6 +1701,15 @@ const renderCoordinator = new LatestRequestCoordinator<
         return;
       }
       options = { ...options, windFieldsOverride: windResult.fields };
+      previewWindFields = {
+        elevation: renderDem.elevation,
+        elevationFingerprint: getMountainFieldFingerprint(renderDem.elevation),
+        dxMeters: renderDem.dxMeters,
+        dyMeters: renderDem.dyMeters,
+        windAzimuthDeg: options.windAzimuthDeg ?? 225,
+        gpuMode,
+        fields: windResult.fields,
+      };
       postBackendStatus(
         request.requestId,
         windResult.report.backend,
@@ -2053,6 +2110,7 @@ self.onmessage = (event: MessageEvent<MountainPreviewRequest>) => {
         renderCache = createMountainRenderStageCache();
         draftRenderCache = createMountainRenderStageCache();
         retainedPreparedCache = null;
+        previewWindFields = null;
         return;
       case "assets":
         if (request.vegetationMotifs !== undefined)
