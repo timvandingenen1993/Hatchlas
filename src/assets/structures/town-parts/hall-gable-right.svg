@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="187.79" height="172.2" viewBox="0 0 62.6 57.4" data-footprint="3 3" data-origin="31.3 25.2" fill="none" stroke="#2a1e16" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round">
+<defs><filter id="hand" x="-4%" y="-4%" width="108%" height="108%"><feTurbulence type="fractalNoise" baseFrequency="0.07" numOctaves="2" seed="4" result="warp"/><feDisplacementMap in="SourceGraphic" in2="warp" scale="1.3" xChannelSelector="R" yChannelSelector="G" result="wobble"/><feTurbulence type="fractalNoise" baseFrequency="1.2" numOctaves="2" seed="9" result="grain"/><feColorMatrix in="grain" type="matrix" values="0 0 0 0 0.16 0 0 0 0 0.11 0 0 0 0 0.07 2.2 0 0 0 -1.18" result="specks"/><feComposite in="specks" in2="wobble" operator="in" result="speckled"/><feMerge><feMergeNode in="wobble"/><feMergeNode in="speckled"/></feMerge></filter></defs>
+<g class="part" filter="url(#hand)">
+<path data-layer="back roof" class="roof-shade" fill="#7b5e45" d="M16.58 2.2L46.02 19.2L60.4 26.95L30.95 9.95Z"/>
+<path data-layer="chimney" fill="#b9a684" d="M46.02 27.5L42.56 29.5L42.56 11L46.02 9Z"/>
+<path data-layer="chimney" fill="#e4d8bd" d="M42.56 29.5L39.44 27.7L39.44 9.2L42.56 11Z"/>
+<path data-layer="chimney" fill="#ddd0b3" d="M42.9 7.2L46.02 9L42.56 11L39.44 9.2Z"/>
+<path data-layer="walls" fill="#ece1c9" d="M5.32 40.2L31.3 55.2L31.3 40.2L5.32 25.2Z"/>
+<path data-layer="walls" fill="#c4b393" d="M57.28 40.2L31.3 55.2L31.3 40.2L44.29 18.2L57.28 25.2Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M7.7 37.08L9.43 38.08L9.43 34.68L7.7 33.68Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M14.19 40.83L15.93 41.83L15.93 38.42L14.19 37.43Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M27.18 48.33L28.92 49.33L28.92 45.93L27.18 44.93Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M45.15 42.7L43.42 43.7L43.42 40.3L45.15 39.3Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M44.98 29.11L43.6 29.91L43.6 27.51L44.98 26.71Z"/>
+<path data-layer="door" fill="#2a1e16" d="M20 48.68L20 43.28L20.12 42.65L20.45 42.27L20.96 42.17L21.56 42.38L22.15 42.86L22.66 43.54L23 44.32L23.11 45.08L23.11 50.48Z"/>
+<path data-layer="eaves" class="roof-shade" fill="#7b5e45" d="M46.02 19.2L60.4 26.95L60.4 27.95L46.02 20.2Z"/>
+<path data-layer="eaves" class="roof-shade" fill="#7b5e45" d="M46.02 19.2L31.64 43.55L31.64 44.55L46.02 20.2Z"/>
+<path data-layer="eaves" class="roof-shade" fill="#7b5e45" d="M2.2 26.55L31.64 43.55L31.64 44.55L2.2 27.55Z"/>
+<path data-layer="roof" class="roof-lit" fill="#a07f5f" d="M16.58 2.2L46.02 19.2L31.64 43.55L2.2 26.55Z"/>
+<path data-layer="roof lines" d="M18.71 8.01L8.78 24.83"/>
+<path data-layer="roof lines" d="M22.39 11.14L12.44 27.99"/>
+<path data-layer="roof lines" d="M26.3 15.02L16.34 31.89"/>
+<path data-layer="roof lines" d="M31.33 15.6L21.63 32.03"/>
+<path data-layer="roof lines" d="M34.7 19.9L25 36.33"/>
+<path data-layer="roof lines" d="M39.54 20.91L29.27 38.31"/>
+</g>
+</svg>

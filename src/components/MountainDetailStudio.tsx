@@ -49,9 +49,15 @@ import {
 } from "../rendering/forestCanvasRenderer";
 import { ForestRenderControls } from "./ForestRenderControls";
 import { NumericControl } from "./NumericControl";
+import { StructuresPanel } from "./StructuresPanel";
+import { StructuresOverlay } from "./StructuresOverlay";
+import { useStructuresEditor, type RoutingWaterSurface, type ScreenProjector } from "../structures/useStructuresEditor";
+import { screenToSource, sourceToScreen, type CameraGrid } from "../structures/viewProjection";
+import type { VegetationCoverGrid } from "../structures/roadRouting";
+import { TOWN_REFERENCE_FRAME_WIDTH } from "../structures/townStamp";
 import { PreviewStatus, type PreviewStatusValue } from "./PreviewStatus";
 import { InspectorColor, InspectorFold, InspectorNote, InspectorSection, InspectorSeed, InspectorSelect, InspectorToggle } from "./InspectorParts";
-import { Check, ChevronDown, Crop, Download, Hand, Minus, PanelRightClose, PanelRightOpen, Plus, RotateCcw, Ruler, X } from "lucide-react";
+import { Castle, Check, ChevronDown, Crop, Download, Hand, Minus, MousePointer2, PanelRightClose, PanelRightOpen, Plus, RotateCcw, Route, Ruler, X } from "lucide-react";
 import {
   propStandStyleForBiome,
   rasterPropSettingsForBiome,
@@ -236,9 +242,12 @@ const PRIMARY_VIEWS = [
   ["biomes", "Biomes"],
 ] as const satisfies readonly (readonly [MountainDetailLayer, string])[];
 const TOOLS = [
+  { id: "select", label: "Select and move", key: "V", Icon: MousePointer2 },
   { id: "pan", label: "Pan", key: "H", Icon: Hand },
   { id: "profile", label: "Elevation profile", key: "P", Icon: Ruler },
   { id: "region", label: "Export region", key: "R", Icon: Crop },
+  { id: "road", label: "Draw road", key: "D", Icon: Route },
+  { id: "town", label: "Place town", key: "T", Icon: Castle },
 ] as const;
 
 const PERSISTED_MOUNTAIN_LAYERS: readonly MountainDetailLayer[] = [
@@ -612,7 +621,7 @@ export function MountainDetailStudio({
   }, [onMountainBackendStatusChange]);
 
   // Active 2D Cartographic Layer & Palette
-  const [inspectorTab, setInspectorTab] = useState<"Terrain" | "Ink" | "Water" | "Lighting">("Ink");
+  const [inspectorTab, setInspectorTab] = useState<"Terrain" | "Ink" | "Water" | "Lighting" | "Structures">("Terrain");
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
   const [activeLayer, setActiveLayer] =
@@ -936,15 +945,48 @@ export function MountainDetailStudio({
 
   // Interactive Tools State: Inspect vs Profile Cross-Section vs Rain Dropper vs Epicenter vs Pan
   const [activeTool, setActiveTool] = useState<
-    "profile" | "epicenter" | "pan" | "region"
+    "profile" | "epicenter" | "pan" | "region" | "road" | "town" | "select"
   >("pan");
+  // Structure tools bring up their tab so the selected road or town is editable.
+  const selectTool = (tool: typeof activeTool) => {
+    setActiveTool(tool);
+    if (tool === "road" || tool === "town" || tool === "select") setInspectorTab("Structures");
+  };
+  // Roads and towns. Clicks map onto the displayed terrain through the
+  // camera grid sent with each frame (none in the top-down view).
+  const [cameraGrid, setCameraGrid] = useState<CameraGrid | null>(null);
+  // Roads cross the water the viewport shows, including wetland pools that
+  // only the preview worker generates.
+  const [routingWater, setRoutingWater] = useState<RoutingWaterSurface | null>(null);
+  // Placed forest and shrub stands, published by the preview when they change.
+  const [vegetationCover, setVegetationCover] = useState<VegetationCoverGrid | null>(null);
+  const structuresEditor = useStructuresEditor({
+    dem: demData,
+    analysisRevision,
+    heightmapSourceName,
+    riverThresholdKm2: previewMetadata?.riverThresholdKm2 ?? riverThresholdKm2,
+    waterSurface: routingWater,
+    vegetationCover,
+  });
+  const structureKeyDown = structuresEditor.keyDown;
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (event.ctrlKey || event.metaKey || event.altKey || target?.closest("input, select, textarea")) return;
+      if (structureKeyDown(event.key)) event.preventDefault();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [structureKeyDown]);
   const [diagnosticsMenuOpen, setDiagnosticsMenuOpen] = useState(false);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       if (event.ctrlKey || event.metaKey || event.altKey || target?.closest("input, select, textarea")) return;
       const tool = TOOLS.find(({ key }) => key === event.key.toUpperCase());
-      if (tool) setActiveTool(tool.id);
+      if (!tool) return;
+      setActiveTool(tool.id);
+      if (tool.id === "road" || tool.id === "town" || tool.id === "select") setInspectorTab("Structures");
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -979,6 +1021,17 @@ export function MountainDetailStudio({
     climateZone: string;
     heightAboveRiverM: number;
   } | null>(null);
+  // Ground length of the A → B line, computed live so it updates while dragging.
+  const profileLengthKm = (() => {
+    if (!profileA || !profileB) return null;
+    const dem = demDataRef.current;
+    const canvas = canvasRef.current;
+    const widthKm = dem?.domainWidthKm ?? domainWidthKm;
+    const heightKm = dem?.domainHeightKm
+      ?? (canvas && canvas.width > 0 ? domainWidthKm * (canvas.height / canvas.width) : domainWidthKm);
+    const lengthKm = Math.hypot((profileB.x - profileA.x) * widthKm, (profileB.y - profileA.y) * heightKm);
+    return lengthKm > 0 ? lengthKm : null;
+  })();
   const [settingsReady, setSettingsReady] = useState<boolean>(false);
   const waterSnapshotResolversRef = useRef(
     new Map<number, (value: MountainExportWaterSurface | undefined) => void>(),
@@ -1070,6 +1123,8 @@ export function MountainDetailStudio({
             } else if (response.imageData) {
               context.putImageData(response.imageData, 0, 0);
             }
+            setCameraGrid(response.cameraGrid ?? null);
+            if (response.vegetationCover) setVegetationCover(response.vegetationCover);
             setFrameVersion((version) => version + 1);
             const canvas = canvasRef.current;
             if (canvas) {
@@ -1218,8 +1273,6 @@ export function MountainDetailStudio({
           PERSISTED_MOUNTAIN_LAYERS,
         ),
       );
-      const restoredLayer = readStoredEnum(stored, "activeLayer", "vegetation_patterns", PERSISTED_MOUNTAIN_LAYERS);
-      setInspectorTab(restoredLayer === "vegetation_patterns" ? "Ink" : restoredLayer === "drainage_network" ? "Water" : "Terrain");
       setActivePalette(
         readStoredEnum(
           stored,
@@ -2369,6 +2422,7 @@ export function MountainDetailStudio({
 
     const renderOpts: MountainRenderOptions = {
       layer: activeLayer,
+      structures: structuresEditor.renderOptions,
       palette: activePalette,
       gpuRenderMode: MOUNTAIN_GPU_RENDER_MODE,
       sunAzimuthDeg,
@@ -2857,6 +2911,7 @@ export function MountainDetailStudio({
     vegetationWashShadowDistance,
     vegetationWashShadowGap,
     vegetationWashShadowGrain,
+    structuresEditor.renderOptions,
     analysisRevision,
   ]);
 
@@ -3009,8 +3064,30 @@ export function MountainDetailStudio({
     return { xRatio, yRatio, px, py };
   }
 
+  function structureProjector(): ScreenProjector {
+    const canvas = canvasRef.current;
+    const rect = canvas?.getBoundingClientRect();
+    return {
+      referenceScale: canvas && rect && canvas.width > 0
+        ? (rect.width / canvas.width) * (Math.max(canvas.width, canvas.height) / TOWN_REFERENCE_FRAME_WIDTH)
+        : 1,
+      project: (point) => {
+        if (!rect) return { x: NaN, y: NaN };
+        const screen = sourceToScreen(cameraGrid, point);
+        return { x: rect.left + screen.x * rect.width, y: rect.top + screen.y * rect.height };
+      },
+      unproject: (clientX, clientY) => rect && rect.width > 0 && rect.height > 0
+        ? screenToSource(cameraGrid, (clientX - rect.left) / rect.width, (clientY - rect.top) / rect.height)
+        : null,
+    };
+  }
+
   function handleCanvasMouseMove(e: React.MouseEvent<HTMLElement>) {
     if (!demData) return;
+    if (structuresEditor.dragging) {
+      structuresEditor.pointerMove(e.clientX, e.clientY, structureProjector());
+      return;
+    }
 
     if (isPanning) {
       const dx = e.clientX - panStartRef.current.mouseX;
@@ -3082,6 +3159,10 @@ export function MountainDetailStudio({
       return;
     }
 
+    if (activeTool === "road" || activeTool === "town" || activeTool === "select") {
+      if (e.button === 0) structuresEditor.pointerDown(activeTool, e.clientX, e.clientY, structureProjector());
+      return;
+    }
     const { xRatio, yRatio } = getCanvasRelativeCoords(e);
     if (activeTool === "region") {
       if (!exportProgress) setRegionDraft({ x0: xRatio, y0: yRatio, x1: xRatio, y1: yRatio });
@@ -3127,6 +3208,7 @@ export function MountainDetailStudio({
 
   function handleCanvasMouseUp() {
     setIsPanning(false);
+    structuresEditor.pointerUp();
     if (regionDraft) {
       setRegionDraft(null);
       // Ignore clicks; a region needs a visible drag in both directions.
@@ -3197,6 +3279,30 @@ export function MountainDetailStudio({
       worker.postMessage(request);
     });
   }
+
+  const hasStructureRoads = structuresEditor.structures.roads.length > 0;
+  useEffect(() => {
+    if (!hasStructureRoads || isLoading) return;
+    let cancelled = false;
+    void requestPreviewWaterSnapshot().then((water) => {
+      if (!cancelled && water) setRoutingWater(water);
+    });
+    return () => { cancelled = true; };
+  }, [
+    hasStructureRoads,
+    isLoading,
+    analysisRevision,
+    siltReachM,
+    siltTopRemoved,
+    showWetlandPuddleContours,
+    wetlandPuddleDensity,
+    wetlandPuddleSizeMin,
+    wetlandPuddleSizeMax,
+    wetlandPuddleCoastDistance,
+    wetlandPuddleSeed,
+    previewMetadata?.riverThresholdKm2,
+    riverThresholdKm2,
+  ]);
 
   async function handleExportImage(
     region?: { x0: number; y0: number; x1: number; y1: number },
@@ -3319,6 +3425,7 @@ export function MountainDetailStudio({
       heightmapSmoothingPasses,
       render: {
         layer: activeLayer,
+        structures: structuresEditor.renderOptions,
         palette: activePalette,
         gpuRenderMode: MOUNTAIN_GPU_RENDER_MODE,
         sunAzimuthDeg,
@@ -3493,6 +3600,9 @@ export function MountainDetailStudio({
       tileSize: 1024,
       halo: 32,
       profile: MOUNTAIN_PROFILE_ENABLED,
+      townStamps: activeLayer === "raw_heightmap" || activeLayer === "eroded_heightmap"
+        ? undefined
+        : await structuresEditor.buildTownStamps(Math.max(outputSize.width, outputSize.height)),
       filename: `mountain_detail_${activeLayer}_${activePalette}_${outputSize.width}x${outputSize.height}.png`,
       ...(regionPixels && {
         ...regionPixels,
@@ -3795,7 +3905,7 @@ export function MountainDetailStudio({
         <div className="relative flex min-h-0 flex-1">
           <nav aria-label="Tools" className="flex w-10 shrink-0 flex-col items-center gap-1 border-r border-white/5 bg-[#1b1f26] py-2">
             {TOOLS.map(({ id, label, key, Icon }) =>
-              <button type="button" key={id} onClick={() => setActiveTool(id)} aria-pressed={activeTool === id}
+              <button type="button" key={id} onClick={() => selectTool(id)} aria-pressed={activeTool === id}
                 aria-label={label} title={`${label} (${key})`}
                 className={`rounded-md p-1.5 ${activeTool === id ? "bg-sky-600 text-white" : "text-slate-400 hover:bg-white/5 hover:text-slate-100"}`}>
                 <Icon size={17} />
@@ -3928,7 +4038,7 @@ export function MountainDetailStudio({
             onMouseDown={handleCanvasMouseDown}
             onMouseMove={handleCanvasMouseMove}
             onMouseUp={handleCanvasMouseUp}
-            onMouseLeave={() => { setHoverInfo(null); setIsPanning(false); }}
+            onMouseLeave={() => { setHoverInfo(null); setIsPanning(false); structuresEditor.pointerUp(); }}
           >
             {previewError && (
               <div className="absolute top-4 right-4 z-30 flex items-center gap-2 rounded-lg border border-red-800/70 bg-slate-950/95 px-3 py-1.5 text-[11px] text-red-300 shadow-lg">
@@ -3955,7 +4065,7 @@ export function MountainDetailStudio({
               <canvas
                 ref={canvasRef}
                 className={`block max-h-[85vh] max-w-full object-contain ${
-                  activeTool === "profile" || activeTool === "region"
+                  activeTool === "profile" || activeTool === "region" || activeTool === "road" || activeTool === "town"
                     ? "cursor-crosshair"
                     : activeTool === "pan" || isPanning
                         ? "cursor-grab active:cursor-grabbing"
@@ -3965,6 +4075,12 @@ export function MountainDetailStudio({
               <canvas
                 ref={particleCanvasRef}
                 className="absolute inset-0 pointer-events-none w-full h-full object-contain"
+              />
+              <StructuresOverlay
+                editor={structuresEditor}
+                cameraGrid={cameraGrid}
+                sourceCanvasRef={canvasRef}
+                roadToolActive={activeTool === "road" || activeTool === "select"}
               />
               {regionDraft && (
                 <div
@@ -4030,6 +4146,10 @@ export function MountainDetailStudio({
             {hoverInfo.strahler > 0 && <>
               <span className="text-slate-500">River order</span>
               <span className="text-right tabular-nums text-slate-100">{hoverInfo.strahler}</span>
+            </>}
+            {profileLengthKm !== null && <>
+              <span className="text-slate-500">Profile length</span>
+              <span className="text-right tabular-nums text-sky-300">{profileLengthKm < 1 ? `${Math.round(profileLengthKm * 1000)} m` : `${profileLengthKm.toFixed(2)} km`}</span>
             </>}
           </div>
         )}
@@ -4179,7 +4299,7 @@ export function MountainDetailStudio({
       <aside aria-label="Inspector" className={`map-inspector ${inspectorOpen ? "lg:flex" : "lg:hidden"} ${mobileInspectorOpen ? "fixed inset-y-0 right-0 flex" : "hidden"} lg:static z-40 w-[min(360px,100vw)] shrink-0 flex-col border-l border-white/5 bg-[#1f232b] text-slate-200 shadow-2xl lg:w-[360px] lg:shadow-none`}>
         <div className="flex h-10 shrink-0 items-stretch gap-4 border-b border-white/5 px-4">
           <div role="tablist" aria-label="Inspector category" className="flex items-stretch gap-4">
-            {(["Terrain", "Ink", "Water", "Lighting"] as const).map((tab) =>
+            {(["Terrain", "Ink", "Water", "Lighting", "Structures"] as const).map((tab) =>
               <button type="button" role="tab" key={tab} aria-selected={inspectorTab === tab} onClick={() => setInspectorTab(tab)}
                 className={`-mb-px border-b-2 text-[12px] ${inspectorTab === tab ? "border-sky-500 text-white" : "border-transparent text-slate-400 hover:text-slate-200"}`}>{tab}</button>)}
           </div>
@@ -4517,6 +4637,10 @@ export function MountainDetailStudio({
             </>}
           </InspectorSection>
         </>}
+        {inspectorTab === "Structures" && <StructuresPanel
+          editor={structuresEditor}
+          onStartRoad={() => { selectTool("road"); structuresEditor.createRoad(); }}
+          onStartTown={() => selectTool("town")} />}
         </div>
 
         <div className="shrink-0 border-t border-white/5 px-4 py-2">

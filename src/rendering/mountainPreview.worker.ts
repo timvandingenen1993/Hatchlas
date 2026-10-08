@@ -27,6 +27,8 @@ import {
   type MountainRenderOptions,
   type MountainRenderStageCache,
 } from "./mountainDetailRenderer";
+import { buildCameraGrid } from "../structures/viewProjection";
+import type { VegetationCoverGrid } from "../structures/roadRouting";
 import {
   vegetationGeometryStageKey,
   vegetationOverlayStageKey,
@@ -305,6 +307,46 @@ function recordGpuMountainRasterEvent(
 // Coarse render stages reported to the status bar: terrain, mountain fields,
 // wind, mountain illustration, water/vegetation, compositing, finishing.
 const RENDER_STEP_COUNT = 7;
+
+const VEGETATION_COVER_LONG_EDGE = 512;
+let postedVegetationCoverKey = "";
+
+/**
+ * Coarse share of each map cell covered by placed props (forest stands,
+ * shrubs, boulders) so road routing can steer around them. Returns undefined
+ * when the props have not changed since the last frame.
+ */
+function vegetationCoverIfChanged(
+  cache: MountainRenderStageCache,
+  width: number,
+  height: number,
+): VegetationCoverGrid | undefined {
+  const rgba = cache.vegetationOverlay?.rasterPropRGBA;
+  if (!rgba || rgba.length < width * height * 4) return undefined;
+  const key = `${analysisRevision}|${cache.vegetationOverlayKey}|${width}x${height}`;
+  if (key === postedVegetationCoverKey) return undefined;
+  postedVegetationCoverKey = key;
+  const factor = Math.max(1, Math.ceil(Math.max(width, height) / VEGETATION_COVER_LONG_EDGE));
+  const coverWidth = Math.ceil(width / factor);
+  const coverHeight = Math.ceil(height / factor);
+  const data = new Uint8Array(coverWidth * coverHeight);
+  for (let cy = 0; cy < coverHeight; cy++) {
+    const y1 = Math.min(height, (cy + 1) * factor);
+    for (let cx = 0; cx < coverWidth; cx++) {
+      const x1 = Math.min(width, (cx + 1) * factor);
+      let covered = 0;
+      let count = 0;
+      for (let y = cy * factor; y < y1; y++) {
+        for (let x = cx * factor; x < x1; x++) {
+          count++;
+          if (rgba[(y * width + x) * 4 + 3] >= 96) covered++;
+        }
+      }
+      data[cy * coverWidth + cx] = Math.round((covered / Math.max(1, count)) * 255);
+    }
+  }
+  return { width: coverWidth, height: coverHeight, data };
+}
 
 function post(
   response: MountainPreviewResponse,
@@ -1951,6 +1993,16 @@ const renderCoordinator = new LatestRequestCoordinator<
     releaseOversizedPreparedFields(activeRenderCache);
   }
   if (execution.cancelled()) return;
+  // Editors map clicks onto the draped terrain through a coarse copy of the
+  // camera mesh; the top-down view needs none.
+  const cameraGrid = renderedImageData.cameraProjection
+    ? buildCameraGrid(renderedImageData.cameraProjection)
+    : undefined;
+  const vegetationCover = vegetationCoverIfChanged(activeRenderCache, renderDem.width, renderDem.height);
+  const cameraGridBuffers = [
+    ...(cameraGrid ? [cameraGrid.x.buffer, cameraGrid.y.buffer, cameraGrid.depth.buffer] : []),
+    ...(vegetationCover ? [vegetationCover.data.buffer] : []),
+  ];
   postRenderStep("Finishing frame", 7);
   let imageData = request.quality === "draft"
     ? downsamplePreviewImage(renderedImageData, 768)
@@ -2041,11 +2093,13 @@ const renderCoordinator = new LatestRequestCoordinator<
         width: imageData.width,
         height: imageData.height,
         bitmap,
+        cameraGrid,
+        vegetationCover,
         stats: { ...activeRenderCache.stats },
         elapsedMs,
         profile,
       },
-      [bitmap],
+      [bitmap, ...cameraGridBuffers],
     );
   } else {
     const profile = profiler?.finish("completed", false);
@@ -2058,10 +2112,12 @@ const renderCoordinator = new LatestRequestCoordinator<
       width: imageData.width,
       height: imageData.height,
       imageData,
+      cameraGrid,
+      vegetationCover,
       stats: { ...activeRenderCache.stats },
       elapsedMs,
       profile,
-    });
+    }, cameraGridBuffers);
   }
   } catch (error) {
     profiler?.finish("failed");

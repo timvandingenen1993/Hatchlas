@@ -14,6 +14,7 @@ import {
   renderMountainDetailDEM,
   renderMountainDetailDEMWithCache,
 } from '../src/rendering/mountainDetailRenderer';
+import { DEFAULT_ROAD_STYLE } from '../src/structures/types';
 
 function makeDem(width = 24, height = 24): MountainDEMData {
   const raw = new Float32Array(width * height);
@@ -525,5 +526,43 @@ describe('full terrain orthographic camera', () => {
     const cache = createMountainRenderStageCache();
     const cached = renderMountainDetailDEMWithCache(dem, options, cache);
     expect(Array.from(cached.data)).toEqual(Array.from(uncached.data));
+  });
+
+  it('paints roads into the camera foreground so they sit above ridge ink', () => {
+    const dem = makeDem(48, 40);
+    const options = {
+      layer: 'swiss_relief' as const,
+      palette: 'swiss_topo' as const,
+      sunAzimuthDeg: 315,
+      sunAltitudeDeg: 45,
+      verticalExaggeration: 1,
+      ambientOcclusionStrength: 0.35,
+      showRivers: false,
+      riverThresholdKm2: 100,
+      showWaterDetails: false,
+      showContours: false,
+      contourIntervalM: 100,
+      structures: {
+        roads: [{ points: [{ u: 0.1, v: 0.5 }, { u: 0.9, v: 0.5 }], kind: 'road' as const, bridges: [] }],
+        style: { ...DEFAULT_ROAD_STYLE, handDrawn: false, color: '#ff0000', widthScale: 20, clearance: 0 },
+      },
+    };
+    const roadRow = Math.round(0.5 * (40 - 1));
+    const flat = renderMountainDetailDEM(dem, options);
+    // Without a camera the road is part of the map itself.
+    expect(Array.from(flat.data.slice((roadRow * 48 + 24) * 4, (roadRow * 48 + 24) * 4 + 3))).toEqual([255, 0, 0]);
+    // It takes the hillshade: full color on lit ground, darker in shadow.
+    const reds = Array.from({ length: 30 }, (_, index) => flat.data[(roadRow * 48 + index + 9) * 4]);
+    expect(Math.max(...reds)).toBe(255);
+    expect(Math.min(...reds)).toBeLessThan(235);
+    const deferred = renderMountainDetailDEM(dem, {
+      ...options,
+      fullTerrainCameraElevationDeg: 75,
+      deferFullTerrainCamera: true,
+    });
+    // Under the camera it moves to the foreground layer drawn after ridges.
+    const offset = (roadRow * 48 + 24) * 4;
+    expect(Array.from(deferred.foregroundPropsRGBA!.slice(offset, offset + 4))).toEqual([255, 0, 0, 255]);
+    expect(Array.from(deferred.data.slice(offset, offset + 3))).not.toEqual([255, 0, 0]);
   });
 });

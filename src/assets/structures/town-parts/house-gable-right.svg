@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="161.85" height="146.73" viewBox="0 0 53.95 48.91" data-footprint="3 2" data-origin="22.64 21.7" fill="none" stroke="#2a1e16" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" data-edited="true">
+<defs><filter id="hand" x="-4%" y="-4%" width="108%" height="108%"><feTurbulence type="fractalNoise" baseFrequency="0.07" numOctaves="2" seed="4" result="warp"/><feDisplacementMap in="SourceGraphic" in2="warp" scale="1.3" xChannelSelector="R" yChannelSelector="G" result="wobble"/><feTurbulence type="fractalNoise" baseFrequency="1.2" numOctaves="2" seed="9" result="grain"/><feColorMatrix in="grain" type="matrix" values="0 0 0 0 0.16 0 0 0 0 0.11 0 0 0 0 0.07 2.2 0 0 0 -1.18" result="specks"/><feComposite in="specks" in2="wobble" operator="in" result="speckled"/><feMerge><feMergeNode in="wobble"/><feMergeNode in="speckled"/></feMerge></filter></defs>
+<g class="part" filter="url(#hand)">
+<path data-layer="walls" fill="#ece1c9" d="M5.32 31.7L31.3 46.7L31.3 34.2L5.32 19.2Z"/>
+<path data-layer="walls" fill="#c4b393" d="M48.62 36.7L31.3 46.7L31.3 34.2L39.96 18.2L48.62 24.2Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M9.58 31.78L11.31 32.78L11.31 29.37L9.58 28.37Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M14.56 36.47L16.29 37.47L16.43 33.19L14.63 31.91Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M25.09 40.94L26.83 41.94L26.83 38.53L25.09 37.53Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M41.95 29.27L40.57 30.07L40.57 27.67L41.95 26.87Z"/>
+<path data-layer="eaves" class="roof-shade" fill="#7b5e45" d="M41.69 19.2L51.74 26.16L51.74 27.16L41.69 20.2Z"/>
+<path data-layer="eaves" class="roof-shade" fill="#7b5e45" d="M41.69 19.2L31.64 37.76L31.64 38.76L41.69 20.2Z"/>
+<path data-layer="eaves" class="roof-shade" fill="#7b5e45" d="M2.2 20.76L31.64 37.76L31.64 38.76L2.2 21.76Z"/>
+<path data-layer="roof" class="roof-lit" fill="#a07f5f" d="M12.25 2.2L41.69 19.2L31.64 37.76L2.2 20.76Z"/>
+<path data-layer="roof lines" d="M14.12 8.8L7.99 20.13"/>
+<path data-layer="roof lines" d="M18.97 9.83L11.63 23.39"/>
+<path data-layer="roof lines" d="M23.53 12.64L16.16 26.24"/>
+<path data-layer="roof lines" d="M26.84 16.23L20.27 28.38"/>
+<path data-layer="roof lines" d="M32.26 16.91L24.9 30.5"/>
+<path data-layer="roof lines" d="M36.24 19.39L28.85 33.04"/>
+</g>
+</svg>

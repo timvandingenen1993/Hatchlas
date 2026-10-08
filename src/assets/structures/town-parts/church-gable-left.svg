@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="267.81" height="319.2" viewBox="0 0 89.27 106.4" data-footprint="2 7" data-origin="65.94 59.2" fill="none" stroke="#2a1e16" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round">
+<defs><filter id="hand" x="-4%" y="-4%" width="108%" height="108%"><feTurbulence type="fractalNoise" baseFrequency="0.07" numOctaves="2" seed="4" result="warp"/><feDisplacementMap in="SourceGraphic" in2="warp" scale="1.3" xChannelSelector="R" yChannelSelector="G" result="wobble"/><feTurbulence type="fractalNoise" baseFrequency="1.2" numOctaves="2" seed="9" result="grain"/><feColorMatrix in="grain" type="matrix" values="0 0 0 0 0.16 0 0 0 0 0.11 0 0 0 0 0.07 2.2 0 0 0 -1.18" result="specks"/><feComposite in="specks" in2="wobble" operator="in" result="speckled"/><feMerge><feMergeNode in="wobble"/><feMergeNode in="speckled"/></feMerge></filter></defs>
+<g class="part" filter="url(#hand)">
+<path data-layer="tower walls" fill="#c4b393" d="M83.26 69.2L65.94 79.2L65.94 33.2L83.26 23.2Z"/>
+<path data-layer="tower walls" fill="#ece1c9" d="M65.94 79.2L48.62 69.2L48.62 23.2L65.94 33.2Z"/>
+<path data-layer="tower windows" fill="#2a1e16" d="M75.21 64.65L73.99 65.35L73.99 61.15L75.21 60.45Z"/>
+<path data-layer="tower windows" fill="#2a1e16" d="M56.67 64.65L57.89 65.35L57.89 61.15L56.67 60.45Z"/>
+<path data-layer="tower windows" fill="#2a1e16" d="M75.21 54.1L73.99 54.8L73.99 50.6L75.21 49.9Z"/>
+<path data-layer="tower windows" fill="#2a1e16" d="M56.67 54.1L57.89 54.8L57.89 50.6L56.67 49.9Z"/>
+<path data-layer="tower windows" fill="#2a1e16" d="M75.21 43.55L73.99 44.25L73.99 40.05L75.21 39.35Z"/>
+<path data-layer="tower windows" fill="#2a1e16" d="M56.67 43.55L57.89 44.25L57.89 40.05L56.67 39.35Z"/>
+<path data-layer="tower eaves" class="roof-shade" fill="#7b5e45" d="M87.07 23.7L65.94 35.9L65.94 36.9L87.07 24.7Z"/>
+<path data-layer="tower eaves" class="roof-shade" fill="#7b5e45" d="M65.94 35.9L44.81 23.7L44.81 24.7L65.94 36.9Z"/>
+<path data-layer="tower roof" class="roof-shade" fill="#7b5e45" d="M87.07 23.7L65.94 35.9L65.94 2.2Z"/>
+<path data-layer="tower roof" class="roof-lit" fill="#a07f5f" d="M65.94 35.9L44.81 23.7L65.94 2.2Z"/>
+<path data-layer="tower roof lines" d="M70.14 8.71L80.84 25.28"/>
+<path data-layer="tower roof lines" d="M64.54 10.33L60.97 31.01"/>
+<path data-layer="tower roof lines" d="M68.13 7.92L75.87 28.14"/>
+<path data-layer="tower roof lines" d="M63.75 7.92L56.01 28.14"/>
+<path data-layer="tower roof lines" d="M67.06 8.73L70.91 31.01"/>
+<path data-layer="tower roof lines" d="M62.56 7.43L51.04 25.28"/>
+<path data-layer="walls" fill="#c4b393" d="M65.94 79.2L22.64 104.2L22.64 87.2L65.94 62.2Z"/>
+<path data-layer="walls" fill="#ece1c9" d="M5.32 94.2L22.64 104.2L22.64 87.2L13.98 68.7L5.32 77.2Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M63.2 75.68L61.47 76.68L61.47 73.28L63.2 72.28Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M55.98 79.85L54.25 80.85L54.25 77.45L55.98 76.45Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M48.76 84.02L47.03 85.02L47.03 81.62L48.76 80.62Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M34.33 92.35L32.6 93.35L32.6 89.95L34.33 88.95Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M27.11 96.52L25.38 97.52L25.38 94.12L27.11 93.12Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M13.11 93.6L14.84 94.6L14.84 91.2L13.11 90.2Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M13.29 78.83L14.67 79.63L14.67 77.23L13.29 76.43Z"/>
+<path data-layer="door" fill="#2a1e16" d="M42.24 92.88L42.24 87.48L42.12 86.86L41.78 86.47L41.28 86.38L40.68 86.58L40.08 87.06L39.58 87.75L39.24 88.53L39.12 89.28L39.12 94.68Z"/>
+<path data-layer="eaves" class="roof-shade" fill="#7b5e45" d="M12.25 69.7L2.2 79.56L2.2 80.56L12.25 70.7Z"/>
+<path data-layer="eaves" class="roof-shade" fill="#7b5e45" d="M12.25 69.7L22.29 91.16L22.29 92.16L12.25 70.7Z"/>
+<path data-layer="eaves" class="roof-shade" fill="#7b5e45" d="M69.06 64.16L22.29 91.16L22.29 92.16L69.06 65.16Z"/>
+<path data-layer="roof" class="roof-shade" fill="#7b5e45" d="M59.01 42.7L12.25 69.7L22.29 91.16L69.06 64.16Z"/>
+<path data-layer="roof lines" d="M57.27 49.88L63.52 63.21"/>
+<path data-layer="roof lines" d="M52.32 50.76L59.7 66.52"/>
+<path data-layer="roof lines" d="M47.66 53.65L55.03 69.39"/>
+<path data-layer="roof lines" d="M44.53 57.34L51.06 71.29"/>
+<path data-layer="roof lines" d="M39.27 57.63L46.67 73.43"/>
+<path data-layer="roof lines" d="M34.76 60.44L41.65 75.17"/>
+<path data-layer="roof lines" d="M30.33 62.99L37.25 77.78"/>
+<path data-layer="roof lines" d="M26.27 65.38L33.68 81.19"/>
+<path data-layer="roof lines" d="M21.8 67.92L29.06 83.43"/>
+<path data-layer="roof lines" d="M17.75 70.63L24.8 85.67"/>
+</g>
+</svg>

@@ -1,6 +1,6 @@
 /**
  * Top-level app shell. Renders Mountain Studio, and routes the dev-only lab pages
- * (/forest-lab, /forest-props, /pool-lab).
+ * (/forest-lab, /forest-props, /pool-lab, /structure-lab).
  */
 import { useState } from 'react';
 import { Coffee, Download, Heart, Mountain } from 'lucide-react';
@@ -8,6 +8,7 @@ import { MountainDetailStudio } from './components/MountainDetailStudio';
 import { ForestPropTestRoute } from './components/ForestPropTestRoute';
 import { PoolLabRoute } from './components/PoolLabRoute';
 import { ForestLabRoute } from './components/ForestLabRoute';
+import { StructureLabRoute } from './components/StructureLabRoute';
 import type { MountainPreviewBackendStatus } from './rendering/mountainPreviewTypes';
 
 // Fun fact: there is a whole planet-scale world generator in this repo (plate
@@ -51,6 +52,10 @@ export function App() {
 
   if (typeof window !== 'undefined' && window.location.pathname === '/forest-lab') {
     return <ForestLabRoute />;
+  }
+
+  if (typeof window !== 'undefined' && window.location.pathname === '/structure-lab') {
+    return <StructureLabRoute />;
   }
 
   const backendLabel =

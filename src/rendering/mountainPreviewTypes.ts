@@ -10,6 +10,8 @@ import type {
   MountainRenderStageStats,
 } from "./mountainDetailRenderer";
 import type { MountainProfileReport } from "./mountainProfiler";
+import type { CameraGrid } from "../structures/viewProjection";
+import type { VegetationCoverGrid } from "../structures/roadRouting";
 import type {
   VegetationMotifAsset,
   VegetationRasterPropAsset,
@@ -189,6 +191,10 @@ export type MountainPreviewResponse =
       height: number;
       bitmap?: ImageBitmap;
       imageData?: ImageData;
+      /** Coarse camera mesh for mapping clicks onto the tilted view. */
+      cameraGrid?: CameraGrid;
+      /** Prop cover for road routing; sent only when the props changed. */
+      vegetationCover?: VegetationCoverGrid;
       stats: MountainRenderStageStats;
       elapsedMs: number;
       profile?: MountainProfileReport;
