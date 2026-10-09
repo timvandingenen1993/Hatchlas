@@ -613,7 +613,7 @@ export function MountainDetailStudio({
   }, [onMountainBackendStatusChange]);
 
   // Active 2D Cartographic Layer & Palette
-  const [inspectorTab, setInspectorTab] = useState<"Terrain" | "Ink" | "Water" | "Lighting">("Ink");
+  const [inspectorTab, setInspectorTab] = useState<"Terrain" | "Ink" | "Water" | "Lighting">("Terrain");
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
   const [activeLayer, setActiveLayer] =
@@ -1220,8 +1220,6 @@ export function MountainDetailStudio({
           PERSISTED_MOUNTAIN_LAYERS,
         ),
       );
-      const restoredLayer = readStoredEnum(stored, "activeLayer", "vegetation_patterns", PERSISTED_MOUNTAIN_LAYERS);
-      setInspectorTab(restoredLayer === "vegetation_patterns" ? "Ink" : restoredLayer === "drainage_network" ? "Water" : "Terrain");
       setActivePalette(
         readStoredEnum(
           stored,
