@@ -22,11 +22,18 @@ import {
 } from "./orographicPrecipitation";
 import {
   classifyHoldridgeLifeZone,
+  HOLDRIDGE_PET_COEFFICIENT,
   HOLDRIDGE_ZONE_CODES,
   holdridgeBiotemperatureFromAnnualMean,
   holdridgeZoneName,
   holdridgePetRatio,
 } from "./holdridgeLifeZones";
+import {
+  lakeDepthFromBasins,
+  prepareLakeBasins,
+  resolveLakeBasin,
+  routeLakeBasins,
+} from "./lakeWaterBalance";
 import type { MountainProfiler } from "../rendering/mountainProfiler";
 
 export interface MountainDEMData {
@@ -172,6 +179,8 @@ export interface BaseDEMOptions {
   riverThresholdKm2?: number;
   waterStageScale?: number; // 0.2 to 3.0 (controls channel water volume & width)
   flowRateScale?: number; // 0.2 to 1.0; slower flow raises residence time and bank stage
+  /** Multiplier on open-water lake evaporation; 0 keeps every lake brim-full. */
+  lakeEvaporationScale?: number;
   wetlandElevationThresholdM?: number; // Maximum elevation for the legacy valley floodplain/wetland rule
   biomeEdgeNoiseScaleM?: number;
   biomeEdgeStrength?: number;
@@ -3030,6 +3039,44 @@ export function processMountainBaseDEM(
     }
   }
 
+  const cellAreaKm2 = (dxMeters * dyMeters) / 1_000_000.0;
+  const cellAreaM2 = dxMeters * dyMeters;
+  const referenceRunoffMmYr = (1400 - 350) * 0.72;
+  const secondsPerYear = 365.25 * 24 * 60 * 60;
+  const dischargePerRoutedKm2 = (referenceRunoffMmYr * 1000) / secondsPerYear;
+
+  // Lake-sized depressions keep their own water balance instead of passing
+  // every inflow across the spill. A wet cell loses open-water evaporation
+  // (Holdridge PET) less the rain on it, and no longer yields its land
+  // runoff, which routing has already counted.
+  const lakeEvaporationScale = Math.max(0, options.lakeEvaporationScale ?? 1);
+  const minLakeWaterDepthM = 0.25;
+  const minLakeCells = Math.max(6, Math.ceil(0.02 / Math.max(1e-9, cellAreaKm2)));
+  const lakeAbsorption = new Float32Array(totalCells);
+  for (let i = 0; i < totalCells; i++) {
+    const evaporationMm =
+      HOLDRIDGE_PET_COEFFICIENT *
+      holdridgeBiotemperatureFromAnnualMean(temperatureC[i]) *
+      lakeEvaporationScale;
+    lakeAbsorption[i] =
+      (cellAreaKm2 * (evaporationMm - precipitationMmYr[i] + runoffDepthMmYr[i])) /
+      referenceRunoffMmYr;
+  }
+  const lakeBasins = prepareLakeBasins(
+    width,
+    height,
+    elevation,
+    conditionedElevation,
+    isOcean,
+    flowDirection,
+    lakeAbsorption,
+    dxMeters,
+    dyMeters,
+    minLakeWaterDepthM,
+    minLakeCells,
+    2,
+  );
+
   // Build an explicit upstream-to-downstream order. Sorting by raw elevation
   // is not sufficient after depression conditioning because many valid flat
   // receivers share the same elevation.
@@ -3052,6 +3099,11 @@ export function processMountainBaseDEM(
     }
   }
 
+  // A lake's spill cell waits until the whole basin has been routed.
+  for (const spill of lakeBasins.spillCell) {
+    if (spill >= 0) incomingEdges[spill]++;
+  }
+
   const pendingEdges = incomingEdges.slice();
   const routingQueue = new Int32Array(totalCells);
   let queueRead = 0;
@@ -3063,41 +3115,96 @@ export function processMountainBaseDEM(
   // Route the complete upstream catchment through one continuous D8 receiver.
   // Splitting lowland flow made accumulation shrink along the primary route,
   // which could turn a visible river off and leave detached blue fragments.
-  const cellAreaKm2 = (dxMeters * dyMeters) / 1_000_000.0;
-  const cellAreaM2 = dxMeters * dyMeters;
-  const referenceRunoffMmYr = (1400 - 350) * 0.72;
   const flowAccumulation = new Float32Array(totalCells).fill(1.0);
   const rainfallWeightedAreaKm2 = new Float32Array(totalCells);
   const dischargeM3s = new Float32Array(totalCells);
-  const secondsPerYear = 365.25 * 24 * 60 * 60;
   for (let i = 0; i < totalCells; i++) {
     rainfallWeightedAreaKm2[i] =
       (cellAreaKm2 * runoffDepthMmYr[i]) / referenceRunoffMmYr;
     dischargeM3s[i] =
       ((runoffDepthMmYr[i] / 1000) * cellAreaM2) / secondsPerYear;
   }
+  // What each lake-basin cell yields itself plus what enters it from outside
+  // the basin, so the drawn flow inside can be re-accumulated afterwards.
+  const lakeOwnInflow = new Float32Array(totalCells);
+  const lakeOwnCells = new Float32Array(totalCells);
+  for (const cell of lakeBasins.basinCells) {
+    lakeOwnInflow[cell] = rainfallWeightedAreaKm2[cell];
+    lakeOwnCells[cell] = 1;
+  }
   const topologicalOrder = new Int32Array(totalCells);
   let topologicalCount = 0;
-  while (queueRead < queueWrite) {
-    const idx = routingQueue[queueRead++];
-    topologicalOrder[topologicalCount++] = idx;
-    const accum = flowAccumulation[idx];
-    const dir1 = flowDirection[idx];
+  for (;;) {
+    while (queueRead < queueWrite) {
+      const idx = routingQueue[queueRead++];
+      topologicalOrder[topologicalCount++] = idx;
+      const accum = flowAccumulation[idx];
+      const dir1 = flowDirection[idx];
 
-    if (dir1 >= 0) {
-      const x = idx % width;
-      const y = Math.floor(idx / width);
-      const nx1 = x + d8Offsets[dir1][0];
-      const ny1 = y + d8Offsets[dir1][1];
-      if (nx1 >= 0 && nx1 < width && ny1 >= 0 && ny1 < height) {
-        const targetIdx1 = ny1 * width + nx1;
-        flowAccumulation[targetIdx1] += accum;
-        rainfallWeightedAreaKm2[targetIdx1] += rainfallWeightedAreaKm2[idx];
-        dischargeM3s[targetIdx1] += dischargeM3s[idx];
-        pendingEdges[targetIdx1]--;
-        if (pendingEdges[targetIdx1] === 0)
-          routingQueue[queueWrite++] = targetIdx1;
+      if (dir1 >= 0) {
+        const x = idx % width;
+        const y = Math.floor(idx / width);
+        const nx1 = x + d8Offsets[dir1][0];
+        const ny1 = y + d8Offsets[dir1][1];
+        if (nx1 >= 0 && nx1 < width && ny1 >= 0 && ny1 < height) {
+          const targetIdx1 = ny1 * width + nx1;
+          const targetBasin = lakeBasins.basinOf[targetIdx1];
+          if (targetBasin >= 0 && targetBasin !== lakeBasins.basinOf[idx]) {
+            lakeOwnInflow[targetIdx1] += rainfallWeightedAreaKm2[idx];
+            lakeOwnCells[targetIdx1] += accum;
+          }
+          flowAccumulation[targetIdx1] += accum;
+          rainfallWeightedAreaKm2[targetIdx1] += rainfallWeightedAreaKm2[idx];
+          dischargeM3s[targetIdx1] += dischargeM3s[idx];
+          pendingEdges[targetIdx1]--;
+          if (pendingEdges[targetIdx1] === 0)
+            routingQueue[queueWrite++] = targetIdx1;
+        }
       }
+
+      const basin = lakeBasins.basinOf[idx];
+      if (basin >= 0 && --lakeBasins.remaining[basin] === 0) releaseLakeBasin(basin);
+    }
+    // A stall means some basin waits on water that waits on its own spill.
+    // Resolve the most complete one with what has arrived so far.
+    let stalled = -1;
+    for (let b = 0; b < lakeBasins.remaining.length; b++) {
+      if (
+        lakeBasins.remaining[b] > 0 &&
+        (stalled < 0 || lakeBasins.remaining[b] < lakeBasins.remaining[stalled])
+      )
+        stalled = b;
+    }
+    if (stalled < 0) break;
+    lakeBasins.remaining[stalled] = 0;
+    releaseLakeBasin(stalled);
+  }
+
+  function releaseLakeBasin(basin: number): void {
+    const outflow = resolveLakeBasin(
+      lakeBasins,
+      basin,
+      flowDirection,
+      rainfallWeightedAreaKm2,
+      riverThresholdKm2,
+    );
+    const spill = lakeBasins.spillCell[basin];
+    if (spill >= 0) {
+      if (outflow > 0) {
+        let pitArea = 0;
+        for (
+          let k = lakeBasins.basinStart[basin];
+          k < lakeBasins.basinStart[basin + 1];
+          k++
+        ) {
+          const cell = lakeBasins.basinCells[k];
+          if (flowDirection[cell] < 0) pitArea += flowAccumulation[cell];
+        }
+        flowAccumulation[spill] += pitArea;
+        rainfallWeightedAreaKm2[spill] += outflow;
+        dischargeM3s[spill] += outflow * dischargePerRoutedKm2;
+      }
+      if (--pendingEdges[spill] === 0) routingQueue[queueWrite++] = spill;
     }
   }
 
@@ -3107,6 +3214,59 @@ export function processMountainBaseDEM(
   if (topologicalCount < totalCells) {
     for (let i = 0; i < totalCells; i++) {
       if (pendingEdges[i] > 0) topologicalOrder[topologicalCount++] = i;
+    }
+  }
+
+  const lakeDepthM = lakeDepthFromBasins(
+    lakeBasins,
+    elevation,
+    minLakeWaterDepthM,
+    minLakeCells,
+    riverThresholdKm2,
+  );
+  routeLakeBasins(
+    lakeBasins,
+    elevation,
+    flowDirection,
+    lakeOwnInflow,
+    lakeOwnCells,
+    rainfallWeightedAreaKm2,
+    dischargeM3s,
+    flowAccumulation,
+    dischargePerRoutedKm2,
+  );
+  // Lake outlets now link basins to their spill cells, so stream order needs
+  // an upstream-to-downstream order of the final field.
+  if (lakeBasins.basinCells.length > 0) {
+    pendingEdges.fill(0);
+    for (let idx = 0; idx < totalCells; idx++) {
+      const dir = flowDirection[idx];
+      if (dir < 0) continue;
+      const nx = (idx % width) + d8Offsets[dir][0];
+      const ny = Math.floor(idx / width) + d8Offsets[dir][1];
+      if (nx >= 0 && nx < width && ny >= 0 && ny < height) pendingEdges[ny * width + nx]++;
+    }
+    topologicalCount = 0;
+    queueRead = 0;
+    queueWrite = 0;
+    for (let i = 0; i < totalCells; i++) {
+      if (pendingEdges[i] === 0) routingQueue[queueWrite++] = i;
+    }
+    while (queueRead < queueWrite) {
+      const idx = routingQueue[queueRead++];
+      topologicalOrder[topologicalCount++] = idx;
+      const dir = flowDirection[idx];
+      if (dir < 0) continue;
+      const nx = (idx % width) + d8Offsets[dir][0];
+      const ny = Math.floor(idx / width) + d8Offsets[dir][1];
+      if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+      const target = ny * width + nx;
+      if (--pendingEdges[target] === 0) routingQueue[queueWrite++] = target;
+    }
+    if (topologicalCount < totalCells) {
+      for (let i = 0; i < totalCells; i++) {
+        if (pendingEdges[i] > 0) topologicalOrder[topologicalCount++] = i;
+      }
     }
   }
 
@@ -3302,19 +3462,6 @@ export function processMountainBaseDEM(
     riverThresholdKm2,
     oceanElevationM,
     Math.min(dxMeters, dyMeters),
-  );
-  const lakeDepthM = extractRiverFedLakes(
-    width,
-    height,
-    elevation,
-    conditionedElevation,
-    isOcean,
-    rainfallWeightedAreaKm2,
-    riverThresholdKm2,
-    cellAreaKm2,
-    // Routing is finished; reuse its full-size scratch buffers.
-    floodVisited,
-    routingQueue,
   );
   hydrologyStop?.();
 
@@ -3561,75 +3708,6 @@ export function processMountainBaseDEM(
     isOcean,
     lakeDepthM,
   };
-}
-
-/**
- * Turns priority-flood depressions into lakes. The filled surface is the
- * basin's spill level, so every connected cell below it is standing water.
- * Only basins large and deep enough to be real, and fed by a routed river
- * (the spill outlet carries the whole inflow), become lakes; small raster
- * pits stay filled for routing only. Returns water depth per lake cell.
- */
-export function extractRiverFedLakes(
-  width: number,
-  height: number,
-  elevation: Float32Array,
-  filledElevation: Float32Array,
-  isOcean: Uint8Array,
-  rainfallWeightedAreaKm2: Float32Array,
-  riverThresholdKm2: number,
-  cellAreaKm2: number,
-  visited = new Uint8Array(width * height),
-  component = new Int32Array(width * height),
-): Float32Array {
-  const totalCells = width * height;
-  const lakeDepthM = new Float32Array(totalCells);
-  const minWaterDepthM = 0.25;
-  const minLakeDepthM = 2;
-  const minLakeCells = Math.max(6, Math.ceil(0.02 / Math.max(1e-9, cellAreaKm2)));
-  const isBasin = (i: number): boolean =>
-    isOcean[i] === 0 && filledElevation[i] - elevation[i] > minWaterDepthM;
-
-  visited.fill(0);
-  for (let start = 0; start < totalCells; start++) {
-    if (visited[start] === 1 || !isBasin(start)) continue;
-    visited[start] = 1;
-    component[0] = start;
-    let count = 1;
-    let read = 0;
-    let maxDepth = 0;
-    let inflowKm2 = 0;
-    while (read < count) {
-      const idx = component[read++];
-      maxDepth = Math.max(maxDepth, filledElevation[idx] - elevation[idx]);
-      inflowKm2 = Math.max(inflowKm2, rainfallWeightedAreaKm2[idx]);
-      const x = idx % width;
-      const y = (idx - x) / width;
-      for (let dy = -1; dy <= 1; dy++) {
-        const ny = y + dy;
-        if (ny < 0 || ny >= height) continue;
-        for (let dx = -1; dx <= 1; dx++) {
-          const nx = x + dx;
-          if ((dx === 0 && dy === 0) || nx < 0 || nx >= width) continue;
-          const n = ny * width + nx;
-          if (visited[n] === 1 || !isBasin(n)) continue;
-          visited[n] = 1;
-          component[count++] = n;
-        }
-      }
-    }
-    if (
-      count >= minLakeCells &&
-      maxDepth >= minLakeDepthM &&
-      inflowKm2 >= riverThresholdKm2
-    ) {
-      for (let k = 0; k < count; k++) {
-        const idx = component[k];
-        lakeDepthM[idx] = filledElevation[idx] - elevation[idx];
-      }
-    }
-  }
-  return lakeDepthM;
 }
 
 /**
