@@ -445,6 +445,7 @@ interface MountainDetailSettingsSnapshot {
   biomeRegionScaleKm: number;
   waterStageScale: number;
   flowRateScale: number;
+  lakeEvaporationScale: number;
   waterLandscapeImpact: number;
   waterEvolutionStep: number;
   rainOverlayOpacity: number;
@@ -612,7 +613,7 @@ export function MountainDetailStudio({
   }, [onMountainBackendStatusChange]);
 
   // Active 2D Cartographic Layer & Palette
-  const [inspectorTab, setInspectorTab] = useState<"Terrain" | "Ink" | "Water" | "Lighting">("Ink");
+  const [inspectorTab, setInspectorTab] = useState<"Terrain" | "Ink" | "Water" | "Lighting">("Terrain");
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
   const [activeLayer, setActiveLayer] =
@@ -840,6 +841,7 @@ export function MountainDetailStudio({
   const [biomeRegionScaleKm, setBiomeRegionScaleKm] = useState<number>(0.01);
   const [waterStageScale, setWaterStageScale] = useState<number>(0.8);
   const [flowRateScale, setFlowRateScale] = useState<number>(0.9);
+  const [lakeEvaporationScale, setLakeEvaporationScale] = useState<number>(1);
   const [waterLandscapeImpact, setWaterLandscapeImpact] = useState<number>(1);
   const [waterEvolutionStep, setWaterEvolutionStep] = useState<number>(0);
   const [rainOverlayOpacity, setRainOverlayOpacity] = useState<number>(0.0);
@@ -1218,8 +1220,6 @@ export function MountainDetailStudio({
           PERSISTED_MOUNTAIN_LAYERS,
         ),
       );
-      const restoredLayer = readStoredEnum(stored, "activeLayer", "vegetation_patterns", PERSISTED_MOUNTAIN_LAYERS);
-      setInspectorTab(restoredLayer === "vegetation_patterns" ? "Ink" : restoredLayer === "drainage_network" ? "Water" : "Terrain");
       setActivePalette(
         readStoredEnum(
           stored,
@@ -1708,6 +1708,9 @@ export function MountainDetailStudio({
         readStoredNumber(stored, "waterStageScale", 0.8, 0.3, 3),
       );
       setFlowRateScale(readStoredNumber(stored, "flowRateScale", 0.9, 0.2, 1));
+      setLakeEvaporationScale(
+        readStoredNumber(stored, "lakeEvaporationScale", 1, 0, 10),
+      );
       setWaterLandscapeImpact(
         readStoredNumber(stored, "waterLandscapeImpact", 1, 0.1, 1),
       );
@@ -1914,6 +1917,7 @@ export function MountainDetailStudio({
       biomeRegionScaleKm,
       waterStageScale,
       flowRateScale,
+      lakeEvaporationScale,
       waterLandscapeImpact,
       waterEvolutionStep,
       rainOverlayOpacity,
@@ -2092,6 +2096,7 @@ export function MountainDetailStudio({
     biomeRegionScaleKm,
     waterStageScale,
     flowRateScale,
+    lakeEvaporationScale,
     waterLandscapeImpact,
     waterEvolutionStep,
     rainOverlayOpacity,
@@ -2318,6 +2323,7 @@ export function MountainDetailStudio({
         // A river widens as it matures: each evolution step raises the bank-full stage.
         waterStageGrowthPerStep: 0.125,
         flowRateScale,
+        lakeEvaporationScale,
         erosionStrength: waterLandscapeImpact,
         erosionIterations: waterEvolutionStep,
         erosionTimeScale: 1,
@@ -3312,6 +3318,7 @@ export function MountainDetailStudio({
         // A river widens as it matures: each evolution step raises the bank-full stage.
         waterStageGrowthPerStep: 0.125,
         flowRateScale,
+        lakeEvaporationScale,
         erosionStrength: waterLandscapeImpact,
         erosionIterations: waterEvolutionStep,
         erosionTimeScale: 1,
@@ -4231,6 +4238,7 @@ export function MountainDetailStudio({
             {num("Water evolution", waterEvolutionStep, (next) => setWaterEvolutionStep(Math.round(next)), 0, MOUNTAIN_WATER_EVOLUTION_STEPS, 1, { key: "waterEvolutionStep", commit: true, limits: [0, MOUNTAIN_WATER_EVOLUTION_STEPS], title: "0 is the initial terrain; later steps reroute rivers and erode the terrain" })}
             {num("River catchment", riverThresholdKm2, setRiverThresholdKm2, 1, 200, 0.01, { unit: "km²", key: "riverThresholdKm2", commit: true, log: true, title: "Wet-climate catchment area needed before a river appears. 1 km² carries about 24 L/s in the reference climate; raise it for fewer, longer rivers" })}
             {num("Erosion strength", waterLandscapeImpact, setWaterLandscapeImpact, 0.1, 1, 0.05, { unit: "%", key: "waterLandscapeImpact", commit: true, log: false })}
+            {num("Lake evaporation", lakeEvaporationScale, setLakeEvaporationScale, 0, 10, 0.1, { unit: "×", key: "lakeEvaporationScale", commit: true, log: false, title: "Open-water evaporation from lakes. Higher values let dry basins hold terminal lakes below their spill point, where rivers end; 0 keeps every lake brim-full" })}
             <InspectorFold title="Channels and flow">
               {num("Channel width", waterStageScale, setWaterStageScale, 0.3, 3, 0.1, { unit: "×", key: "waterStageScale", commit: true })}
               {num("Flow rate", flowRateScale, setFlowRateScale, 0.2, 1, 0.05, { unit: "×", key: "flowRateScale", commit: true, title: "Lower flow retains water longer and fills the banks" })}
