@@ -2,7 +2,7 @@
  * Dev page (/structure-lab) for the town part SVGs. Each part is a stack of
  * layers (walls, windows, door, roof…): reorder, hide, rename, move and
  * duplicate them, borrow a layer from another part, or switch to the points
- * tool and reshape single shapes corner by corner. Save writes the file back
+ * tool and reshape shapes corner by corner, with multi-selection in both tools. Save writes the file back
  * to src/assets/structures/town-parts through the dev server. Saved files
  * carry `data-edited`, so scripts/generate-town-parts.ts leaves them alone.
  */
@@ -47,9 +47,18 @@ import {
   type PartLayer,
   type Point,
 } from "../structures/partDocument";
-import { parseTownPart } from "../structures/townParts";
+import {
+  allPoints, layerRange, moveLayers, movePoints, pointTargets, sameCorner, sameShape,
+  selectItem, shapeCorners, type CornerRef, type PointRef, type ShapeRef,
+} from "../structures/partSelection";
+import { copyPartSelection, insertPartLayers, pastePartLayers, type PartClipboard } from "../structures/partClipboard";
+import { PartLayerPicker } from "./PartLayerPicker";
+import { PartBlueprintOverlay } from "./PartBlueprintOverlay";
+import { parseTownPart, partNamed } from "../structures/townParts";
 import { composeSettlement, svgDataUrl } from "../structures/townSprite";
 import { SETTLEMENT_KINDS, type SettlementKind } from "../structures/types";
+import { defaultSettlements, isLayoutPart, parseSettlements, SETTLEMENT_ATTRIBUTE, type PlacementRules } from "../structures/partPlacement";
+import { findSettlementPreview } from "../structures/settlementPreview";
 
 const FILES = Object.fromEntries(
   Object.entries(
@@ -81,23 +90,8 @@ type View = Box;
 
 type Tool = "layer" | "points";
 
-/** One shape (path) of the part: element `el` of layer `layerId`. */
-interface ShapeRef {
-  layerId: string;
-  el: number;
-}
-
-/** A corner of a shape: `x`, `y` in the shape's own coordinates, `ax`, `ay` on the canvas (with its layer's offset). */
-interface PointRef extends ShapeRef {
-  index: number;
-  x: number;
-  y: number;
-  ax: number;
-  ay: number;
-}
-
 type Drag =
-  | { kind: "move"; id: string; pointer: number; startX: number; startY: number; dx: number; dy: number; key: string }
+  | { kind: "move"; ids: string[]; start: PartDocument; pointer: number; startX: number; startY: number; dx: number; dy: number; key: string; moved: boolean; additive: boolean }
   | { kind: "pan"; pointer: number; clientX: number; clientY: number; view: View; scale: number }
   | {
       kind: "points"; pointer: number; startX: number; startY: number; key: string; moved: boolean;
@@ -112,53 +106,6 @@ const SHARED = 0.05;
 /** Screen pixels within which a dragged corner snaps to another, and a double-click finds an edge. */
 const SNAP_PX = 8;
 const HANDLE_PX = 3.5;
-
-/** Every corner of every visible straight-line shape in `doc`. */
-function allPoints(doc: PartDocument): PointRef[] {
-  const points: PointRef[] = [];
-  for (const layer of doc.layers) {
-    if (layer.hidden) continue;
-    layer.elements.forEach((element, el) => {
-      shapePoints(element)?.points.forEach(([x, y], index) => {
-        points.push({ layerId: layer.id, el, index, x, y, ax: x + layer.dx, ay: y + layer.dy });
-      });
-    });
-  }
-  return points;
-}
-
-const sameShape = (a: ShapeRef, b: ShapeRef) => a.layerId === b.layerId && a.el === b.el;
-
-/**
- * Corners `indices` of `shape`, plus, when `link` is on, every corner of
- * another shape that sits on one of them, so faces sharing a corner stay joined.
- */
-function pointTargets(doc: PartDocument, shape: ShapeRef, indices: readonly number[], link: boolean): PointRef[] {
-  const points = allPoints(doc);
-  const own = points.filter((point) => sameShape(point, shape) && indices.includes(point.index));
-  if (!link) return own;
-  const shared = points.filter((point) => !sameShape(point, shape)
-    && own.some((corner) => Math.abs(corner.ax - point.ax) < SHARED && Math.abs(corner.ay - point.ay) < SHARED));
-  return [...own, ...shared];
-}
-
-/** `doc` with every target corner moved by (dx, dy) from where the target says it was. */
-function movePoints(doc: PartDocument, targets: readonly PointRef[], dx: number, dy: number): PartDocument {
-  if (targets.length === 0) return doc;
-  const layers = doc.layers.map((layer) => {
-    if (!targets.some((target) => target.layerId === layer.id)) return layer;
-    const elements = layer.elements.map((element, el) => {
-      const moving = targets.filter((target) => target.layerId === layer.id && target.el === el);
-      const shape = moving.length > 0 ? shapePoints(element) : null;
-      if (!shape) return element;
-      const points = shape.points.map((point) => [...point] as Point);
-      for (const target of moving) points[target.index] = [target.x + dx, target.y + dy];
-      return withShapePoints(element, { ...shape, points });
-    });
-    return { ...layer, elements };
-  });
-  return { ...doc, layers };
-}
 
 function parseOrError(source: string): PartDocument | Error {
   try {
@@ -196,20 +143,19 @@ function measureLayers(svg: SVGSVGElement | null, layers: readonly PartLayer[]):
   return box && { x: box.minX, y: box.minY, width: box.maxX - box.minX, height: box.maxY - box.minY };
 }
 
-function fitView(doc: PartDocument): View {
-  const [x, y, width, height] = doc.viewBox;
+function fitView(doc: PartDocument, reference?: PartDocument | null): View {
+  let [x, y, width, height] = doc.viewBox;
+  if (reference) {
+    const [rx, ry, rw, rh] = reference.viewBox;
+    const [dx, dy] = [doc.origin[0] - reference.origin[0], doc.origin[1] - reference.origin[1]];
+    const minX = Math.min(x, rx + dx);
+    const minY = Math.min(y, ry + dy);
+    width = Math.max(x + width, rx + dx + rw) - minX;
+    height = Math.max(y + height, ry + dy + rh) - minY;
+    [x, y] = [minX, minY];
+  }
   const pad = Math.max(width, height) * 0.15;
   return { x: x - pad, y: y - pad, width: width + pad * 2, height: height + pad * 2 };
-}
-
-/** The first settlement (kind and seed) that draws `part`, so the context preview shows it. */
-function settlementShowing(part: string): { kind: SettlementKind; seed: number } {
-  for (const { kind } of SETTLEMENT_KINDS) {
-    for (let seed = 1; seed <= 6; seed++) {
-      if (composeSettlement(kind, seed).includes(`data-part="${part}"`)) return { kind, seed };
-    }
-  }
-  return { kind: "village", seed: 1 };
 }
 
 export function StructureLabRoute() {
@@ -224,20 +170,32 @@ export function StructureLabRoute() {
   const [selected, setSelected] = useState(() => (sources["house-gable-right"] ? "house-gable-right" : names[0]));
   const [filter, setFilter] = useState("");
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
-  const [layerId, setLayerId] = useState<string | null>(null);
+  const [layerIds, setLayerIds] = useState<string[]>([]);
+  const layerId = layerIds.at(-1) ?? null;
+  const layerAnchor = useRef<string | null>(null);
+  const setLayerId = useCallback((id: string | null) => {
+    setLayerIds(id ? [id] : []);
+    layerAnchor.current = id;
+  }, []);
   const [hoverId, setHoverId] = useState<string | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
   const [palette, setPalette] = useState(() => defaultPalette(selected));
   const [showGrid, setShowGrid] = useState(true);
+  const [blueprintOnTop, setBlueprintOnTop] = useState(false);
+  const [referenceName, setReferenceName] = useState("");
+  const [showReference, setShowReference] = useState(false);
   const [status, setStatus] = useState<{ text: string; error?: boolean } | null>(null);
   const [saveAsName, setSaveAsName] = useState("");
   const [borrow, setBorrow] = useState("");
-  const [context, setContext] = useState(() => settlementShowing(selected));
+  const [context, setContext] = useState(() => findSettlementPreview(partNamed(selected))
+    ?? { kind: defaultSettlements(selected)[0], seed: 1 });
   const [highlightInContext, setHighlightInContext] = useState(true);
   const [tool, setTool] = useState<Tool>("layer");
-  const [shape, setShape] = useState<ShapeRef | null>(null);
-  const [pointSelection, setPointSelection] = useState<number[]>([]);
+  const [shapeSelection, setShapeSelection] = useState<ShapeRef[]>([]);
+  const shape = shapeSelection.at(-1) ?? null;
+  const setShape = useCallback((next: ShapeRef | null) => setShapeSelection(next ? [next] : []), []);
+  const [pointSelection, setPointSelection] = useState<CornerRef[]>([]);
   const [hoverShape, setHoverShape] = useState<ShapeRef | null>(null);
   const [linkCorners, setLinkCorners] = useState(true);
   const [marquee, setMarquee] = useState<Box | null>(null);
@@ -245,6 +203,8 @@ export function StructureLabRoute() {
   const svgRef = useRef<SVGSVGElement>(null);
   const dragRef = useRef<Drag | null>(null);
   const dragLayerRef = useRef<string | null>(null);
+  const clipboardRef = useRef<PartClipboard | null>(null);
+  const pasteCountRef = useRef(0);
 
   const baseDocs = useMemo(
     () => Object.fromEntries(Object.entries(sources).map(([name, source]) => [name, parseOrError(source)])),
@@ -259,9 +219,25 @@ export function StructureLabRoute() {
   );
   const current = docOf(selected);
   const doc = current instanceof Error ? null : current ?? null;
+  const reference = docOf(referenceName);
+  const referenceDoc = reference && !(reference instanceof Error) ? reference : null;
+  const visibleReference = showReference ? referenceDoc : null;
+  const referenceOptions = useMemo(() => names.filter((name) => name !== selected
+    && baseDocs[name] && !(baseDocs[name] instanceof Error)).map((name) => ({ value: name, part: name })), [baseDocs, names, selected]);
   const draft = drafts[selected];
   const dirty = (name: string) => (drafts[name]?.index ?? 0) > 0;
   const anyDirty = names.some(dirty);
+  const placementRules = useMemo<PlacementRules>(() => Object.fromEntries(
+    names.flatMap((name) => {
+      const current = docOf(name);
+      if (!current || current instanceof Error || isLayoutPart(name)) return [];
+      const value = current.attributes.find(([key]) => key === SETTLEMENT_ATTRIBUTE)?.[1];
+      const choices = parseSettlements(value);
+      return choices === undefined ? [] : [[name, choices]];
+    }),
+  ), [docOf, names]);
+  const placement = placementRules[selected] ?? defaultSettlements(selected);
+  const fixedPlacement = isLayoutPart(selected);
 
   const [view, setView] = useState<View>(() => (doc ? fitView(doc) : { x: 0, y: 0, width: 100, height: 100 }));
   /** ViewBox units per screen pixel (the canvas letterboxes the view). */
@@ -274,9 +250,36 @@ export function StructureLabRoute() {
     return { shapeLayer, shapeElement, shapeGeometry: shapeElement ? shapePoints(shapeElement) : null };
   }, [doc, shape]);
   const selectedPoints = useMemo(
-    () => (shapeGeometry ? pointSelection.filter((index) => index < shapeGeometry.points.length) : []),
-    [pointSelection, shapeGeometry],
+    () => doc ? pointTargets(doc, pointSelection, false) : [],
+    [doc, pointSelection],
   );
+  const selectedShapes = useMemo(() => shapeSelection.flatMap((ref) => {
+    const layer = doc?.layers.find((candidate) => candidate.id === ref.layerId && !candidate.hidden);
+    const geometry = layer ? shapePoints(layer.elements[ref.el] ?? "") : null;
+    return layer && geometry ? [{ ref, layer, geometry }] : [];
+  }), [doc, shapeSelection]);
+  const selectedLayerIds = useMemo(
+    () => layerIds.filter((id) => doc?.layers.some((layer) => layer.id === id)),
+    [doc, layerIds],
+  );
+  const pickLayer = (id: string, event: { ctrlKey: boolean; metaKey: boolean; shiftKey: boolean }, canvas = false) => {
+    const toggle = event.ctrlKey || event.metaKey;
+    let next: string[];
+    if (event.shiftKey && !canvas) {
+      const order = doc ? [...doc.layers].reverse().map((layer) => layer.id) : [];
+      if (!layerAnchor.current || !order.includes(layerAnchor.current)) layerAnchor.current = id;
+      const range = layerRange(order, layerAnchor.current, id);
+      next = toggle ? [...new Set([...selectedLayerIds, ...range])] : range;
+    } else {
+      next = canvas || toggle || event.shiftKey
+        ? selectItem(selectedLayerIds, id, toggle || event.shiftKey, (a, b) => a === b) : [id];
+      layerAnchor.current = id;
+    }
+    // The clicked layer stays active in the inspector while the group remains selected.
+    if (next.includes(id)) next = [...next.filter((other) => other !== id), id];
+    setLayerIds(next);
+    return next;
+  };
 
   /** Applies `change` to the selected part as one undo step (or merges into the last one with the same `key`). */
   const update = useCallback(
@@ -321,6 +324,8 @@ export function StructureLabRoute() {
   const revert = () => {
     setDrafts(({ [selected]: _dropped, ...rest }) => rest);
     setLayerId(null);
+    setShapeSelection([]);
+    setPointSelection([]);
   };
 
   const moveLayer = (id: string, to: number) =>
@@ -336,7 +341,7 @@ export function StructureLabRoute() {
   const removeLayer = useCallback(
     (id: string) => {
       update((doc) => ({ ...doc, layers: doc.layers.filter((layer) => layer.id !== id) }));
-      setLayerId((selectedId) => (selectedId === id ? null : selectedId));
+      setLayerIds((ids) => ids.filter((selectedId) => selectedId !== id));
     },
     [update],
   );
@@ -361,6 +366,9 @@ export function StructureLabRoute() {
     [docOf, names],
   );
 
+  const borrowLayerOptions = useMemo(() => borrowOptions.flatMap(({ name, doc: source }) =>
+    source.layers.map((layer) => ({ value: `${name}|${layer.id}`, part: name, layer: layer.name }))), [borrowOptions]);
+
   const addBorrowed = () => {
     const [from, id] = borrow.split("|");
     const source = borrowOptions.find((option) => option.name === from)?.doc;
@@ -380,7 +388,15 @@ export function StructureLabRoute() {
     async (target: string) => {
       if (!doc) return;
       try {
-        const text = serializePartDocument(fitViewBox(doc, measureLayers(svgRef.current, doc.layers), STROKE_WIDTH * 2));
+        const toSave = target !== selected && !isLayoutPart(selected) ? {
+          ...doc,
+          attributes: [
+            ...doc.attributes.filter(([key]) => key !== SETTLEMENT_ATTRIBUTE),
+            [SETTLEMENT_ATTRIBUTE, (parseSettlements(doc.attributes.find(([key]) => key === SETTLEMENT_ATTRIBUTE)?.[1])
+              ?? defaultSettlements(selected)).join(" ")] as [string, string],
+          ],
+        } : doc;
+        const text = serializePartDocument(fitViewBox(toSave, measureLayers(svgRef.current, doc.layers), STROKE_WIDTH * 2));
         parseTownPart(target, text);
         const response = await fetch(`/__town-parts/${encodeURIComponent(target)}`, { method: "POST", body: text });
         if (!response.ok) {
@@ -394,12 +410,14 @@ export function StructureLabRoute() {
           setSaveAsName("");
         }
         setLayerId(null);
+        setShapeSelection([]);
+        setPointSelection([]);
         setStatus({ text: `Saved ${target}.svg` });
       } catch (error) {
         setStatus({ text: error instanceof Error ? error.message : String(error), error: true });
       }
     },
-    [doc, selected],
+    [doc, selected, setLayerId],
   );
 
   const selectPart = (name: string) => {
@@ -409,49 +427,75 @@ export function StructureLabRoute() {
     setPointSelection([]);
     setRenamingId(null);
     setPalette(defaultPalette(name));
-    setContext(settlementShowing(name));
+    const choices = placementRules[name] ?? defaultSettlements(name);
+    setContext(findSettlementPreview({ name }, placementRules, choices) ?? { kind: choices[0] ?? "village", seed: 1 });
     setStatus(null);
     const next = docOf(name);
-    if (next && !(next instanceof Error)) setView(fitView(next));
+    if (name === referenceName) {
+      setReferenceName("");
+      setShowReference(false);
+    }
+    if (next && !(next instanceof Error)) setView(fitView(next, name === referenceName ? null : visibleReference));
   };
 
-  /** Moves corners `indices` of the selected shape (and the corners they share, if linked) by (dx, dy). */
+  const setPlacement = (kind: SettlementKind, checked: boolean) => {
+    const choices = SETTLEMENT_KINDS.filter(({ kind: candidate }) => candidate === kind ? checked : placement.includes(candidate))
+      .map(({ kind }) => kind);
+    update((doc) => ({
+      ...doc,
+      attributes: [
+        ...doc.attributes.filter(([key]) => key !== SETTLEMENT_ATTRIBUTE),
+        [SETTLEMENT_ATTRIBUTE, choices.join(" ")],
+      ],
+    }));
+  };
+
+  const showInSettlement = (kind: SettlementKind) => {
+    setContext(findSettlementPreview({ name: selected }, placementRules, [kind]) ?? { kind, seed: 1 });
+  };
+
+  /** Moves selected corners, including shared corners when linking is enabled. */
   const nudgePoints = useCallback(
-    (indices: readonly number[], dx: number, dy: number, key: string) => {
-      if (!shape) return;
-      update((doc) => movePoints(doc, pointTargets(doc, shape, indices, linkCorners), dx, dy), key);
+    (corners: readonly CornerRef[], dx: number, dy: number, key: string) => {
+      update((doc) => movePoints(doc, pointTargets(doc, corners, linkCorners), dx, dy), key);
     },
-    [linkCorners, shape, update],
+    [linkCorners, update],
   );
 
   const deleteShape = useCallback(() => {
-    if (!shape) return;
+    if (shapeSelection.length === 0) return;
     update((doc) => ({
       ...doc,
-      layers: doc.layers
-        .map((layer) => (layer.id === shape.layerId ? { ...layer, elements: layer.elements.filter((_, el) => el !== shape.el) } : layer))
-        .filter((layer) => layer.elements.length > 0),
+      layers: doc.layers.map((layer) => ({ ...layer,
+        elements: layer.elements.filter((_, el) => !shapeSelection.some((ref) => ref.layerId === layer.id && ref.el === el)),
+      })).filter((layer) => layer.elements.length > 0),
     }));
-    setShape(null);
+    setShapeSelection([]);
     setPointSelection([]);
-  }, [shape, update]);
+  }, [shapeSelection, update]);
 
   const deletePoints = useCallback(() => {
-    if (!shape || !shapeGeometry || selectedPoints.length === 0) return;
-    const left = shapeGeometry.points.filter((_, index) => !selectedPoints.includes(index));
-    if (left.length < (shapeGeometry.closed ? 3 : 2)) {
+    if (!doc || selectedPoints.length === 0) return;
+    const invalid = doc.layers.some((layer) => layer.elements.some((element, el) => {
+      const count = selectedPoints.filter((point) => point.layerId === layer.id && point.el === el).length;
+      const geometry = count ? shapePoints(element) : null;
+      return geometry && geometry.points.length - count < (geometry.closed ? 3 : 2);
+    }));
+    if (invalid) {
       setStatus({ text: "A shape needs at least 3 corners (2 for a line); delete the shape instead.", error: true });
       return;
     }
-    update((doc) => ({
-      ...doc,
-      layers: doc.layers.map((layer) => layer.id !== shape.layerId ? layer : {
-        ...layer,
-        elements: layer.elements.map((element, el) => (el === shape.el ? withShapePoints(element, { ...shapeGeometry, points: left }) : element)),
+    update((doc) => ({ ...doc, layers: doc.layers.map((layer) => ({ ...layer,
+      elements: layer.elements.map((element, el) => {
+        const indices = selectedPoints.filter((point) => point.layerId === layer.id && point.el === el).map((point) => point.index);
+        const geometry = indices.length ? shapePoints(element) : null;
+        return geometry ? withShapePoints(element, { ...geometry,
+          points: geometry.points.filter((_, index) => !indices.includes(index)),
+        }) : element;
       }),
-    }));
+    })) }));
     setPointSelection([]);
-  }, [selectedPoints, shape, shapeGeometry, update]);
+  }, [doc, selectedPoints, update]);
 
   /** Adds a corner to the selected shape where its outline passes nearest (x, y), and to any shape sharing that edge. */
   const insertPoint = (x: number, y: number): boolean => {
@@ -479,18 +523,55 @@ export function StructureLabRoute() {
         return elements.every((element, index) => element === layer.elements[index]) ? layer : { ...layer, elements };
       }),
     }));
-    setPointSelection([near.insertAt]);
+    setPointSelection([{ ...shape, index: near.insertAt }]);
     return true;
   };
 
-  // Keyboard: undo/redo, save, tools, delete and nudge the selected layer or corners.
+  const copySelection = useCallback(() => {
+    if (!doc) return false;
+    const clipboard = copyPartSelection(doc, tool === "layer"
+      ? { kind: "layers", ids: selectedLayerIds }
+      : { kind: "shapes", shapes: selectedPoints.length ? selectedPoints : shapeSelection });
+    if (!clipboard) return false;
+    clipboardRef.current = clipboard;
+    pasteCountRef.current = 0;
+    const count = clipboard.kind === "layers" ? clipboard.layers.length
+      : clipboard.layers.reduce((sum, layer) => sum + layer.elements.length, 0);
+    setStatus({ text: `Copied ${count} ${clipboard.kind === "layers" ? "layer" : "shape"}${count === 1 ? "" : "s"}. Ctrl+V to paste.` });
+    return true;
+  }, [doc, selectedLayerIds, selectedPoints, shapeSelection, tool]);
+
+  const pasteSelection = useCallback(() => {
+    const clipboard = clipboardRef.current;
+    if (!doc || !clipboard) return false;
+    const offset = 2 * ++pasteCountRef.current;
+    // Allocate IDs before the React updater so one paste is one stable undo step.
+    const copies = pastePartLayers(clipboard, doc, [offset, offset]);
+    update((doc) => insertPartLayers(doc, copies, layerId));
+    setLayerIds(copies.map((layer) => layer.id));
+    layerAnchor.current = copies.at(-1)?.id ?? null;
+    setPointSelection([]);
+    setTool(clipboard.kind === "layers" ? "layer" : "points");
+    setShapeSelection(clipboard.kind === "shapes" ? copies.flatMap((layer) =>
+      layer.elements.map((_, el) => ({ layerId: layer.id, el }))) : []);
+    const count = clipboard.kind === "layers" ? copies.length
+      : copies.reduce((sum, layer) => sum + layer.elements.length, 0);
+    setStatus({ text: `Pasted ${count} ${clipboard.kind === "layers" ? "layer" : "shape"}${count === 1 ? "" : "s"}. Drag the selection to move it.` });
+    return true;
+  }, [doc, layerId, update]);
+
+  // Keyboard: copy/paste, undo/redo, save, tools, delete and nudge the selection.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
-      if (target && /^(INPUT|SELECT|TEXTAREA)$/.test(target.tagName)) return;
+      if (target && (/^(INPUT|SELECT|TEXTAREA)$/.test(target.tagName) || target.isContentEditable)) return;
       const mod = event.ctrlKey || event.metaKey;
       const key = event.key.toLowerCase();
-      if (mod && key === "z") {
+      if (mod && key === "c") {
+        if (copySelection()) event.preventDefault();
+      } else if (mod && key === "v") {
+        if (pasteSelection()) event.preventDefault();
+      } else if (mod && key === "z") {
         event.preventDefault();
         step(event.shiftKey ? 1 : -1);
       } else if (mod && key === "y") {
@@ -503,37 +584,41 @@ export function StructureLabRoute() {
         setTool(key === "v" ? "layer" : "points");
       } else if (tool === "points") {
         const arrow = ({ ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] } as Record<string, Point>)[event.key];
-        if (mod && key === "a" && shapeGeometry) {
+        if (mod && key === "a" && doc) {
           event.preventDefault();
-          setPointSelection(shapeGeometry.points.map((_, index) => index));
+          setPointSelection(shapeCorners(doc, shapeSelection));
         } else if (event.key === "Delete" || event.key === "Backspace") {
           event.preventDefault();
           if (selectedPoints.length > 0) deletePoints();
           else deleteShape();
-        } else if (arrow && shapeGeometry) {
+        } else if (arrow && doc && shapeSelection.length > 0) {
           event.preventDefault();
           const amount = event.shiftKey ? 2 : 0.5;
-          const indices = selectedPoints.length > 0 ? selectedPoints : shapeGeometry.points.map((_, index) => index);
-          nudgePoints(indices, arrow[0] * amount, arrow[1] * amount, `nudge-points:${shape?.layerId}:${shape?.el}:${indices.join(",")}`);
+          const corners = selectedPoints.length > 0 ? selectedPoints : shapeCorners(doc, shapeSelection);
+          nudgePoints(corners, arrow[0] * amount, arrow[1] * amount, `nudge-points:${corners.map((point) => `${point.layerId}:${point.el}:${point.index}`).join(",")}`);
         } else if (event.key === "Escape") {
           if (selectedPoints.length > 0) setPointSelection([]);
           else setShape(null);
         }
-      } else if (layerId && (event.key === "Delete" || event.key === "Backspace")) {
+      } else if (mod && key === "a" && doc) {
         event.preventDefault();
-        removeLayer(layerId);
-      } else if (layerId && event.key.startsWith("Arrow")) {
+        setLayerIds(doc.layers.filter((layer) => !layer.hidden).map((layer) => layer.id));
+      } else if (selectedLayerIds.length > 0 && (event.key === "Delete" || event.key === "Backspace")) {
+        event.preventDefault();
+        update((doc) => ({ ...doc, layers: doc.layers.filter((layer) => !selectedLayerIds.includes(layer.id)) }));
+        setLayerIds([]);
+      } else if (selectedLayerIds.length > 0 && event.key.startsWith("Arrow")) {
         event.preventDefault();
         const amount = event.shiftKey ? 2 : 0.5;
         const [x, y] = { ArrowLeft: [-amount, 0], ArrowRight: [amount, 0], ArrowUp: [0, -amount], ArrowDown: [0, amount] }[event.key] ?? [0, 0];
-        updateLayer(layerId, (layer) => ({ ...layer, dx: layer.dx + x, dy: layer.dy + y }), `nudge:${layerId}`);
+        update((doc) => moveLayers(doc, selectedLayerIds, x, y), `nudge:${selectedLayerIds.join(",")}`);
       } else if (event.key === "Escape") {
-        setLayerId(null);
+        setLayerIds([]);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [deletePoints, deleteShape, layerId, nudgePoints, removeLayer, save, selected, selectedPoints, shape, shapeGeometry, step, tool, updateLayer]);
+  }, [copySelection, pasteSelection, deletePoints, deleteShape, doc, nudgePoints, save, selected, selectedLayerIds, selectedPoints, shapeSelection, step, tool, update, setShape]);
 
   useEffect(() => {
     if (!anyDirty) return;
@@ -577,10 +662,10 @@ export function StructureLabRoute() {
     return matrix ? new DOMPoint(event.clientX, event.clientY).matrixTransform(matrix.inverse()) : null;
   };
 
-  /** Starts dragging corners `indices` of `target`; `grab` is the corner under the pointer, which snaps. */
-  const startPointDrag = (event: ReactPointerEvent, start: Point, target: ShapeRef, indices: readonly number[], grab: Point | null, link: boolean) => {
+  /** Starts dragging selected corners; `grab` is the corner under the pointer, which snaps. */
+  const startPointDrag = (event: ReactPointerEvent, start: Point, corners: readonly CornerRef[], grab: Point | null, link: boolean) => {
     if (!doc) return;
-    const targets = pointTargets(doc, target, indices, link);
+    const targets = pointTargets(doc, corners, link);
     const anchors = grab
       ? allPoints(doc).filter((point) => !targets.some((moving) => sameShape(moving, point) && moving.index === point.index))
       : [];
@@ -600,29 +685,36 @@ export function StructureLabRoute() {
     if (!point) return;
     if (tool === "points") {
       const handle = (event.target as Element).closest("[data-handle]");
-      if (handle && shape && shapeGeometry && shapeLayer) {
-        const index = Number(handle.getAttribute("data-handle"));
-        let selection = selectedPoints;
-        if (event.shiftKey) selection = selection.includes(index) ? selection.filter((other) => other !== index) : [...selection, index];
-        else if (!selection.includes(index)) selection = [index];
+      if (handle) {
+        const corner: CornerRef = {
+          layerId: handle.getAttribute("data-handle-layer")!,
+          el: Number(handle.getAttribute("data-handle-el")),
+          index: Number(handle.getAttribute("data-handle")),
+        };
+        const selection = selectItem(selectedPoints, corner, event.ctrlKey || event.metaKey || event.shiftKey, sameCorner);
         setPointSelection(selection);
-        if (selection.includes(index)) {
-          const [x, y] = shapeGeometry.points[index];
-          startPointDrag(event, [point.x, point.y], shape, selection, [x + shapeLayer.dx, y + shapeLayer.dy], linkCorners);
+        if (selection.some((point) => sameCorner(point, corner))) {
+          const grab = allPoints(doc).find((point) => sameCorner(point, corner));
+          if (grab) startPointDrag(event, [point.x, point.y], selection, [grab.ax, grab.ay], linkCorners);
         }
         return;
       }
       if (layer && hitElement) {
         const next = { layerId: layer.id, el: Number(hitElement.getAttribute("data-el")) };
-        if (!shape || !sameShape(shape, next)) setPointSelection([]);
-        setShape(next);
+        const additive = event.ctrlKey || event.metaKey || event.shiftKey;
+        const selection = selectItem(shapeSelection, next, additive, sameShape);
+        setShapeSelection(selection.some((ref) => sameShape(ref, next))
+          ? [...selection.filter((ref) => !sameShape(ref, next)), next] : selection);
         setLayerId(layer.id);
-        // Dragging the body moves the whole shape, without its neighbours.
-        const geometry = shapePoints(layer.elements[next.el] ?? "");
-        if (geometry) startPointDrag(event, [point.x, point.y], next, geometry.points.map((_, index) => index), null, false);
+        // Keep corner selections when adding shapes; body drags move the selected shapes together.
+        if (additive) setPointSelection((corners) => corners.filter((corner) => selection.some((ref) => sameShape(ref, corner))));
+        else setPointSelection([]);
+        if (selection.some((ref) => sameShape(ref, next))) {
+          startPointDrag(event, [point.x, point.y], shapeCorners(doc, selection), null, false);
+        }
         return;
       }
-      if (event.shiftKey && shape) {
+      if (event.shiftKey || event.ctrlKey || event.metaKey) {
         dragRef.current = { kind: "marquee", pointer: event.pointerId, startX: point.x, startY: point.y, add: true };
         return;
       }
@@ -633,10 +725,12 @@ export function StructureLabRoute() {
       return;
     }
     if (layer) {
-      setLayerId(layer.id);
+      const ids = pickLayer(layer.id, event, true);
+      if (!ids.includes(layer.id)) return;
       dragRef.current = {
-        kind: "move", id: layer.id, pointer: event.pointerId, startX: point.x, startY: point.y,
-        dx: layer.dx, dy: layer.dy, key: `move:${event.timeStamp}`,
+        kind: "move", ids, start: doc, pointer: event.pointerId, startX: point.x, startY: point.y,
+        dx: layer.dx, dy: layer.dy, key: `move:${event.timeStamp}`, moved: false,
+        additive: event.ctrlKey || event.metaKey || event.shiftKey,
       };
     } else {
       setLayerId(null);
@@ -690,9 +784,14 @@ export function StructureLabRoute() {
       update(() => movePoints(drag.start, drag.targets, dx, dy), drag.key);
       return;
     }
-    let [dx, dy] = [drag.dx + point.x - drag.startX, drag.dy + point.y - drag.startY];
-    if (event.shiftKey) [dx, dy] = snapToGrid(dx, dy);
-    updateLayer(drag.id, (layer) => (layer.dx === dx && layer.dy === dy ? layer : { ...layer, dx, dy }), drag.key);
+    let [dx, dy] = [point.x - drag.startX, point.y - drag.startY];
+    if (!drag.moved && Math.hypot(dx, dy) < 2 * unitsPerPixel) return;
+    drag.moved = true;
+    if (event.shiftKey && !drag.additive) {
+      const [sx, sy] = snapToGrid(drag.dx + dx, drag.dy + dy);
+      [dx, dy] = [sx - drag.dx, sy - drag.dy];
+    }
+    update(() => moveLayers(drag.start, drag.ids, dx, dy), drag.key);
   };
 
   const onPointerUp = (event: ReactPointerEvent<SVGSVGElement>) => {
@@ -702,24 +801,26 @@ export function StructureLabRoute() {
     if (drag.kind === "marquee") {
       setMarquee(null);
       const point = toSvg(event);
-      if (!point || !shapeGeometry || !shapeLayer) return;
+      if (!point || !doc) return;
       const [x0, x1] = [Math.min(drag.startX, point.x), Math.max(drag.startX, point.x)];
       const [y0, y1] = [Math.min(drag.startY, point.y), Math.max(drag.startY, point.y)];
-      const inside = shapeGeometry.points.flatMap(([x, y], index) => {
-        const [ax, ay] = [x + shapeLayer.dx, y + shapeLayer.dy];
-        return ax >= x0 && ax <= x1 && ay >= y0 && ay <= y1 ? [index] : [];
+      const inside = allPoints(doc).filter(({ ax, ay }) => ax >= x0 && ax <= x1 && ay >= y0 && ay <= y1);
+      const corners = [...(drag.add ? selectedPoints : []), ...inside];
+      setPointSelection(corners.filter((corner, index) => !corners.slice(0, index).some((other) => sameCorner(other, corner))));
+      setShapeSelection((selection) => {
+        const shapes = [...selection, ...inside.map(({ layerId, el }) => ({ layerId, el }))];
+        return shapes.filter((ref, index) => !shapes.slice(0, index).some((other) => sameShape(other, ref)));
       });
-      setPointSelection((selection) => [...new Set([...(drag.add ? selection : []), ...inside])]);
     }
   };
 
-  // Dashed box round the hovered or selected layer.
-  const focusId = hoverId ?? layerId;
+  // Dashed box around the group and the hovered layer.
   const [focusBox, setFocusBox] = useState<Box | null>(null);
   useLayoutEffect(() => {
-    const layer = doc?.layers.find((candidate) => candidate.id === focusId);
-    setFocusBox(layer ? measureLayers(svgRef.current, [layer]) : null);
-  }, [doc, focusId]);
+    const focusIds = hoverId ? [...selectedLayerIds, hoverId] : selectedLayerIds;
+    const layers = doc?.layers.filter((candidate) => focusIds.includes(candidate.id)) ?? [];
+    setFocusBox(layers.length ? measureLayers(svgRef.current, layers) : null);
+  }, [doc, selectedLayerIds, hoverId]);
 
   const partMarkup = useMemo(() => {
     if (!doc) return "";
@@ -740,29 +841,41 @@ export function StructureLabRoute() {
     [sources],
   );
 
-  // Composed from the files on disk, so it shows edits once they are saved.
-  const contextUrl = useMemo(() => {
-    let svg = composeSettlement(context.kind, context.seed);
+  // Artwork comes from the saved files; draft placement choices apply immediately.
+  const contextPreview = useMemo(() => {
+    let svg = composeSettlement(context.kind, context.seed, placementRules);
+    const present = svg.includes(`data-part="${selected}"`);
     if (highlightInContext) {
       svg = svg.replace("</svg>", `<style>[data-part]:not([data-part="${selected}"]){opacity:.35}</style></svg>`);
     }
-    return svgDataUrl(svg);
+    return { url: svgDataUrl(svg), present };
     // Fast Refresh reruns this when a save reloads the parts it composes from.
-  }, [context, highlightInContext, selected]);
+  }, [context, highlightInContext, selected, placementRules]);
 
-  const selectedLayer = doc?.layers.find((layer) => layer.id === layerId) ?? null;
-  const hoverLayer = tool === "points" && hoverShape && !(shape && sameShape(shape, hoverShape))
+  const selectedLayer = doc?.layers.find((layer) => layer.id === selectedLayerIds.at(-1)) ?? null;
+  const hoverLayer = tool === "points" && hoverShape && !shapeSelection.some((ref) => sameShape(ref, hoverShape))
     ? doc?.layers.find((layer) => layer.id === hoverShape.layerId) ?? null
     : null;
   const hoverGeometry = hoverShape && hoverLayer ? shapePoints(hoverLayer.elements[hoverShape.el] ?? "") : null;
-  const singlePoint = shapeGeometry && shapeLayer && selectedPoints.length === 1
-    ? ([shapeGeometry.points[selectedPoints[0]][0] + shapeLayer.dx, shapeGeometry.points[selectedPoints[0]][1] + shapeLayer.dy] as Point)
+  const singlePoint = selectedPoints.length === 1
+    ? ([selectedPoints[0].ax, selectedPoints[0].ay] as Point)
     : null;
   const listed = doc ? [...doc.layers].reverse() : [];
   const visibleNames = names.filter((name) => name.includes(filter.trim().toLowerCase()));
   const button = "flex items-center gap-1 rounded bg-slate-800 px-2 py-1 hover:bg-slate-700 disabled:opacity-40 disabled:hover:bg-slate-800";
   const iconButton = "rounded p-0.5 text-slate-400 hover:bg-slate-700 hover:text-slate-100 disabled:opacity-30";
   const numberInput = "w-full rounded bg-slate-950 px-1.5 py-0.5 tabular-nums";
+
+  // Guides share canvas coordinates but never take part in hit testing or saved artwork.
+  const blueprintOverlay = doc && (
+    <g pointerEvents="none">
+      {showGrid && <GridOverlay doc={doc} />}
+      {visibleReference && <>
+        <PartBlueprintOverlay doc={visibleReference} origin={doc.origin} name={referenceName} />
+        <GridOverlay doc={visibleReference} origin={doc.origin} reference />
+      </>}
+    </g>
+  );
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-slate-950 font-sans text-xs text-slate-100">
@@ -836,7 +949,10 @@ export function StructureLabRoute() {
           <label className="flex items-center gap-1">
             <input type="checkbox" checked={showGrid} onChange={(event) => setShowGrid(event.target.checked)} /> Grid
           </label>
-          <button className={button} onClick={() => doc && setView(fitView(doc))}>Fit</button>
+          <label className="flex items-center gap-1" title="Draw the footprint grid and reference blueprint above the artwork">
+            <input type="checkbox" checked={blueprintOnTop} onChange={(event) => setBlueprintOnTop(event.target.checked)} /> Blueprint on top
+          </label>
+          <button className={button} onClick={() => doc && setView(fitView(doc, visibleReference))}>Fit</button>
           <button className={`${button} bg-sky-700 hover:bg-sky-600`} disabled={!doc} onClick={() => void save(selected)} title="Save (Ctrl+S)">
             <Save size={14} /> Save
           </button>
@@ -858,7 +974,7 @@ export function StructureLabRoute() {
               if (!doc) return;
               const point = tool === "points" ? toSvg(event) : null;
               if (point && insertPoint(point.x, point.y)) return;
-              if (!(event.target as Element).closest("[data-lid], [data-handle]")) setView(fitView(doc));
+              if (!(event.target as Element).closest("[data-lid], [data-handle]")) setView(fitView(doc, visibleReference));
             }}
           >
             <style>{ROOF_CSS}</style>
@@ -869,34 +985,38 @@ export function StructureLabRoute() {
                 fill="none" stroke="#a8916e" strokeDasharray="4 3" vectorEffect="non-scaling-stroke"
               />
             )}
-            {doc && showGrid && <GridOverlay doc={doc} />}
+            {!blueprintOnTop && blueprintOverlay}
             <g dangerouslySetInnerHTML={partHtml} />
+            {blueprintOnTop && blueprintOverlay}
             {hoverGeometry && hoverLayer && (
               <path
                 d={outlinePath(hoverGeometry, hoverLayer.dx, hoverLayer.dy)}
                 fill="none" stroke="#0284c7" strokeWidth={1} strokeDasharray="3 2" vectorEffect="non-scaling-stroke" pointerEvents="none"
               />
             )}
-            {tool === "points" && shapeGeometry && shapeLayer && (
-              <g>
+            {tool === "points" && selectedShapes.map(({ ref, layer, geometry }) => (
+              <g key={`${ref.layerId}:${ref.el}`}>
                 <path
-                  d={outlinePath(shapeGeometry, shapeLayer.dx, shapeLayer.dy)}
+                  d={outlinePath(geometry, layer.dx, layer.dy)}
                   fill="none" stroke="#0284c7" strokeWidth={1.5} vectorEffect="non-scaling-stroke" pointerEvents="none"
                 />
-                {shapeGeometry.points.map(([x, y], index) => {
-                  const size = HANDLE_PX * unitsPerPixel * (selectedPoints.includes(index) ? 1.3 : 1);
+                {geometry.points.map(([x, y], index) => {
+                  const selected = selectedPoints.some((corner) => sameCorner(corner, { ...ref, index }));
+                  const size = HANDLE_PX * unitsPerPixel * (selected ? 1.3 : 1);
                   return (
                     <rect
                       key={index}
                       data-handle={index}
-                      x={x + shapeLayer.dx - size} y={y + shapeLayer.dy - size} width={size * 2} height={size * 2}
-                      fill={selectedPoints.includes(index) ? "#0284c7" : "#ffffff"} stroke="#0284c7" strokeWidth={1}
+                      data-handle-layer={ref.layerId}
+                      data-handle-el={ref.el}
+                      x={x + layer.dx - size} y={y + layer.dy - size} width={size * 2} height={size * 2}
+                      fill={selected ? "#0284c7" : "#ffffff"} stroke="#0284c7" strokeWidth={1}
                       vectorEffect="non-scaling-stroke" className="cursor-move"
                     />
                   );
                 })}
               </g>
-            )}
+            ))}
             {marquee && (
               <rect
                 x={marquee.x} y={marquee.y} width={marquee.width} height={marquee.height}
@@ -914,18 +1034,36 @@ export function StructureLabRoute() {
           </svg>
           <p className="pointer-events-none absolute bottom-2 left-3 right-3 text-[11px] text-stone-600">
             {tool === "layer"
-              ? "Layers tool: click a shape to pick its layer; drag to move the layer (Shift snaps to half cells), arrows nudge."
-              : "Points tool: click a shape, then drag its corners (they snap to other corners; Alt stops that). Shift-click or "
-                + "Shift-drag a box adds corners, double-click an edge adds one, Delete removes, arrows nudge."}
-            {" "}Drag the background to pan, scroll to zoom, double-click empty space to fit. Dashed brown: the file's viewBox.
+              ? "Layers: Ctrl/Shift-click toggles layers; Shift-click in the list selects a range. Drag or arrows move the selection. Hold Shift after starting a drag to snap."
+              : "Points: Ctrl/Shift-click toggles shapes or corners; Ctrl/Shift-drag a box adds corners across shapes. Drag or arrows move the selection; Alt disables snapping. Double-click an edge adds a corner."}
+            {" "}Ctrl+C copies selected layers or shapes; Ctrl+V pastes. Drag the background to pan, scroll to zoom, double-click empty space to fit. Dashed brown: the file's viewBox.
           </p>
         </div>
       </main>
 
       <aside className="w-80 shrink-0 overflow-y-auto border-l border-slate-800 bg-slate-900 p-3">
         <section className="mb-4">
+          <h2 className="mb-2 font-semibold uppercase tracking-wider text-slate-400">Blueprint reference</h2>
+          <label className="mb-2 flex items-center gap-1">
+            <input type="checkbox" checked={showReference} disabled={!referenceDoc} onChange={(event) => {
+              setShowReference(event.target.checked);
+              if (event.target.checked && doc) setView(fitView(doc, referenceDoc));
+            }} /> Show reference blueprint
+          </label>
+          <PartLayerPicker options={referenceOptions} value={referenceName} label="Reference part"
+            placeholder="Choose a reference house..." searchPlaceholder="Search reference parts..."
+            onChange={(name) => {
+              setReferenceName(name);
+              setShowReference(true);
+              setBlueprintOnTop(true);
+              const next = docOf(name);
+              if (doc && next && !(next instanceof Error)) setView(fitView(doc, next));
+            }} />
+          <p className="mt-2 text-slate-500">Dashed blue outlines show the reference at the same scale and grid origin. Use Blueprint on top to compare shapes and height over your artwork.</p>
+        </section>
+        <section className="mb-4">
           <h2 className="mb-1 font-semibold uppercase tracking-wider text-slate-400">Layers</h2>
-          <p className="mb-2 text-slate-500">Top of the list is drawn last, in front.</p>
+          <p className="mb-2 text-slate-500">Top is drawn in front. Ctrl-click toggles; Shift-click selects a range.{selectedLayerIds.length > 1 && <span className="text-sky-300"> {selectedLayerIds.length} layers selected.</span>}</p>
           <ul onMouseLeave={() => setHoverId(null)}>
             {listed.map((layer) => {
               const index = doc!.layers.indexOf(layer);
@@ -950,9 +1088,9 @@ export function StructureLabRoute() {
                   }}
                   onDragEnd={() => setDragOverId(null)}
                   onMouseEnter={() => setHoverId(layer.id)}
-                  onClick={() => setLayerId(layer.id)}
+                  onClick={(event) => pickLayer(layer.id, event)}
                   className={`mb-0.5 flex items-center gap-1 rounded px-1 py-1 ${
-                    layer.id === layerId ? "bg-sky-900/60" : "hover:bg-slate-800"
+                    selectedLayerIds.includes(layer.id) ? "bg-sky-900/60" : "hover:bg-slate-800"
                   } ${dragOverId === layer.id ? "outline outline-1 outline-sky-500" : ""}`}
                 >
                   <GripVertical size={14} className="shrink-0 cursor-grab text-slate-600" />
@@ -1014,16 +1152,7 @@ export function StructureLabRoute() {
             })}
           </ul>
           <div className="mt-2 flex gap-1">
-            <select className="min-w-0 flex-1 rounded bg-slate-800 px-1 py-1" value={borrow} onChange={(event) => setBorrow(event.target.value)}>
-              <option value="">Borrow a layer from…</option>
-              {borrowOptions.map(({ name, doc: source }) => (
-                <optgroup key={name} label={name}>
-                  {source.layers.map((layer) => (
-                    <option key={layer.id} value={`${name}|${layer.id}`}>{layer.name}</option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
+            <PartLayerPicker options={borrowLayerOptions} value={borrow} onChange={setBorrow} />
             <button className={button} disabled={!borrow || !doc} onClick={addBorrowed} title="Add above the selected layer, at the same grid position">
               <Plus size={14} /> Add
             </button>
@@ -1042,7 +1171,8 @@ export function StructureLabRoute() {
                 <p className="mb-2 text-slate-300">
                   {shapeLayer.name} · shape {shape.el + 1} of {shapeLayer.elements.length} · {shapeGeometry.points.length} corners
                   {shapeGeometry.closed ? "" : " (open line)"}
-                  {selectedPoints.length > 0 && <span className="text-sky-300"> · {selectedPoints.length} selected</span>}
+                  {selectedPoints.length > 0 && <span className="text-sky-300"> / {selectedPoints.length} corners selected</span>}
+                  {selectedShapes.length > 1 && <span className="text-sky-300"> / {selectedShapes.length} shapes selected</span>}
                 </p>
                 {singlePoint && (
                   <div className="mb-2 grid grid-cols-2 gap-2">
@@ -1056,7 +1186,7 @@ export function StructureLabRoute() {
                             const value = Number(event.target.value);
                             if (!Number.isFinite(value)) return;
                             const delta = value - singlePoint[axis];
-                            nudgePoints(selectedPoints, axis === 0 ? delta : 0, axis === 1 ? delta : 0, `corner:${shape.layerId}:${shape.el}:${selectedPoints[0]}`);
+                            nudgePoints(selectedPoints, axis === 0 ? delta : 0, axis === 1 ? delta : 0, `corner:${selectedPoints[0].layerId}:${selectedPoints[0].el}:${selectedPoints[0].index}`);
                           }}
                         />
                       </label>
@@ -1072,7 +1202,7 @@ export function StructureLabRoute() {
                     <Trash2 size={14} /> Delete corners
                   </button>
                   <button className={button} onClick={deleteShape}>
-                    <Trash2 size={14} /> Delete shape
+                    <Trash2 size={14} /> Delete {shapeSelection.length > 1 ? "shapes" : "shape"}
                   </button>
                 </div>
               </>
@@ -1092,7 +1222,10 @@ export function StructureLabRoute() {
                     value={Math.round(selectedLayer[axis] * 100) / 100}
                     onChange={(event) => {
                       const value = Number(event.target.value);
-                      if (Number.isFinite(value)) updateLayer(selectedLayer.id, (layer) => ({ ...layer, [axis]: value }), `offset:${selectedLayer.id}`);
+                      if (Number.isFinite(value)) {
+                        const delta = value - selectedLayer[axis];
+                        update((doc) => moveLayers(doc, selectedLayerIds, axis === "dx" ? delta : 0, axis === "dy" ? delta : 0), `offset:${selectedLayerIds.join(",")}`);
+                      }
                     }}
                   />
                 </label>
@@ -1156,13 +1289,39 @@ export function StructureLabRoute() {
           {saveAsName in sources && <p className="mt-1 text-amber-300">That part already exists.</p>}
         </section>
 
+        <section className="mb-4">
+          <h2 className="mb-2 font-semibold uppercase tracking-wider text-slate-400">Appears in</h2>
+          {fixedPlacement ? (
+            <p className="text-slate-400">This part connects the walls or anchors a corner. Its placement is controlled by the settlement layout.</p>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-2">
+                {SETTLEMENT_KINDS.map(({ kind, label }) => (
+                  <label key={kind} className="flex items-center gap-1.5">
+                    <input type="checkbox" checked={placement.includes(kind)} disabled={!doc}
+                      onChange={(event) => setPlacement(kind, event.target.checked)} />
+                    {label}
+                  </label>
+                ))}
+              </div>
+              <p className="mt-2 text-slate-400">Choose which settlements can use this building. Save to keep these choices.</p>
+              {placement.length === 0 && <p className="mt-1 text-amber-300">Disabled in all settlements.</p>}
+              {placementRules[selected] !== undefined && (
+                <button className={`${button} mt-2`} onClick={() => update((doc) => ({
+                  ...doc, attributes: doc.attributes.filter(([key]) => key !== SETTLEMENT_ATTRIBUTE),
+                }))}>Use default placement</button>
+              )}
+            </>
+          )}
+        </section>
+
         <section>
           <h2 className="mb-2 font-semibold uppercase tracking-wider text-slate-400">In a settlement</h2>
           <div className="mb-2 flex items-center gap-1">
             <select
               className="flex-1 rounded bg-slate-800 px-1 py-1"
               value={context.kind}
-              onChange={(event) => setContext((context) => ({ ...context, kind: event.target.value as SettlementKind }))}
+              onChange={(event) => showInSettlement(event.target.value as SettlementKind)}
             >
               {SETTLEMENT_KINDS.map(({ kind, label }) => (
                 <option key={kind} value={kind}>{label}</option>
@@ -1178,8 +1337,11 @@ export function StructureLabRoute() {
             <input type="checkbox" checked={highlightInContext} onChange={(event) => setHighlightInContext(event.target.checked)} />
             Fade the other parts
           </label>
-          <img src={contextUrl} alt="" className="w-full rounded bg-[#efe6d2]" />
-          <p className="mt-1 text-slate-500">Drawn from the saved files; shows edits after Save.</p>
+          <button className={`${button} mb-2`} disabled={!placement.includes(context.kind)}
+            onClick={() => showInSettlement(context.kind)}>Find layout with this part</button>
+          <img src={contextPreview.url} alt={`${context.kind} layout ${context.seed}`} className="w-full rounded bg-[#efe6d2]" />
+          {!contextPreview.present && <p className="mt-1 text-amber-300">This part does not appear in this layout.</p>}
+          <p className="mt-1 text-slate-500">Placement choices preview immediately. Building artwork updates after Save.</p>
         </section>
       </aside>
     </div>
@@ -1192,9 +1354,9 @@ function outlinePath(shape: { points: readonly Point[]; closed: boolean }, dx: n
 }
 
 /** Iso grid round the footprint, and the footprint itself, anchored on the part's origin. */
-function GridOverlay({ doc }: { doc: PartDocument }) {
+function GridOverlay({ doc, origin = doc.origin, reference = false }: { doc: PartDocument; origin?: Point; reference?: boolean }) {
   const [cellsI, cellsJ] = doc.footprint;
-  const [ox, oy] = doc.origin;
+  const [ox, oy] = origin;
   const at = (i: number, j: number) => [ox + (i - j) * STEP_X, oy + (i + j) * STEP_Y] as const;
   const margin = 2;
   const lines: string[] = [];
@@ -1209,8 +1371,8 @@ function GridOverlay({ doc }: { doc: PartDocument }) {
   const footprint = [at(0, 0), at(cellsI, 0), at(cellsI, cellsJ), at(0, cellsJ)].map((point) => point.join(" ")).join(" ");
   return (
     <g pointerEvents="none">
-      <path d={lines.join("")} stroke="#a8916e" strokeOpacity={0.45} fill="none" vectorEffect="non-scaling-stroke" />
-      <polygon points={footprint} fill="#0284c7" fillOpacity={0.12} stroke="#0284c7" strokeWidth={1.5} vectorEffect="non-scaling-stroke" />
+      {!reference && <path d={lines.join("")} stroke="#a8916e" strokeOpacity={0.45} fill="none" vectorEffect="non-scaling-stroke" />}
+      <polygon points={footprint} fill="#0284c7" fillOpacity={reference ? 0.04 : 0.12} stroke="#0284c7" strokeWidth={1.5} strokeDasharray={reference ? "4 2" : undefined} vectorEffect="non-scaling-stroke" />
       <circle cx={ox} cy={oy} r={0.8} fill="#0284c7" />
     </g>
   );

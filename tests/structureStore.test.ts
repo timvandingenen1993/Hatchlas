@@ -5,7 +5,7 @@ import {
   STRUCTURES_STORAGE_KEY,
   type StoredStructures,
 } from '../src/structures/structureStore';
-import { DEFAULT_ROAD_STYLE, DEFAULT_ROUTING_SETTINGS, DEFAULT_TOWN_STYLE } from '../src/structures/types';
+import { DEFAULT_ROAD_STYLE, DEFAULT_ROUTING_SETTINGS, DEFAULT_TOWN_STYLE, roadKindStyle } from '../src/structures/types';
 
 describe('structure store', () => {
   it('round-trips roads, towns and routing settings', () => {
@@ -17,9 +17,6 @@ describe('structure store', () => {
             id: 'road_1',
             name: 'King\'s Way',
             kind: 'highway',
-            color: '#553311',
-            lineStyle: 'dotted',
-            widthScale: 1.5,
             visible: true,
             waypoints: [{ id: 'w1', u: 0.1, v: 0.2 }, { id: 'w2', u: 0.8, v: 0.7 }],
           }],
@@ -33,12 +30,18 @@ describe('structure store', () => {
             seed: 1234,
             size: 40,
             labelPosition: 'right',
+            labelOffset: 18,
             showLabel: true,
           }],
         },
       },
       routing: { ...DEFAULT_ROUTING_SETTINGS, maxGradePct: 9, forestAvoidance: 2 },
-      roadStyle: { ...DEFAULT_ROAD_STYLE, outline: true, outlineColor: '#ffffff', clearance: 6 },
+      roadStyle: { ...DEFAULT_ROAD_STYLE, outline: true, outlineColor: '#ffffff', clearance: 6, byKind: {
+        track: { width: 2, color: '#112233', dashSpacing: 8 },
+        road: { width: 5, outline: true, outlineColor: '#ddeeff', outlineWidth: 2 },
+        highway: { width: 10, shadowOpacity: 0.4, shadowColor: '#221100', shadowOffset: 3, shadowBlur: 4,
+          dashLength: 22 },
+      } },
       townStyle: { ...DEFAULT_TOWN_STYLE, font: 'garamond', uppercase: true, letterSpacing: 0.12 },
     };
     const written = new Map<string, string>();
@@ -57,6 +60,23 @@ describe('structure store', () => {
     expect(parseStoredStructures(null)).toEqual(empty);
     expect(parseStoredStructures('{not json')).toEqual(empty);
     expect(parseStoredStructures(JSON.stringify({ version: 7, maps: {} }))).toEqual(empty);
+  });
+
+  it('drops saved per-road overrides so styling comes from the type', () => {
+    const parsed = parseStoredStructures(JSON.stringify({
+      version: 1,
+      maps: { a: { roads: [{ id: 'r', name: 'Old road', kind: 'highway', visible: true,
+        waypoints: [{ id: 'w', u: 0.2, v: 0.3 }], color: '#ff0000', widthScale: 4, lineStyle: 'double',
+      }] } },
+      roadStyle: { byKind: { highway: { width: 6, color: '#102030' } } },
+    }));
+    expect(parsed.maps.a.roads[0]).toEqual({ id: 'r', name: 'Old road', kind: 'highway', visible: true,
+      waypoints: [{ id: 'w', u: 0.2, v: 0.3 }],
+    });
+    expect(roadKindStyle(parsed.roadStyle, 'highway')).toMatchObject({ width: 6, color: '#102030' });
+    const saved = new Map<string, string>();
+    saveStoredStructures(parsed, { setItem: (key, value) => saved.set(key, value) });
+    expect(JSON.parse(saved.get(STRUCTURES_STORAGE_KEY)!).maps.a.roads[0]).toEqual(parsed.maps.a.roads[0]);
   });
 
   it('drops invalid entries and clamps values', () => {
@@ -99,6 +119,20 @@ describe('structure store', () => {
     expect(parseStoredStructures(raw).maps.a.towns.slice(0, 2).map((town) => town.seed)).toEqual([first.seed, second.seed]);
   });
 
+  it('keeps signed label offsets and handles old or invalid values', () => {
+    const parsed = parseStoredStructures(JSON.stringify({
+      version: 1,
+      maps: { a: { towns: [
+        { id: 'old', u: 0.2, v: 0.3 },
+        { id: 'closer', u: 0.2, v: 0.3, labelOffset: -12 },
+        { id: 'invalid', u: 0.2, v: 0.3, labelOffset: 'far' },
+        { id: 'too-far', u: 0.2, v: 0.3, labelOffset: 9999 },
+        { id: 'too-close', u: 0.2, v: 0.3, labelOffset: -9999 },
+      ] } },
+    }));
+    expect(parsed.maps.a.towns.map((town) => town.labelOffset ?? 0)).toEqual([0, -12, 0, 320, -160]);
+  });
+
   it('reports a full storage instead of throwing', () => {
     const quota = new Error('full');
     quota.name = 'QuotaExceededError';
@@ -106,5 +140,33 @@ describe('structure store', () => {
       setItem: () => { throw quota; },
     });
     expect(message).toMatch(/full/);
+  });
+
+  it('uses the same shared settings for all types in old saves', () => {
+    const parsed = parseStoredStructures(JSON.stringify({ version: 1, roadStyle: {
+      widthScale: 2, color: '#112233', outline: true, outlineWidth: 3,
+    } }));
+    const base = roadKindStyle(parsed.roadStyle, 'road');
+    expect(base.width).toBe(8.4);
+    expect(base.color).toBe('#112233');
+    expect(base.outline).toBe(true);
+    expect(base.dashSpacing).toBe(0);
+    expect(roadKindStyle(parsed.roadStyle, 'track')).toEqual(base);
+    expect(roadKindStyle(parsed.roadStyle, 'highway')).toEqual(base);
+  });
+
+  it('sanitizes per-type styles without affecting other types or shared defaults', () => {
+    const parsed = parseStoredStructures(JSON.stringify({ version: 1, roadStyle: {
+      color: '#102030', byKind: {
+        track: { width: -1, dashSpacing: -20, color: 'bad', shadowOpacity: 9, shadowBlur: 999, highlightOpacity: 1 },
+        road: { dashSpacing: 18, outline: true }, highway: 'invalid', canal: { width: 99 },
+      },
+    } }));
+    expect(parsed.roadStyle.byKind).toEqual({
+      track: { width: 0.2, dashSpacing: 0, color: DEFAULT_ROAD_STYLE.color, shadowOpacity: 1, shadowBlur: 20 },
+      road: { dashSpacing: 18, outline: true },
+    });
+    expect(roadKindStyle(parsed.roadStyle, 'highway').color).toBe('#102030');
+    expect(roadKindStyle(parsed.roadStyle, 'road').dashSpacing).toBe(18);
   });
 });

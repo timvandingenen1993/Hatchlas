@@ -2,15 +2,16 @@
  * Castle sprite: a courtyard inside a curtain wall whose sides run along i,
  * along j or on a diagonal. The great keep rises on the back corner, round
  * towers stand on the corners furthest left, right and to the front, slim
- * turrets on the other square outer corners, and wall drums on the rest:
- * inner corners, the bends where a diagonal side meets a straight one, and
- * partway along long sides. A gatehouse stands out from a front wall.
+ * turrets on the other square outer corners, and wall drums on the rest.
+ * Occasionally one front drum is a slim turret instead. A gatehouse stands
+ * out from a front wall.
  * Castle buildings can stand in the wall itself, their outer wall the
  * castle's, with no wall drawn where they stand: a hall in each back wall
  * and sometimes a house in a front one. One more stands in the yard.
  *
  * The outline starts as a rectangle, then gets corners cut off on the
  * diagonal or notched in, and sometimes a bay pushed out of a front side.
+ * Occasionally the horizontal front wall is a cell longer.
  * Every piece is a whole SVG part of town-parts, the walls ("wall-...")
  * shared with walled towns and cities; this module only decides where each
  * one goes.
@@ -28,23 +29,19 @@ import {
   project,
   ROOF_CSS,
   shapeBounds,
-  shapesToSvg,
-  SOFT_WOBBLE,
   type Vec2,
   WALL,
   WALL_PIECE_GAP,
   type WallDirection,
 } from "./isoDraw";
 import { gabled, partNamed, PARTS, type TownPart } from "./townParts";
+import { allowedIn, isKeepOrTowerPart, placementPool, type PlacementRules } from "./partPlacement";
 
 const GATE_LENGTH = 3;
 /** Cells from the back corner kept whole, for the keep and the halls beside it. */
 const BACK_CLEAR = 5;
 /** Radius of the slim turrets and wall drums, for clearances and paint order. */
 const PIECE_RADIUS = 0.62;
-const COURTYARD = "#bdab88";
-const PATH = "#a99673";
-const SHADOW = "#2a1e1638";
 
 const fmt = (value: number) => (Math.round(value * 100) / 100).toString();
 const key = (i: number, j: number) => `${i},${j}`;
@@ -125,14 +122,13 @@ const outward = (d: Vec2): Vec2 => [d[1], -d[0]];
  * Corner points of the wall's centre line, back corner first: a rectangle
  * with its right, front and left corners each kept, cut off on the diagonal
  * or notched in (at least one cut), and sometimes a bay out of a front side.
+ * A longer front cut stays within the same rectangle.
  */
-function shapeOutline(between: (low: number, high: number) => number, random: () => number): Vec2[] {
+function shapeOutline(between: (low: number, high: number) => number, random: () => number, longerFront: boolean): Vec2[] {
   const LI = between(8, 10);
   const LJ = between(7, 9);
   const rectangle: Vec2[] = [[-0.5, -0.5], [LI + 0.5, -0.5], [LI + 0.5, LJ + 0.5], [-0.5, LJ + 0.5]];
-  // The front corner is usually cut: its diagonal wall runs across the
-  // screen, face on. Cut side corners run straight down it, seen nearly
-  // edge on, so they come up less.
+  // Keep the original balance of cut, recessed and square corners.
   const styles = [0.25, 0.65, 0.25].map((cut) => {
     const roll = random();
     return roll < cut ? "cut" : roll < cut + 0.2 ? "notch" : "plain";
@@ -145,7 +141,7 @@ function shapeOutline(between: (low: number, high: number) => number, random: ()
     const corner = rectangle[index + 1];
     const into = ALONG[index], out = ALONG[index + 1];
     if (style === "cut") {
-      const size = between(2, 3);
+      const size = between(2, 3) + (index === 1 && longerFront ? 1 : 0);
       corners.push([add(corner, into, -size), add(corner, out, size)]);
     } else if (style === "notch") {
       const [back, side] = [between(2, 3), between(2, 3)];
@@ -242,7 +238,7 @@ interface CastlePlan {
 }
 
 /** Pieces of a castle wall with this outline, or null when they do not fit together. */
-function planWall(outline: Vec2[], pickTower: () => TownPart, choose: (count: number) => number): Omit<CastlePlan, "court"> | null {
+function planWall(outline: Vec2[], pickTower: () => TownPart, choose: (count: number) => number, smallFrontTower: boolean, rules: PlacementRules): Omit<CastlePlan, "court"> | null {
   const count = outline.length;
   if (outline[0][0] !== -0.5 || outline[0][1] !== -0.5) return null;
   // Sides run along i, j or a diagonal, and the outline never crosses itself.
@@ -264,7 +260,7 @@ function planWall(outline: Vec2[], pickTower: () => TownPart, choose: (count: nu
 
   // What stands on each corner: the keep on the back one; on square outer
   // corners between straight sides a tower if furthest out, else a turret;
-  // a drum everywhere else.
+  // a drum everywhere else, with at most one small front tower substituted.
   const squareOuter = (index: number) => {
     const [into, out] = [steps[(index + count - 1) % count], steps[index]];
     const convex = into[0] * out[1] - into[1] * out[0] > 0;
@@ -277,6 +273,17 @@ function planWall(outline: Vec2[], pickTower: () => TownPart, choose: (count: nu
   const framing = new Set([furthest(([i, j]) => i - j), furthest(([i, j]) => j - i), furthest(([i, j]) => i + j)]);
   const kinds: CornerKind[] = outline.map((_, index) =>
     index === 0 ? "keep" : framing.has(index) ? "tower" : candidates.includes(index) ? "turret" : "drum");
+  if (smallFrontTower) {
+    const frontBends = outline.map((_, index) => index).filter((index) => {
+      const [into, out] = [steps[(index + count - 1) % count], steps[index]];
+      const convex = into[0] * out[1] - into[1] * out[0] > 0;
+      const horizontal = (step: Vec2) => step[0] === -1 && step[1] === 1;
+      return kinds[index] === "drum" && convex && (horizontal(into) || horizontal(out));
+    });
+    const front = frontBends.reduce<number | null>((best, index) =>
+      best === null || viewward(outline[index]) > viewward(outline[best]) ? index : best, null);
+    if (front !== null) kinds[front] = "turret";
+  }
   const trimAt = (index: number) => TRIM[kinds[index % count]];
 
   // Room for wall along each straight side; a diagonal one runs between drums or turrets only.
@@ -296,13 +303,14 @@ function planWall(outline: Vec2[], pickTower: () => TownPart, choose: (count: nu
   const gateOffset = spare >= 2 ? 1 + choose(spare - 1) : choose(spare + 1);
 
   // Buildings standing in the wall, their outer wall the castle's: a hall
-  // in each back wall (the larger in one, the smaller in the other), and
+  // in each back wall (prefer a smaller one in the second), and
   // sometimes a house in a front wall the gate is not in.
   const inWall = new Map<number, { part: TownPart; offset: number }>();
   const buildInto = (index: number, choices: typeof BACK_BUILDINGS, below: number): number => {
     for (const building of choices) {
       if (building.length > rooms[index] || building.length >= below) continue;
       const part = partNamed(`${building.name}-gable-${steps[index][1] === 0 ? "right" : "left"}`);
+      if (!allowedIn(part, "castle", rules)) continue;
       inWall.set(index, { part, offset: choose(rooms[index] - building.length + 1) });
       return building.length;
     }
@@ -310,7 +318,9 @@ function planWall(outline: Vec2[], pickTower: () => TownPart, choose: (count: nu
   };
   const [firstBack, secondBack] = choose(2) === 0 ? [0, count - 1] : [count - 1, 0];
   const hall = buildInto(firstBack, BACK_BUILDINGS, Infinity);
-  buildInto(secondBack, BACK_BUILDINGS, hall || Infinity);
+  if (!buildInto(secondBack, BACK_BUILDINGS, hall || Infinity)) {
+    buildInto(secondBack, BACK_BUILDINGS, Infinity);
+  }
   const fronts = gateSides.filter(({ index }) => index !== gateSide.index);
   if (fronts.length > 0 && choose(2) === 0) buildInto(fronts[choose(fronts.length)].index, FRONT_BUILDINGS, Infinity);
 
@@ -335,7 +345,7 @@ function planWall(outline: Vec2[], pickTower: () => TownPart, choose: (count: nu
       [q[0] + across[0], q[1] + across[1]], [p[0] + across[0], p[1] + across[1]],
     ]));
   };
-  /** A wall `length` cells along i or j from `start`, with a drum partway along if it is longer than the longest file. */
+  /** A wall along i or j, with a drum separating long stretches. */
   const straight = (start: Vec2, unit: Vec2, length: number) => {
     const direction = directionOf(unit);
     if (length > longest(direction)) {
@@ -424,8 +434,8 @@ function planWall(outline: Vec2[], pickTower: () => TownPart, choose: (count: nu
 }
 
 /** Footprints of everything in a castle, with the part each one is. */
-export function castleLayout(seed: number): CastlePiece[] {
-  return layoutCastle(seed).items.map(({ name, footprint }) => ({ name, footprint }));
+export function castleLayout(seed: number, rules: PlacementRules = {}): CastlePiece[] {
+  return layoutCastle(seed, rules).items.map(({ name, footprint }) => ({ name, footprint }));
 }
 
 /** Corner points of the castle wall's centre line, back corner first, and what stands on each. */
@@ -434,8 +444,14 @@ export function castleOutline(seed: number): { outline: Vec2[]; kinds: CornerKin
   return { outline, kinds };
 }
 
-function layoutCastle(seed: number): CastlePlan {
+function layoutCastle(seed: number, rules: PlacementRules = {}): CastlePlan {
   const random = mulberry((seed ^ 0x7a11ed) + 0xca571e);
+  // Keep the usual layout's random sequence intact; these are occasional
+  // front details rather than a new family of castle sizes and outlines.
+  const variation = mulberry((seed ^ 0x63f20a) + 0xca571e);
+  const frontVariant = variation();
+  const longerFront = frontVariant < 0.1;
+  const smallFrontTower = frontVariant >= 0.1 && frontVariant < 0.3;
   const between = (low: number, high: number) => low + Math.floor(random() * (high - low + 1));
   const pick = <T,>(list: readonly T[]) => list[Math.floor(random() * list.length)];
   const choose = (count: number) => Math.floor(random() * count);
@@ -445,9 +461,9 @@ function layoutCastle(seed: number): CastlePlan {
   for (let attempt = 0; attempt < 40 && !plan; attempt++) {
     // A rectangle with its front corner cut is the last resort; it always fits.
     const outline: Vec2[] = attempt < 39
-      ? shapeOutline(between, random)
+      ? shapeOutline(between, random, longerFront)
       : [[-0.5, -0.5], [8.5, -0.5], [8.5, 5.5], [5.5, 8.5], [-0.5, 8.5]];
-    const candidate = planWall(outline, () => pick(TOWERS), choose);
+    const candidate = planWall(outline, () => pick(TOWERS), choose, smallFrontTower, rules);
     if (!candidate) continue;
     // The yard: whole cells inside the wall, clear of it and its round pieces.
     const yard = new Set<string>();
@@ -496,8 +512,10 @@ function layoutCastle(seed: number): CastlePlan {
     }
     return cells;
   };
-  const fits = (part: TownPart, i: number, j: number) =>
-    cellsOf(part, i, j).every((cell) => court.has(cell) && !occupied.has(cell) && !lanes.has(cell));
+  // The fixed great keep already consumes the shared keep/great-keep/tower slot.
+  const canAddBuilding = (part: TownPart) => !isKeepOrTowerPart(part.name) || !items.some(({ name }) => isKeepOrTowerPart(name));
+  const fits = (part: TownPart, i: number, j: number) => canAddBuilding(part)
+    && cellsOf(part, i, j).every((cell) => court.has(cell) && !occupied.has(cell) && !lanes.has(cell));
   const claim = (part: TownPart, i: number, j: number) => {
     for (const cell of cellsOf(part, i, j)) occupied.add(cell);
     items.push(partItem(part, [i, j], rect(i, j, i + part.cellsI, j + part.cellsJ)));
@@ -516,7 +534,8 @@ function layoutCastle(seed: number): CastlePlan {
     }
     if (best) claim(part, best.i, best.j);
   };
-  tuckIn(pick(EXTRAS));
+  const extras = placementPool(EXTRAS, PARTS, "castle", rules).filter(canAddBuilding);
+  if (extras.length > 0) tuckIn(pick(extras));
 
   return { outline, kinds, items, court, gate };
 }
@@ -585,27 +604,14 @@ export function paintByOutline<T extends CastlePiece>(pieces: readonly T[]): T[]
 }
 
 /** Composes a castle as a standalone SVG document; `seed` picks its layout. */
-export function composeCastle(seed: number): string {
-  const { outline, items, court, gate } = layoutCastle(seed);
+export function composeCastle(seed: number, rules: PlacementRules = {}): string {
+  const { outline, items } = layoutCastle(seed, rules);
   const ordered = paintByOutline(items);
 
-  // Ground: a cast shadow off to the right and behind, the courtyard inside
-  // the wall's centre line, and a darker path in from the gate.
-  const shadow: IsoShape = { points: outline.map(([i, j]) => [i + 0.8, j - 0.8, 0] as const), fill: SHADOW, seamless: true };
-  const ground: IsoShape = { points: outline.map(([i, j]) => [i, j, 0] as const), fill: COURTYARD, seamless: true };
-  let depth = 0;
-  const middle = Math.floor(gate.centre);
-  while (depth < 5 && court.has(gate.facesJ ? key(middle, gate.line - depth - 1) : key(gate.line - depth - 1, middle))) depth++;
-  const reach = Math.max(0.5, Math.min(4.2, depth - 0.3));
-  const [a, b, near, far] = [gate.centre - 0.6, gate.centre + 0.6, gate.line + 0.7, gate.line - reach];
-  const path: IsoShape = {
-    points: gate.facesJ
-      ? [[a, near, 0], [b, near, 0], [b, far, 0], [a, far, 0]]
-      : [[near, a, 0], [near, b, 0], [far, b, 0], [far, a, 0]],
-    fill: PATH,
-    seamless: true,
-  };
-  const bounds = shapeBounds([shadow, ground]);
+  // The castle stands on the map itself: no coloured base, courtyard, path or
+  // shadow is drawn. The wall's outline only sizes the sprite.
+  const footprint: IsoShape = { points: outline.map(([i, j]) => [i, j, 0] as const) };
+  const bounds = shapeBounds([footprint]);
   for (const { extent } of ordered) {
     bounds.minX = Math.min(bounds.minX, extent.minX);
     bounds.minY = Math.min(bounds.minY, extent.minY);
@@ -618,6 +624,5 @@ export function composeCastle(seed: number): string {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${fmt(width * 3)}" height="${fmt(height * 3)}" `
     + `viewBox="${fmt(bounds.minX)} ${fmt(bounds.minY)} ${fmt(width)} ${fmt(height)}" ${style.root}>`
     + `<defs>${style.filter}</defs><style>${ROOF_CSS}</style>`
-    + `<g filter="url(#hand)">${shapesToSvg([shadow, ground, path], 0, 0, SOFT_WOBBLE)}\n`
-    + `${ordered.map((item) => item.svg).join("\n")}</g></svg>`;
+    + `<g filter="url(#hand)">${ordered.map((item) => item.svg).join("\n")}</g></svg>`;
 }

@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import tower from "../src/assets/structures/town-parts/tower.svg?raw";
-import { CASTLE_SLATE, INK, keep, roundTower, STROKE_WIDTH } from "../src/structures/isoDraw";
+import { CASTLE_SLATE, INK, keep, project, roundTower, STROKE_WIDTH } from "../src/structures/isoDraw";
 import { castleLayout, castleOutline } from "../src/structures/castleSprite";
+import { PARTS, partNamed } from "../src/structures/townParts";
+import { allowedIn, type PlacementRules } from "../src/structures/partPlacement";
 import { composeSettlement, paintOrder, parseTownPart } from "../src/structures/townSprite";
 import { SETTLEMENT_KINDS, type SettlementKind } from "../src/structures/types";
 
@@ -71,9 +73,10 @@ describe("settlement sprites", () => {
       for (const kind of ["hamlet", "village", "keep"] as const) expect(wallParts(kind, seed)).toEqual([]);
       for (const kind of ["walled-town", "city"] as const) {
         expect(wallParts(kind, seed).filter((name) => name.startsWith("wall-gate-"))).toHaveLength(1);
-        // Outside the parts a town draws only its ground.
+        // Outside the parts a town draws nothing visible: only its invisible footprint, with no coloured base.
         const outside = composeSettlement(kind, seed).replace(/<g class="p\d"[^>]*>[\s\S]*?<\/g>/g, "");
         expect(outside.match(/<path /g)).toHaveLength(1);
+        expect(outside).toContain('fill="none"');
       }
       for (const kind of ["walled-town", "city", "castle"] as const) {
         expect(wallParts(kind, seed).some((name) => /^wall-[ij]-\d+$/.test(name))).toBe(true);
@@ -115,7 +118,52 @@ describe("settlement sprites", () => {
         if (castleLayout(seed).some(({ name }) => /^wall-(flat|steep)-\d+$/.test(name))) rotated++;
       }
       expect(rotated).toBe(20);
-      expect(outlines.size).toBeGreaterThanOrEqual(15);
+      expect(outlines.size).toBeGreaterThanOrEqual(10);
+    });
+
+    it("keeps the original castle scale with only occasional front variations", () => {
+      const bendKinds = new Set<string>();
+      let extended = 0;
+      let withSmallTower = 0;
+      for (let seed = 1; seed <= 80; seed++) {
+        const { outline, kinds } = castleOutline(seed);
+        // The back walls still fit the original 8–10 by 7–9-cell rectangle.
+        expect(outline[1][0]).toBeLessThanOrEqual(10.5);
+        expect(outline[outline.length - 1][1]).toBeLessThanOrEqual(9.5);
+        const diagonal = outline.map((point, index) => {
+          const next = outline[(index + 1) % outline.length];
+          return point[0] !== next[0] && point[1] !== next[1];
+        });
+        let smallTowers = 0;
+        outline.forEach((point, index) => {
+          const previous = (index + outline.length - 1) % outline.length;
+          if (!diagonal[index] && !diagonal[previous]) return;
+          bendKinds.add(kinds[index]);
+          if (kinds[index] === "turret") {
+            smallTowers++;
+            expect(castleLayout(seed).some(({ name, footprint }) => name === "turret-small"
+              && Math.abs(footprint.reduce((sum, p) => sum + p[0] / footprint.length, 0) - point[0]) < 1e-6
+              && Math.abs(footprint.reduce((sum, p) => sum + p[1] / footprint.length, 0) - point[1]) < 1e-6)).toBe(true);
+          }
+        });
+        expect(smallTowers).toBeLessThanOrEqual(1);
+        if (smallTowers) withSmallTower++;
+        outline.forEach((point, index) => {
+          const next = outline[(index + 1) % outline.length];
+          if (!(next[0] < point[0] && next[1] > point[1])) return;
+          const length = point[0] - next[0];
+          expect(length).toBeLessThanOrEqual(4);
+          if (length === 4) {
+            expect(smallTowers).toBe(0);
+            extended++;
+          }
+        });
+      }
+      expect(bendKinds).toEqual(new Set(["drum", "turret"]));
+      expect(extended).toBeGreaterThan(0);
+      expect(extended).toBeLessThan(20);
+      expect(withSmallTower).toBeGreaterThan(0);
+      expect(withSmallTower).toBeLessThan(30);
     });
 
     it("stands a wall drum, never a tower, on every inner corner", () => {
@@ -154,9 +202,9 @@ describe("settlement sprites", () => {
             }
           }
         }
-        // Outside the parts the castle draws only its ground: shadow, courtyard and path.
+        // Outside the parts the castle draws nothing: no courtyard, path, shadow or other coloured base.
         const outside = castle(seed).replace(/<g class="p\d"[^>]*>[\s\S]*?<\/g>/g, "");
-        expect(outside.match(/<path /g)).toHaveLength(3);
+        expect(outside.match(/<path /g)).toBeNull();
       }
     });
 
@@ -198,7 +246,11 @@ describe("settlement sprites", () => {
         expect(parts.some((name) => /^(cottage|house|townhouse|longhouse|hall|hut|shed)-/.test(name))).toBe(false);
       }
       for (const kind of ["hamlet", "village", "walled-town", "city"] as const) {
-        for (let seed = 1; seed <= 6; seed++) expect(names(kind, seed).some((name) => name.startsWith("castle-"))).toBe(false);
+        for (let seed = 1; seed <= 6; seed++) {
+          for (const name of names(kind, seed).filter((name) => name.startsWith("castle-"))) {
+            expect(allowedIn(partNamed(name), kind), `${name} in ${kind}`).toBe(true);
+          }
+        }
       }
     });
 
@@ -226,7 +278,7 @@ describe("settlement sprites", () => {
         const [pa, pb] = [along(a), along(b)];
         return Math.max(...pa) > Math.min(...pb) + 1e-6 && Math.max(...pb) > Math.min(...pa) + 1e-6;
       }));
-      for (let seed = 1; seed <= 40; seed++) {
+      for (let seed = 1; seed <= 80; seed++) {
         const layout = castleLayout(seed);
         for (const { name, footprint } of layout) {
           if (/^(castle-|gatehouse-|great-keep|turret$|turret-tall)/.test(name)) expect(footprint.flat().every(whole)).toBe(true);
@@ -247,6 +299,48 @@ describe("settlement sprites", () => {
       const rim = shapes.filter((shape) => !shape.detail && shape.points.every(([, , z]) => z >= wall && z <= wall + 0.5));
       expect(rim).toHaveLength(0);
     });
+  });
+
+  it("attaches the keep's wing by its short side and reserves the shared landmark slot for the keep", () => {
+    const orientations = new Set<string>();
+    const rules: PlacementRules = {
+      ...Object.fromEntries(PARTS.map(({ name }) => [name, []])),
+      keep: ["keep"], tower: ["keep"],
+      "castle-house-gable-left": ["keep"], "castle-house-gable-right": ["keep"],
+    };
+    const [unitX, unitY] = project([1, 0, 0]);
+    for (let seed = 1; seed <= 60; seed++) {
+      // Recover grid footprints from the rendered SVG, including each part's origin.
+      const layout = buildings(composeSettlement("keep", seed, rules)).map(({ name, x, y }) => {
+        const part = partNamed(name);
+        const i = Math.round(((x + part.originX) / unitX + (y + part.originY) / unitY) / 2);
+        const j = Math.round(((y + part.originY) / unitY - (x + part.originX) / unitX) / 2);
+        return { name, i, j, endI: i + part.cellsI, endJ: j + part.cellsJ, part };
+      });
+      const main = layout.find(({ name }) => name === "keep")!;
+      const wings = layout.filter(({ name }) => name.startsWith("castle-"));
+      expect(wings).toHaveLength(1);
+      const wing = wings[0];
+      orientations.add(wing.name);
+      const overlapI = Math.min(main.endI, wing.endI) - Math.max(main.i, wing.i);
+      const overlapJ = Math.min(main.endJ, wing.endJ) - Math.max(main.j, wing.j);
+      if (wing.part.cellsI > wing.part.cellsJ) {
+        expect(main.endI).toBe(wing.i);
+        expect(overlapJ).toBe(wing.part.cellsJ);
+      } else {
+        expect(main.endJ).toBe(wing.j);
+        expect(overlapI).toBe(wing.part.cellsI);
+      }
+      expect(layout).toHaveLength(2);
+      expect(layout.filter(({ name }) => /^(keep|great-keep|tower)(?:-|$)/.test(name))).toHaveLength(1);
+      for (let a = 0; a < layout.length; a++) {
+        for (let b = a + 1; b < layout.length; b++) {
+          const first = layout[a], second = layout[b];
+          expect(first.endI <= second.i || second.endI <= first.i || first.endJ <= second.j || second.endJ <= first.j).toBe(true);
+        }
+      }
+    }
+    expect(orientations.size).toBe(2);
   });
 
   it("draws every line with the same ink colour and width", () => {
@@ -278,15 +372,36 @@ describe("settlement sprites", () => {
       expect(houseCount("hamlet", seed)).toBeGreaterThanOrEqual(2);
       expect(houseCount("hamlet", seed)).toBeLessThanOrEqual(3);
       expect(names("hamlet", seed).some((name) => /keep|tower|turret|church/.test(name))).toBe(false);
-      expect(houseCount("village", seed)).toBeGreaterThanOrEqual(4);
+      expect(houseCount("village", seed)).toBeGreaterThanOrEqual(3);
+      expect(houseCount("village", seed)).toBeLessThanOrEqual(5);
       expect(names("keep", seed)).toContain("keep");
       expect(composeSettlement("keep", seed)).toContain(`<g class="p${CASTLE_SLATE}" data-part="keep"`);
       expect(names("castle", seed)).toContain("great-keep");
       expect(houseCount("walled-town", seed)).toBeGreaterThanOrEqual(4);
-      expect(houseCount("city", seed)).toBeGreaterThanOrEqual(15);
+      expect(houseCount("city", seed)).toBeGreaterThan(houseCount("village", seed));
       expect(houseCount("city", seed)).toBeGreaterThan(houseCount("walled-town", seed));
-      expect(names("city", seed).some((name) => name.startsWith("church-"))).toBe(true);
+      expect(names("city", seed).filter((name) => name.startsWith("cathedral-"))).toHaveLength(1);
+      expect(names("city", seed).some((name) => name.startsWith("church-"))).toBe(false);
     }
+  });
+
+  it("keeps rural building counts small and villages smaller than towns, including outbuildings", () => {
+    const hamletCounts = new Set<number>(), villageCounts = new Set<number>();
+    for (let seed = 1; seed <= 40; seed++) {
+      const hamlet = names("hamlet", seed).length;
+      const village = names("village", seed).length;
+      const town = names("walled-town", seed).filter((name) => !name.startsWith("wall-")).length;
+      expect(hamlet, `hamlet seed ${seed}`).toBeGreaterThanOrEqual(2);
+      expect(hamlet, `hamlet seed ${seed}`).toBeLessThanOrEqual(4);
+      expect(village, `village seed ${seed}`).toBeGreaterThanOrEqual(5);
+      expect(village, `village seed ${seed}`).toBeLessThanOrEqual(8);
+      expect(hamlet).toBeLessThan(village);
+      expect(village).toBeLessThan(town);
+      hamletCounts.add(hamlet);
+      villageCounts.add(village);
+    }
+    expect(hamletCounts.size).toBeGreaterThan(1);
+    expect(villageCounts.size).toBeGreaterThan(1);
   });
 
   it("is quick enough to redraw while a seed is typed", () => {

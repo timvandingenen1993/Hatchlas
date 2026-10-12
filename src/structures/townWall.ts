@@ -12,7 +12,7 @@
  * on each; the walls either side stop WALL_PIECE_GAP short of its middle,
  * and the gatehouse spans two cells, so the files fit without cutting.
  */
-import { GROUND, type IsoShape, WALL, WALL_PIECE_GAP, WALL_PIECE_RADIUS, type Vec2, type WallDirection } from "./isoDraw";
+import { type IsoShape, WALL, WALL_PIECE_GAP, WALL_PIECE_RADIUS, type Vec2, type WallDirection } from "./isoDraw";
 import { partNamed, PARTS, type TownPart } from "./townParts";
 
 /** A town part with its grid point (0, 0) on (i, j); i and j may be fractional. */
@@ -42,6 +42,8 @@ export interface TownWall {
   outline: Vec2[];
   /** Radius inside which buildings clear every wall piece. */
   clearRadius: number;
+  /** Whole grid cells inside the actual wall outline, clear of walls and corner pieces. */
+  interiorCells: ReadonlySet<string>;
 }
 
 /** Whole wall files by direction and length in grid steps. */
@@ -59,6 +61,27 @@ const longest = (direction: WallDirection) => Math.max(...RUNS.get(direction)!.k
 const GATE_INWARD = WALL.thickness / 2 + 0.22;
 /** Half the length of a gatehouse along its wall. */
 const GATE_HALF = 1;
+
+/** Whole cells in the convex enclosure, including pockets outside its inscribed circle. */
+function wallInteriorCells(outline: readonly Vec2[], clearance: number): Set<string> {
+  const cells = new Set<string>();
+  const minI = Math.floor(Math.min(...outline.map(([i]) => i)));
+  const maxI = Math.ceil(Math.max(...outline.map(([i]) => i)));
+  const minJ = Math.floor(Math.min(...outline.map(([, j]) => j)));
+  const maxJ = Math.ceil(Math.max(...outline.map(([, j]) => j)));
+  for (let i = minI; i < maxI; i++) {
+    for (let j = minJ; j < maxJ; j++) {
+      const corners: Vec2[] = [[i, j], [i + 1, j], [i + 1, j + 1], [i, j + 1]];
+      if (outline.every((a, index) => {
+        const b = outline[(index + 1) % outline.length];
+        const di = b[0] - a[0], dj = b[1] - a[1];
+        const minimum = clearance * Math.hypot(di, dj);
+        return corners.every(([ci, cj]) => di * (cj - a[1]) - dj * (ci - a[0]) >= minimum - 1e-9);
+      })) cells.add(`${i},${j}`);
+    }
+  }
+  return cells;
+}
 
 const viewward = (v: Vec2) => v[0] + v[1];
 
@@ -214,11 +237,12 @@ export function buildTownWall(options: TownWallOptions): TownWall {
   }));
   const reach = Math.max(WALL_PIECE_RADIUS, GATE_INWARD);
   return {
-    ground: { points: corners.map(([i, j]) => [i, j, 0] as const), fill: GROUND, seamless: true },
+    ground: { points: corners.map(([i, j]) => [i, j, 0] as const), fill: "none", seamless: true },
     back,
     front,
     outline: corners,
     clearRadius: nearest - reach - 0.1,
+    interiorCells: wallInteriorCells(corners, reach + 0.1),
   };
 }
 

@@ -15,19 +15,10 @@ export interface Waypoint extends MapPoint {
 
 export type RoadKind = "track" | "road" | "highway";
 
-/** "auto" follows the road kind: tracks dashed, roads solid, highways double. */
-export type RoadLineStyle = "auto" | "solid" | "dashed" | "dotted" | "double";
-
 export interface Road {
   id: string;
   name: string;
   kind: RoadKind;
-  /** Optional ink color; falls back to the road style color. */
-  color?: string;
-  /** Line pattern override; defaults to "auto". */
-  lineStyle?: RoadLineStyle;
-  /** Width multiplier on top of the road style width; defaults to 1. */
-  widthScale?: number;
   waypoints: Waypoint[];
   visible: boolean;
 }
@@ -100,6 +91,8 @@ export interface Town extends MapPoint {
   /** Icon size in pixels at the 2048px reference frame width. */
   size: number;
   labelPosition: TownLabelPosition;
+  /** Extra distance from the icon, in 2048px frame pixels; negative moves the label closer. */
+  labelOffset?: number;
   showLabel: boolean;
 }
 
@@ -136,23 +129,54 @@ export const DEFAULT_ROUTING_SETTINGS: RoutingSettings = {
   minLegLengthM: 200,
 };
 
-/** Map-wide road appearance. Widths are pixels of a 2048px wide frame. */
-export interface RoadStyle {
+/** Per-type appearance; all road types use the same line geometry. Pixel sizes use a 2048px frame. */
+export interface RoadKindStyle {
+  width: number;
   color: string;
-  opacity: number;
-  widthScale: number;
-  /** Charcoal pen: tapered strokes with seeded breaks; off draws clean, even lines. */
-  handDrawn: boolean;
-  /** 0..1 chance that a charcoal stroke ends in a break (hand-drawn only). */
-  interruptions: number;
-  /** Some breaks carry a single ink dot, like river marks (hand-drawn only). */
-  gapDots: boolean;
   outline: boolean;
   outlineColor: string;
   outlineWidth: number;
-  /** Centre of double-line roads. */
-  fillColor: string;
+  /** Gap between dashes in reference pixels. Zero draws a continuous line. */
+  dashSpacing: number;
+  /** Length of each dash (section) in reference pixels; unused for a continuous line. */
+  dashLength: number;
+  /** Drop shadow beneath the line: offset down-right, softened over `shadowBlur`. */
+  shadowOpacity: number;
+  shadowColor: string;
+  shadowOffset: number;
+  shadowBlur: number;
+}
+
+export const DEFAULT_ROAD_KIND_STYLE: RoadKindStyle = {
+  width: 4.2,
+  color: "#563a26",
+  outline: false,
+  outlineColor: "#f4ecd6",
+  outlineWidth: 1.2,
+  dashSpacing: 0,
+  dashLength: 14,
+  shadowOpacity: 0,
+  shadowColor: "#281c14",
+  shadowOffset: 1.5,
+  shadowBlur: 2.5,
+};
+
+/** Map-wide road appearance. Legacy shared fields provide defaults for saved maps. */
+export interface RoadStyle {
+  byKind?: Partial<Record<RoadKind, Partial<RoadKindStyle>>>;
+  color: string;
+  opacity: number;
+  widthScale: number;
+  /** Charcoal pen texture on road outlines; lines and dashes are always clean. */
+  handDrawn: boolean;
+  outline: boolean;
+  outlineColor: string;
+  outlineWidth: number;
   bridgeColor: string;
+  /** Outline drawn around a bridge and along its side sections. */
+  bridgeOutlineColor: string;
+  /** Thickness of the bridge outline lines, in reference pixels. */
+  bridgeOutlineWidth: number;
   /** Extra corridor, beyond the road edge, kept clear of trees and shrubs. */
   clearance: number;
 }
@@ -162,15 +186,27 @@ export const DEFAULT_ROAD_STYLE: RoadStyle = {
   opacity: 1,
   widthScale: 1,
   handDrawn: true,
-  interruptions: 0.3,
-  gapDots: true,
   outline: false,
   outlineColor: "#f4ecd6",
   outlineWidth: 1.2,
-  fillColor: "#eee2c4",
   bridgeColor: "#eee2c4",
+  bridgeOutlineColor: "#563a26",
+  bridgeOutlineWidth: 1.2,
   clearance: 2,
 };
+
+/** Shared defaults and per-type settings, with no geometry inferred from the road kind. */
+export function roadKindStyle(style: RoadStyle, kind: RoadKind): RoadKindStyle {
+  return {
+    ...DEFAULT_ROAD_KIND_STYLE,
+    width: DEFAULT_ROAD_KIND_STYLE.width * style.widthScale,
+    color: style.color,
+    outline: style.outline,
+    outlineColor: style.outlineColor,
+    outlineWidth: style.outlineWidth,
+    ...style.byKind?.[kind],
+  };
+}
 
 export type TownFont = "serif" | "oldstyle" | "garamond" | "didone" | "sans" | "script" | "blackletter";
 
@@ -230,14 +266,6 @@ export const ROAD_KIND_LABELS: Record<RoadKind, string> = {
   highway: "Highway",
 };
 
-export const ROAD_LINE_STYLE_LABELS: Record<RoadLineStyle, string> = {
-  auto: "By type",
-  solid: "Solid",
-  dashed: "Dashed",
-  dotted: "Dotted",
-  double: "Double",
-};
-
 export interface MapStructures {
   roads: Road[];
   towns: Town[];
@@ -255,9 +283,6 @@ export interface IconAsset {
 export interface RoadRenderPath {
   points: MapPoint[];
   kind: RoadKind;
-  color?: string;
-  lineStyle?: RoadLineStyle;
-  widthScale?: number;
   bridges: RouteCrossing[];
 }
 

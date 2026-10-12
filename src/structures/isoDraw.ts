@@ -28,7 +28,6 @@ export interface Palette {
 
 export const PLASTER: Palette = { lit: "#ece1c9", mid: "#ddcfb1", shade: "#c4b393", top: "#e6dac0" };
 export const STONE: Palette = { lit: "#e4d8bd", mid: "#d3c4a3", shade: "#b9a684", top: "#ddd0b3" };
-export const GROUND = "#a8916e";
 
 /** Roof colours; the composer recolours these by class per building. */
 export interface RoofPalette {

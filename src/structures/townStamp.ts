@@ -73,7 +73,7 @@ function layoutTownStamp(
     });
     context.letterSpacing = "0px";
     const blockHeight = entries.reduce((sum, entry) => sum + entry.size * 1.15, 0);
-    const gap = nameSize * 0.25 + halo * 0.5;
+    const gap = nameSize * 0.25 + halo * 0.5 + (town.labelOffset ?? 0) * scale;
     const blockWidth = Math.max(...widths);
     let top: number;
     let x: number;

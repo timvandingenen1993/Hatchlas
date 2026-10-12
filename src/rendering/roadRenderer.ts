@@ -6,30 +6,26 @@
  * every export tile place the same road on the same output pixels. Widths are
  * authored against a 2048px long edge and scale with the domain.
  *
- * The layer holds four coverage passes, composited in this order:
+ * The layer holds coverage passes, composited in this order:
  * - clear: corridor where trees and shrubs are removed (not drawn itself)
+ * - shadow: soft drop shadow beneath the road
  * - outline: optional casing beneath the road
- * - ink: road lines and bridge rails
- * - fill: centre of double-line roads and bridge decks
+ * - ink: road lines
+ * - fill: bridge decks
+ * - bridgeOutline: bridge edges and side sections, in their own colour
  *
- * Hand-drawn roads use the map's charcoal pen: each road is split into
- * seeded strokes (the same schedule as rivers and forest outlines), every
- * stroke tapers through the brush pressure curve, and some gaps carry a
- * single ink dot. Breaks are measured along the full road in global pixels,
+ * Every road kind uses the same pen. Per-type settings control its width,
+ * color, casing, dashes and shadow. Dashes are measured in global pixels,
  * so export tiles agree on where every stroke starts and ends.
  */
 import {
-  createCharcoalStrokeRuns,
-  hash01,
-  paintInkDisk,
   paintInkSegment,
   type CharcoalStrokeRun,
 } from "./cartographicStrokeRenderer";
 import {
   DEFAULT_ROAD_STYLE,
+  roadKindStyle,
   type MapPoint,
-  type RoadKind,
-  type RoadLineStyle,
   type RoadRenderPath,
   type RoadStyle,
 } from "../structures/types";
@@ -38,18 +34,26 @@ export const ROAD_REFERENCE_LONG_EDGE = 2048;
 
 type RGB = readonly [number, number, number];
 
+export interface RoadAccentLayer {
+  alpha: Uint8Array;
+  colorIndex: Uint8Array;
+  colors: RGB[];
+}
+
 export interface RoadLayer {
   clear: Uint8Array | null;
   outline: Uint8Array | null;
   ink: Uint8Array;
   fill: Uint8Array;
+  /** Bridge outlines (side sections and their edges), drawn above the deck in `bridgeOutlineColor`. */
+  bridgeOutline: Uint8Array | null;
+  bridgeOutlineColor: RGB;
   /** Index into `inkColors` of the road that last painted ink at each pixel. */
   inkColorIndex: Uint8Array;
   inkColors: RGB[];
-  /** 1 where the fill belongs to a bridge deck, 0 for a road centre. */
-  fillIsBridge: Uint8Array;
-  outlineColor: RGB;
-  fillColor: RGB;
+  outlineColorIndex: Uint8Array | null;
+  outlineColors: RGB[];
+  shadow: RoadAccentLayer | null;
   bridgeColor: RGB;
   opacity: number;
 }
@@ -63,19 +67,6 @@ export interface RoadRasterTarget {
   domainWidth: number;
   domainHeight: number;
 }
-
-/** Ink half-width per road kind, in reference pixels. */
-const KIND_RADIUS: Record<RoadKind, number> = {
-  track: 1.5,
-  road: 2.1,
-  highway: 2.6,
-};
-
-const KIND_LINE_STYLE: Record<RoadKind, Exclude<RoadLineStyle, "auto">> = {
-  track: "dashed",
-  road: "solid",
-  highway: "double",
-};
 
 export function parseRoadColor(color: string | undefined, fallback: RGB): RGB {
   const match = color?.match(/^#([0-9a-f]{6})$/i);
@@ -130,37 +121,6 @@ function strokeRange(line: Polyline, start: number, end: number, paint: StrokePi
   }
 }
 
-/**
- * Parallel copy of a polyline at a signed distance (positive is to the left
- * of the direction of travel), with mitred joins limited at sharp bends.
- */
-function offsetPolyline(points: readonly { x: number; y: number }[], distance: number): { x: number; y: number }[] {
-  const normals: { x: number; y: number }[] = [];
-  for (let index = 0; index + 1 < points.length; index++) {
-    const dx = points[index + 1].x - points[index].x;
-    const dy = points[index + 1].y - points[index].y;
-    const length = Math.hypot(dx, dy) || 1;
-    normals.push({ x: -dy / length, y: dx / length });
-  }
-  return points.map((point, index) => {
-    const before = normals[Math.max(0, index - 1)];
-    const after = normals[Math.min(normals.length - 1, index)];
-    let nx = before.x + after.x;
-    let ny = before.y + after.y;
-    const length = Math.hypot(nx, ny);
-    if (length < 1e-6) {
-      nx = after.x;
-      ny = after.y;
-    } else {
-      nx /= length;
-      ny /= length;
-    }
-    // Mitre length grows as 1/cos(half angle); cap it so hairpins stay tidy.
-    const cosine = Math.max(0.5, nx * after.x + ny * after.y);
-    return { x: point.x + nx * distance / cosine, y: point.y + ny * distance / cosine };
-  });
-}
-
 /** Periodic on/off intervals along a line of `length`. */
 function periodicRuns(length: number, on: number, off: number): CharcoalStrokeRun[] {
   const runs: CharcoalStrokeRun[] = [];
@@ -168,35 +128,107 @@ function periodicRuns(length: number, on: number, off: number): CharcoalStrokeRu
   return runs;
 }
 
-function strokePolyline(points: readonly { x: number; y: number }[], paint: Segment): void {
-  for (let index = 0; index + 1 < points.length; index++) {
-    paint(points[index].x, points[index].y, points[index + 1].x, points[index + 1].y);
+/** A dash's square end planes: a point and the unit direction of travel at each end. */
+interface DashEnds {
+  start: { x: number; y: number; tx: number; ty: number };
+  end: { x: number; y: number; tx: number; ty: number };
+}
+
+/** Distance past the dash's nearer end plane; negative inside the dash. */
+function dashOvershoot(ends: DashEnds, x: number, y: number): number {
+  return Math.max(
+    -((x - ends.start.x) * ends.start.tx + (y - ends.start.y) * ends.start.ty),
+    (x - ends.end.x) * ends.end.tx + (y - ends.end.y) * ends.end.ty,
+  );
+}
+
+/**
+ * Crisp solid stroke with exact edge coverage, so the road line and dashes are
+ * sharp but not jagged. Coverage is measured at each pixel centre, which keeps a
+ * dash exactly as long as it is set (a pixel-centre in/out test is up to a whole
+ * pixel off) and stays a pure function of global coordinates for export tiles.
+ * Overlapping strokes keep the strongest value.
+ */
+function paintCleanSegment(
+  alpha: Uint8Array, tags: Uint8Array | undefined, width: number, height: number,
+  x0: number, y0: number, x1: number, y1: number,
+  radius: number, opacity: number, paletteIndex: number, ends?: DashEnds,
+): void {
+  const reach = radius + 1;
+  const minX = Math.max(0, Math.floor(Math.min(x0, x1) - reach));
+  const maxX = Math.min(width - 1, Math.ceil(Math.max(x0, x1) + reach));
+  const minY = Math.max(0, Math.floor(Math.min(y0, y1) - reach));
+  const maxY = Math.min(height - 1, Math.ceil(Math.max(y0, y1) + reach));
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const lengthSquared = dx * dx + dy * dy;
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      const along = lengthSquared > 1e-9
+        ? Math.max(0, Math.min(1, ((x - x0) * dx + (y - y0) * dy) / lengthSquared))
+        : 0;
+      const perpendicular = Math.hypot(x - (x0 + dx * along), y - (y0 + dy * along));
+      let coverage = Math.max(0, Math.min(1, 0.5 - (perpendicular - radius)));
+      if (coverage <= 0) continue;
+      if (ends) coverage *= Math.max(0, Math.min(1, 0.5 - dashOvershoot(ends, x, y)));
+      const value = Math.round(coverage * opacity * 255);
+      const index = y * width + x;
+      if (value > alpha[index]) {
+        alpha[index] = value;
+        if (tags) tags[index] = paletteIndex;
+      }
+    }
   }
 }
 
-/** Sets `tags` to `value` wherever `alpha` is painted inside a segment's footprint. */
-function tagFootprint(
-  alpha: Uint8Array,
-  tags: Uint8Array,
-  value: number,
-  width: number,
-  height: number,
-  x0: number,
-  y0: number,
-  x1: number,
-  y1: number,
-  radius: number,
+/**
+ * Soft-edged capsule for drop shadows: solid inside `radius - blur`, fading out
+ * by `radius + blur`. Coverage is a pure function of the pixel's distance to the
+ * segment, so export tiles agree. Overlaps keep the strongest value, which stops
+ * shadows doubling up where strokes join.
+ */
+function paintSoftSegment(
+  layer: RoadAccentLayer, width: number, height: number,
+  x0: number, y0: number, x1: number, y1: number,
+  radius: number, blur: number, opacity: number, paletteIndex: number,
+  ends?: DashEnds,
 ): void {
-  const pad = Math.ceil(radius * 1.6 + 2);
-  const xa = Math.max(0, Math.floor(Math.min(x0, x1) - pad));
-  const xb = Math.min(width - 1, Math.ceil(Math.max(x0, x1) + pad));
-  const ya = Math.max(0, Math.floor(Math.min(y0, y1) - pad));
-  const yb = Math.min(height - 1, Math.ceil(Math.max(y0, y1) + pad));
-  for (let y = ya; y <= yb; y++) {
-    for (let x = xa; x <= xb; x++) {
+  const reach = radius + blur;
+  const minX = Math.max(0, Math.floor(Math.min(x0, x1) - reach));
+  const maxX = Math.min(width - 1, Math.ceil(Math.max(x0, x1) + reach));
+  const minY = Math.max(0, Math.floor(Math.min(y0, y1) - reach));
+  const maxY = Math.min(height - 1, Math.ceil(Math.max(y0, y1) + reach));
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const lengthSquared = dx * dx + dy * dy;
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      const along = lengthSquared > 1e-9
+        ? Math.max(0, Math.min(1, ((x - x0) * dx + (y - y0) * dy) / lengthSquared))
+        : 0;
+      const perpendicular = Math.hypot(x - (x0 + dx * along), y - (y0 + dy * along));
+      // Signed distance to the stroke edge: negative inside. Past a dash's flat
+      // end planes the edge is square, so the shadow fades there instead of rounding off.
+      let distance = perpendicular - radius;
+      if (ends) {
+        const overshoot = dashOvershoot(ends, x, y);
+        if (overshoot > 0) distance = Math.hypot(Math.max(distance, 0), overshoot);
+      }
+      // Half a pixel of feathering keeps a zero blur from aliasing.
+      const t = Math.max(0, Math.min(1, (blur - distance) / (2 * Math.max(blur, 0.5))));
+      const alpha = Math.round(t * t * (3 - 2 * t) * opacity * 255);
       const index = y * width + x;
-      if (alpha[index] > 0) tags[index] = value;
+      if (alpha > layer.alpha[index]) {
+        layer.alpha[index] = alpha;
+        layer.colorIndex[index] = paletteIndex;
+      }
     }
+  }
+}
+
+function strokePolyline(points: readonly { x: number; y: number }[], paint: Segment): void {
+  for (let index = 0; index + 1 < points.length; index++) {
+    paint(points[index].x, points[index].y, points[index + 1].x, points[index + 1].y);
   }
 }
 
@@ -210,10 +242,15 @@ export function rasterizeRoadLayer(
   const total = width * height;
   const ink = new Uint8Array(total);
   const fill = new Uint8Array(total);
-  const outline = style.outline && style.outlineWidth > 0 ? new Uint8Array(total) : null;
+  const bridgeOutline = roads.some((road) => road.bridges.some((span) => !span.ford)) ? new Uint8Array(total) : null;
+  const settings = roads.map((road) => roadKindStyle(style, road.kind));
+  const outline = settings.some((value) => value.outline && value.outlineWidth > 0) ? new Uint8Array(total) : null;
   const clear = style.clearance > 0 ? new Uint8Array(total) : null;
   const inkColorIndex = new Uint8Array(total);
-  const fillIsBridge = new Uint8Array(total);
+  const outlineColorIndex = outline ? new Uint8Array(total) : null;
+  const outlineColors: RGB[] = [];
+  const accentLayer = (): RoadAccentLayer => ({ alpha: new Uint8Array(total), colorIndex: new Uint8Array(total), colors: [] });
+  const shadow = settings.some((value) => value.shadowOpacity > 0) ? accentLayer() : null;
   const clip = new Uint8Array(total).fill(1);
   const defaultInk = parseRoadColor(style.color, [86, 58, 38]);
   const inkColors: RGB[] = [];
@@ -222,18 +259,17 @@ export function rasterizeRoadLayer(
     x: point.u * (domainWidth - 1) - offsetX,
     y: point.v * (domainHeight - 1) - offsetY,
   });
-  const smoothCore = !style.handDrawn;
   let painted = false;
 
   roads.forEach((road, roadIndex) => {
     if (road.points.length < 2) return;
-    const lineStyle = !road.lineStyle || road.lineStyle === "auto" ? KIND_LINE_STYLE[road.kind] : road.lineStyle;
-    const inkRadius = KIND_RADIUS[road.kind] * Math.max(0.1, style.widthScale) * Math.max(0.1, road.widthScale ?? 1) * scale;
-    // A double road is a wide ink stroke with a narrower fill on top.
-    const strokeRadius = lineStyle === "double" ? inkRadius * 1.3 : inkRadius;
-    const outlineRadius = strokeRadius + style.outlineWidth * scale;
-    const clearRadius = (outline ? outlineRadius : strokeRadius) + style.clearance * scale;
-    const margin = clearRadius * 2 + 12 * scale;
+    const kindStyle = settings[roadIndex];
+    const inkRadius = Math.max(0.1, kindStyle.width / 2) * scale;
+    const hasOutline = kindStyle.outline && kindStyle.outlineWidth > 0;
+    const outlineRadius = inkRadius + kindStyle.outlineWidth * scale;
+    const clearRadius = (hasOutline ? outlineRadius : inkRadius) + style.clearance * scale;
+    const shadowReach = kindStyle.shadowOpacity > 0 ? (kindStyle.shadowOffset * Math.SQRT2 + kindStyle.shadowBlur) * scale : 0;
+    const margin = clearRadius * 2 + shadowReach + 12 * scale;
     const local = road.points.map(toLocal);
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const point of local) {
@@ -243,40 +279,45 @@ export function rasterizeRoadLayer(
       maxY = Math.max(maxY, point.y);
     }
     if (maxX < -margin || maxY < -margin || minX > width + margin || minY > height + margin) return;
-    const paletteIndex = inkColors.length < 255 ? inkColors.push(parseRoadColor(road.color, defaultInk)) - 1 : 0;
+    const paletteIndex = inkColors.length < 255 ? inkColors.push(parseRoadColor(kindStyle.color, defaultInk)) - 1 : 0;
+    outlineColors[paletteIndex] = parseRoadColor(kindStyle.outlineColor, [244, 236, 214]);
+    if (shadow) shadow.colors[paletteIndex] = parseRoadColor(kindStyle.shadowColor, [40, 28, 20]);
     const seed = 7919 * (roadIndex + 1);
-    const paint = (alpha: Uint8Array, radius: number, solid: boolean, opacity = 1): Segment => (x0, y0, x1, y1) => {
+    // Flat caps cut a stroke square at its ends, for crisp dash boundaries.
+    const paint = (alpha: Uint8Array, radius: number, solid: boolean, opacity = 1, tags?: Uint8Array,
+      flatStart = false, flatEnd = false): Segment => (x0, y0, x1, y1) => {
       paintInkSegment(
         alpha, clip, width, height, x0, y0, x1, y1, radius, seed, 2, 0.5, 0.5, false, false,
-        offsetX, offsetY, domainWidth, opacity, solid ? 0 : 0.02, false, false, solid,
+        offsetX, offsetY, domainWidth, opacity, solid ? 0 : 0.02, flatStart, flatEnd, solid, undefined, undefined, 0, tags, paletteIndex,
       );
     };
-    const paintInk = (radius: number, opacity = 1): Segment => (x0, y0, x1, y1) => {
-      paint(ink, radius, smoothCore, opacity)(x0, y0, x1, y1);
-      tagFootprint(ink, inkColorIndex, paletteIndex, width, height, x0, y0, x1, y1, radius);
-      painted = true;
-    };
-    // One charcoal stroke: pressure swells from a tapered start to a tapered end.
-    const paintStroke = (radius: number, strokeSeed: number, opacity = 1): StrokePiece =>
-      (x0, y0, x1, y1, t0, t1) => {
-        paintInkSegment(
-          ink, clip, width, height, x0, y0, x1, y1, radius, strokeSeed, 2, t0, t1, true, true,
-          offsetX, offsetY, domainWidth, opacity, 0.05,
-        );
-        tagFootprint(ink, inkColorIndex, paletteIndex, width, height, x0, y0, x1, y1, radius);
-        painted = true;
+    // Set while a dash is being drawn so its shadow ends square like the dash.
+    let dashEnds: DashEnds | undefined;
+    // Drop shadow: the stroke's footprint pushed down-right and softened.
+    const paintShadow = (radius: number, opacity: number, x0: number, y0: number, x1: number, y1: number) => {
+      const strength = kindStyle.shadowOpacity * opacity;
+      if (!shadow || strength <= 0) return;
+      const shift = kindStyle.shadowOffset * scale;
+      const ends = dashEnds && {
+        start: { ...dashEnds.start, x: dashEnds.start.x + shift, y: dashEnds.start.y + shift },
+        end: { ...dashEnds.end, x: dashEnds.end.x + shift, y: dashEnds.end.y + shift },
       };
-    const paintDot = (x: number, y: number, radius: number, dotSeed: number) => {
-      paintInkDisk(ink, clip, width, height, x, y, radius, dotSeed, offsetX, offsetY, domainWidth);
-      tagFootprint(ink, inkColorIndex, paletteIndex, width, height, x, y, x, y, radius);
-      painted = true;
+      paintSoftSegment(shadow, width, height, x0 + shift, y0 + shift, x1 + shift, y1 + shift,
+        radius + (hasOutline ? kindStyle.outlineWidth * scale : 0), kindStyle.shadowBlur * scale, strength, paletteIndex, ends);
     };
-    const paintFill = (radius: number, bridge: boolean): Segment => (x0, y0, x1, y1) => {
-      paint(fill, radius, true)(x0, y0, x1, y1);
-      tagFootprint(fill, fillIsBridge, bridge ? 1 : 0, width, height, x0, y0, x1, y1, radius);
+    // The outline is the only charcoal-textured part; lines, dashes and rails stay clean.
+    const paintOutline = (radius: number, flatStart = false, flatEnd = false): Segment => (x0, y0, x1, y1) => {
+      if (!outline || !outlineColorIndex || !hasOutline) return;
+      paint(outline, radius, !style.handDrawn, 1, outlineColorIndex, flatStart, flatEnd)(x0, y0, x1, y1);
+    };
+    const paintInk = (radius: number, opacity = 1, flatStart = false, flatEnd = false): Segment => (x0, y0, x1, y1) => {
+      paintOutline(radius + kindStyle.outlineWidth * scale, flatStart, flatEnd)(x0, y0, x1, y1);
+      paintCleanSegment(ink, inkColorIndex, width, height, x0, y0, x1, y1, radius, opacity, paletteIndex, dashEnds);
+      paintShadow(radius, opacity, x0, y0, x1, y1);
+      painted = true;
     };
 
-    // The cleared corridor and casing follow the whole road, bridges included.
+    // The cleared corridor follows the whole road, bridges included.
     if (clear) strokePolyline(local, paint(clear, clearRadius, true));
 
     // Split the road into land runs and crossing spans.
@@ -289,74 +330,52 @@ export function rasterizeRoadLayer(
     }
     if (cursor < local.length - 1) landRuns.push(local.slice(cursor));
 
-    // Charcoal stroke lengths follow the pen width so wide roads keep the
-    // same rhythm; the schedule is the river/forest one with longer marks.
-    const markScale = Math.max(0.5, strokeRadius / scale / KIND_RADIUS.road) * scale;
-    const breakProbability = style.handDrawn ? Math.max(0, Math.min(1, style.interruptions)) : 0;
-    // One ink lane per drawn line. A double road has two edge lanes, each
-    // with its own seed, so their breaks, tapers and dots never line up.
-    const drawLane = (lanePoints: readonly { x: number; y: number }[], laneSeed: number, radius: number) => {
-      const line = measurePolyline(lanePoints);
+    const drawLane = (points: readonly { x: number; y: number }[], radius: number) => {
+      const line = measurePolyline(points);
       if (line.length <= 1e-6) return;
-      if (lineStyle === "dotted") {
-        // True charcoal dots, evenly spaced along the road.
-        const spacing = radius * 3.4;
-        let index = 0;
-        for (let distance = spacing * 0.5; distance < line.length; distance += spacing, index++) {
-          const point = pointAtDistance(line, distance);
-          const dotSeed = (laneSeed + index * 131) | 0;
-          const dotRadius = radius * (style.handDrawn ? 0.9 + hash01(dotSeed, 389) * 0.25 : 1);
-          if (style.handDrawn) paintDot(point.x, point.y, dotRadius, dotSeed);
-          else paintInk(dotRadius)(point.x, point.y, point.x, point.y);
-        }
+      // Zero spacing is a continuous line.
+      if (kindStyle.dashSpacing <= 0) {
+        strokePolyline(points, paintInk(radius));
         return;
       }
-      if (!style.handDrawn) {
-        const runs = lineStyle === "dashed"
-          ? periodicRuns(line.length, radius * 6.5, radius * 4.5)
-          : [{ start: 0, end: line.length }];
-        const solid = paintInk(radius);
-        for (const stroke of runs) strokeRange(line, stroke.start, stroke.end, (x0, y0, x1, y1) => solid(x0, y0, x1, y1));
-        return;
+      // Clean sections, square-cut at both ends so length and gap read as set.
+      // Every piece is flat-ended: round caps at the joins inside a dash would
+      // bulge past its ends whenever the dash is shorter than the line is wide.
+      // Interior joins overlap by a hair so bends leave no seam.
+      const dashLength = kindStyle.dashLength * scale;
+      const overlap = 0.75 * scale;
+      for (const stroke of periodicRuns(line.length, dashLength, kindStyle.dashSpacing * scale)) {
+        // A sliver left over at the end of the road reads as an artifact.
+        if (stroke.end - stroke.start < dashLength * 0.35) continue;
+        const endPlane = (at: number, toward: number) => {
+          const point = pointAtDistance(line, at);
+          const ahead = pointAtDistance(line, toward);
+          const span = Math.hypot(ahead.x - point.x, ahead.y - point.y) || 1;
+          return { x: point.x, y: point.y, tx: (ahead.x - point.x) / span, ty: (ahead.y - point.y) / span };
+        };
+        const probe = Math.min(stroke.end - stroke.start, Math.max(0.5, radius * 0.5));
+        dashEnds = {
+          start: endPlane(stroke.start, stroke.start + probe),
+          end: endPlane(stroke.end, stroke.end - probe),
+        };
+        // The end plane's normal points outward, away from the dash.
+        dashEnds.end.tx = -dashEnds.end.tx;
+        dashEnds.end.ty = -dashEnds.end.ty;
+        strokeRange(line, stroke.start, stroke.end, (x0, y0, x1, y1, t0, t1) => {
+          const length = Math.hypot(x1 - x0, y1 - y0);
+          const ux = length > 1e-9 ? (x1 - x0) / length : 0;
+          const uy = length > 1e-9 ? (y1 - y0) / length : 0;
+          const back = t0 > 0 ? overlap : 0;
+          const forward = t1 < 1 ? overlap : 0;
+          paintInk(radius, 1, true, true)(x0 - ux * back, y0 - uy * back, x1 + ux * forward, y1 + uy * forward);
+        });
       }
-      const runs = lineStyle === "dashed"
-        // Dashes are already broken; each dash is its own tapered stroke.
-        ? periodicRuns(line.length, radius * 6.5, radius * 4.5)
-        : createCharcoalStrokeRuns(line.length, laneSeed, markScale, {
-            breakProbability,
-            dashMin: 14,
-            dashMax: 46,
-            gapMin: 1.6,
-            gapMax: 3.4,
-          });
-      runs.forEach((stroke, strokeIndex) => {
-        const strokeSeed = (laneSeed + strokeIndex * 977) | 0;
-        strokeRange(line, stroke.start, stroke.end, paintStroke(radius, strokeSeed));
-        // Like river marks, some breaks carry a single ink dot.
-        const next = runs[strokeIndex + 1];
-        if (style.gapDots && lineStyle !== "dashed" && next && hash01(strokeSeed, 401) < 0.45) {
-          const middle = pointAtDistance(line, (stroke.end + next.start) * 0.5);
-          paintDot(middle.x, middle.y, radius * 0.7, strokeSeed ^ 0x5f3);
-        }
-      });
+      dashEnds = undefined;
     };
 
-    // A double road: two thinner edge lines whose outer edges match the
-    // single wide stroke, with the fill reaching to their inner edges.
-    const edgeRadius = inkRadius * 0.55;
-    const edgeOffset = strokeRadius - edgeRadius;
-    landRuns.forEach((run, runIndex) => {
-      if (run.length < 2) return;
-      const runSeed = (seed ^ Math.imul(runIndex + 1, 2654435761)) | 0;
-      if (outline) strokePolyline(run, paint(outline, outlineRadius, true));
-      if (lineStyle === "double") {
-        drawLane(offsetPolyline(run, edgeOffset), runSeed, edgeRadius);
-        drawLane(offsetPolyline(run, -edgeOffset), (runSeed ^ 0x3c6ef372) | 0, edgeRadius);
-        strokePolyline(run, paintFill(Math.max(0.5, edgeOffset - edgeRadius * 0.6), false));
-      } else {
-        drawLane(run, runSeed, strokeRadius);
-      }
-    });
+    for (const run of landRuns) {
+      if (run.length >= 2) drawLane(run, inkRadius);
+    }
 
     for (const span of spans) {
       const a = local[span.from];
@@ -376,26 +395,51 @@ export function rasterizeRoadLayer(
       const ty = (b.y - a.y) / length;
       const nx = -ty;
       const ny = tx;
-      const halfWidth = Math.max(strokeRadius, 1.2 * scale) + 1.8 * scale;
-      const overhang = 2.5 * scale;
-      const startX = a.x - tx * overhang;
-      const startY = a.y - ty * overhang;
-      const endX = b.x + tx * overhang;
-      const endY = b.y + ty * overhang;
-      const railRadius = Math.max(0.6, 0.75 * scale * Math.max(0.5, Math.min(2, style.widthScale)));
-      if (outline) paint(outline, halfWidth + railRadius + style.outlineWidth * scale, true)(startX, startY, endX, endY);
-      // Deck: fill between the rails hides the water beneath.
-      paintFill(Math.max(0.5, halfWidth - railRadius * 1.5), true)(startX, startY, endX, endY);
-      const rail = paintInk(railRadius);
-      const flare = 2.2 * scale;
+      const railRadius = Math.max(0.1, style.bridgeOutlineWidth / 2) * scale;
+      // The bridge only spans the water, with no overhang onto the banks. The
+      // main deck matches the road's width so the road flows onto it, with a
+      // narrow outlined section, a quarter of the road width, along each side.
+      const mainHalf = inkRadius;
+      const stripWidth = Math.max(0.3 * scale, kindStyle.width / 4 * scale);
+      const outerHalf = mainHalf + stripWidth;
+      const casing = kindStyle.outlineWidth * scale;
+      // Points are `along` the bridge from its start and `across` from its centreline.
+      const at = (along: number, across: number) => ({
+        x: a.x + tx * along + nx * across, y: a.y + ty * along + ny * across,
+      });
+      const flatEnds = (from: { x: number; y: number }, to: { x: number; y: number }): DashEnds => ({
+        start: { x: from.x, y: from.y, tx, ty },
+        end: { x: to.x, y: to.y, tx, ty },
+      });
+      // Deck fill hides the water beneath; the outline layer draws above it.
+      const fillBand = (centre: number, half: number) => {
+        const from = at(0, centre);
+        const to = at(length, centre);
+        paintCleanSegment(fill, undefined, width, height, from.x, from.y, to.x, to.y, half, 1, paletteIndex, flatEnds(from, to));
+      };
+      const line = (along0: number, across0: number, along1: number, across1: number) => {
+        const from = at(along0, across0);
+        const to = at(along1, across1);
+        paintCleanSegment(bridgeOutline!, undefined, width, height, from.x, from.y, to.x, to.y, railRadius, 1, paletteIndex);
+      };
+
+      const head = at(0, 0);
+      const tail = at(length, 0);
+      paintOutline(outerHalf + railRadius + casing, true, true)(head.x, head.y, tail.x, tail.y);
+      dashEnds = flatEnds(head, tail);
+      paintShadow(outerHalf + railRadius, 1, head.x, head.y, tail.x, tail.y);
+      dashEnds = undefined;
+
+      fillBand(0, mainHalf);
       for (const side of [-1, 1]) {
-        const ox = nx * halfWidth * side;
-        const oy = ny * halfWidth * side;
-        rail(startX + ox, startY + oy, endX + ox, endY + oy);
-        // End ticks flare outwards like a drawn bridge abutment.
-        rail(startX + ox, startY + oy, startX + ox - tx * flare + nx * flare * side, startY + oy - ty * flare + ny * flare * side);
-        rail(endX + ox, endY + oy, endX + ox + tx * flare + nx * flare * side, endY + oy + ty * flare + ny * flare * side);
+        fillBand(side * (mainHalf + outerHalf) / 2, stripWidth / 2);
+        // Each side section is a closed outlined box; the main deck stays open at both ends.
+        line(0, side * outerHalf, length, side * outerHalf);
+        line(0, side * mainHalf, length, side * mainHalf);
+        line(0, side * mainHalf, 0, side * outerHalf);
+        line(length, side * mainHalf, length, side * outerHalf);
       }
+      painted = true;
     }
   });
 
@@ -405,11 +449,13 @@ export function rasterizeRoadLayer(
     outline,
     ink,
     fill,
+    bridgeOutline,
+    bridgeOutlineColor: parseRoadColor(style.bridgeOutlineColor, [86, 58, 38]),
     inkColorIndex,
     inkColors,
-    fillIsBridge,
-    outlineColor: parseRoadColor(style.outlineColor, [244, 236, 214]),
-    fillColor: parseRoadColor(style.fillColor, [238, 226, 196]),
+    outlineColorIndex,
+    outlineColors,
+    shadow,
     bridgeColor: parseRoadColor(style.bridgeColor, [238, 226, 196]),
     opacity: Math.max(0, Math.min(1, style.opacity)),
   };
@@ -422,5 +468,6 @@ export function roadPropClearanceAt(layer: RoadLayer, index: number): number {
     layer.outline?.[index] ?? 0,
     layer.ink[index],
     layer.fill[index],
+    layer.bridgeOutline?.[index] ?? 0,
   ) / 255;
 }

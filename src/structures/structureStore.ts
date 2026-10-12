@@ -6,6 +6,7 @@
  */
 import {
   DEFAULT_ROAD_STYLE,
+  DEFAULT_ROAD_KIND_STYLE,
   DEFAULT_ROUTING_SETTINGS,
   DEFAULT_TOWN_SIZE,
   DEFAULT_TOWN_ICON_ID,
@@ -15,7 +16,7 @@ import {
   type MapStructures,
   type Road,
   type RoadKind,
-  type RoadLineStyle,
+  type RoadKindStyle,
   type RoadStyle,
   type RoutingSettings,
   type Town,
@@ -78,7 +79,6 @@ function stableSeed(text: string): number {
 }
 
 const ROAD_KINDS: readonly RoadKind[] = ["track", "road", "highway"];
-const ROAD_LINE_STYLES: readonly RoadLineStyle[] = ["auto", "solid", "dashed", "dotted", "double"];
 const TOWN_FONTS = Object.keys(TOWN_FONT_STACKS) as TownFont[];
 const LABEL_POSITIONS: readonly TownLabelPosition[] = ["below", "right", "above"];
 
@@ -95,9 +95,6 @@ function parseRoad(value: unknown): Road | null {
     id: value.id,
     name: text(value.name, "Road"),
     kind: oneOf(value.kind, ROAD_KINDS, "road"),
-    color: typeof value.color === "string" && /^#[0-9a-f]{6}$/i.test(value.color) ? value.color : undefined,
-    lineStyle: value.lineStyle === undefined ? undefined : oneOf(value.lineStyle, ROAD_LINE_STYLES, "auto"),
-    widthScale: value.widthScale === undefined ? undefined : finite(value.widthScale, 1, 0.2, 5),
     waypoints,
     visible: value.visible !== false,
   };
@@ -130,6 +127,7 @@ function parseTown(value: unknown): Town | null {
       : stableSeed(value.id),
     size: finite(value.size, DEFAULT_TOWN_SIZE, 8, 160),
     labelPosition: oneOf(value.labelPosition, LABEL_POSITIONS, "below"),
+    labelOffset: value.labelOffset === undefined ? undefined : finite(value.labelOffset, 0, -160, 320),
     showLabel: value.showLabel !== false,
   };
 }
@@ -163,20 +161,44 @@ export function parseRoutingSettings(value: unknown): RoutingSettings {
 export function parseRoadStyle(value: unknown): RoadStyle {
   const source = isRecord(value) ? value : {};
   const fallback = DEFAULT_ROAD_STYLE;
-  return {
+  const parsed: RoadStyle = {
     color: hexColor(source.color, fallback.color),
     opacity: finite(source.opacity, fallback.opacity, 0, 1),
     widthScale: finite(source.widthScale, fallback.widthScale, 0.2, 5),
     handDrawn: flag(source.handDrawn, fallback.handDrawn),
-    interruptions: finite(source.interruptions, fallback.interruptions, 0, 1),
-    gapDots: flag(source.gapDots, fallback.gapDots),
     outline: flag(source.outline, fallback.outline),
     outlineColor: hexColor(source.outlineColor, fallback.outlineColor),
     outlineWidth: finite(source.outlineWidth, fallback.outlineWidth, 0, 12),
-    fillColor: hexColor(source.fillColor, fallback.fillColor),
     bridgeColor: hexColor(source.bridgeColor, fallback.bridgeColor),
+    bridgeOutlineColor: hexColor(source.bridgeOutlineColor, fallback.bridgeOutlineColor),
+    bridgeOutlineWidth: finite(source.bridgeOutlineWidth, fallback.bridgeOutlineWidth, 0.2, 8),
     clearance: finite(source.clearance, fallback.clearance, 0, 40),
   };
+  if (isRecord(source.byKind)) {
+    parsed.byKind = {};
+    const defaults = DEFAULT_ROAD_KIND_STYLE;
+    const ranges = {
+      width: [0.2, 40], outlineWidth: [0, 12], dashSpacing: [0, 100], dashLength: [1, 200],
+      shadowOpacity: [0, 1], shadowOffset: [0, 40], shadowBlur: [0, 20],
+    } as const;
+    for (const kind of ROAD_KINDS) {
+      const settings = source.byKind[kind];
+      if (!isRecord(settings)) continue;
+      const overrides: Partial<RoadKindStyle> = {};
+      for (const key of ['color', 'outlineColor', 'shadowColor'] as const) {
+        if (settings[key] !== undefined) overrides[key] = hexColor(settings[key], defaults[key]);
+      }
+      if (settings.outline !== undefined) overrides.outline = flag(settings.outline, defaults.outline);
+      for (const key of Object.keys(ranges) as (keyof typeof ranges)[]) {
+        const range = ranges[key];
+        if (settings[key] !== undefined) {
+          overrides[key] = finite(settings[key], defaults[key], range[0], range[1]);
+        }
+      }
+      parsed.byKind[kind] = overrides;
+    }
+  }
+  return parsed;
 }
 
 export function parseTownStyle(value: unknown): TownStyle {

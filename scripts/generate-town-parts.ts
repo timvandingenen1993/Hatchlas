@@ -2,7 +2,8 @@
  * Writes the town building SVGs in src/assets/structures/town-parts.
  * Run with `node scripts/generate-town-parts.ts` after changing a design
  * below. Files edited in /structure-lab carry `data-edited` and are left
- * alone; `--force` overwrites them too.
+ * alone; `--force` overwrites them too. `--only=name,name` limits generation
+ * to the selected parts.
  *
  * Each file carries what the composer needs to put it on the iso grid:
  * `data-footprint` (cells along i and j) and `data-origin` (where grid
@@ -11,9 +12,15 @@
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import {
+  box,
+  doorway,
   gableHouse,
   HAND_FILTER,
+  INK,
   keep,
+  named,
+  PLASTER,
+  ROOF_PALETTES,
   roundTower,
   shapeBounds,
   shapesToSvg,
@@ -27,6 +34,7 @@ import {
   WALL_STEPS,
   wallGate,
   wallLength,
+  wallOpening,
   wallRun,
   type GableHouse,
   type IsoShape,
@@ -35,12 +43,15 @@ import {
 
 const OUT = new URL("../src/assets/structures/town-parts/", import.meta.url);
 const FORCE = process.argv.includes("--force");
+// Regenerate selected designs without touching unrelated building assets.
+const ONLY = process.argv.find((argument) => argument.startsWith("--only="))?.slice(7).split(",");
 const skipped: string[] = [];
 
 const fmt = (value: number) => (Math.round(value * 100) / 100).toString();
 
 /** `wobble` lets edges stray from straight, for the freehand look of castle parts. */
 function writePart(name: string, shapes: IsoShape[], footprint: [number, number], wobble = 0) {
+  if (ONLY && !ONLY.includes(name)) return;
   const file = new URL(`${name}.svg`, OUT);
   if (!FORCE && existsSync(file) && /<svg\b[^>]*\sdata-edited=/.test(readFileSync(file, "utf8"))) {
     skipped.push(name);
@@ -129,9 +140,64 @@ for (const [name, building] of Object.entries(CASTLE_BUILDINGS)) {
 }
 
 // Church: a bell tower behind a long nave, so the nave is drawn over its foot.
-const nave: Omit<GableHouse, "ridge"> = { length: 5, width: 2, wall: 1.7, rise: 1.35, door: 0.5 };
-const belfry = tower({ size: 2, height: 4.6, rise: 2.1, slits: 3 }).map((shape) => ({ ...shape, layer: `tower ${shape.layer}` }));
-writePart("church-gable-right", [...belfry, ...translateShapes(gableHouse({ ...nave, ridge: "i" }), 2, 0)], [7, 2]);
-writePart("church-gable-left", [...belfry, ...translateShapes(gableHouse({ ...nave, ridge: "j" }), 0, 2)], [2, 7]);
+const nave: Omit<GableHouse, "ridge"> = { length: 4, width: 1.6, wall: 1.8, rise: 1.2, door: 0.5, arched: true, streaks: false };
+const belfry = tower({ size: 1.6, height: 2.88, rise: 1.84, slits: 2 }).map((shape) => ({ ...shape, layer: `tower ${shape.layer}` }));
+writePart("church-gable-right", [...belfry, ...translateShapes(gableHouse({ ...nave, ridge: "i" }), 1.6, 0)], [6, 2]);
+writePart("church-gable-left", [...belfry, ...translateShapes(gableHouse({ ...nave, ridge: "j" }), 0, 1.6)], [2, 6]);
+
+/** A city cathedral: low side aisles, a raised nave and paired spires flanking a rose window. */
+function cathedral(ridge: "i" | "j"): IsoShape[] {
+  const stone = (shapes: IsoShape[], prefix: string) => shapes.map((shape) => ({
+    ...shape,
+    fill: shape.fill === PLASTER.lit ? STONE.lit : shape.fill === PLASTER.shade ? STONE.shade : shape.fill,
+    layer: `${prefix} ${shape.layer ?? "walls"}`,
+  }));
+  const aisle = (j: number, prefix: string) => stone(translateShapes(gableHouse({
+    length: 6, width: 0.6, wall: 1.55, rise: 0.5, ridge: "i", boards: false, streaks: false,
+  }), 0.3, j), prefix).filter(({ layer }) => !/windows|door/.test(layer));
+  const spire = (j: number, prefix: string) => stone(translateShapes(tower({
+    size: 1.35, height: 4.2, rise: 1.9, palette: STONE, slits: 2,
+  }), 6.25, j), prefix).filter(({ layer }) => !layer.endsWith("roof lines"));
+  const nave = stone(translateShapes(gableHouse({
+    length: 7.4, width: 2.4, wall: 2.9, rise: 1.65, ridge: "i", boards: false, streaks: false,
+  }), 0.3, 0.8), "nave").filter(({ layer }) => !/windows|door/.test(layer));
+  const shapes = [...aisle(0.2, "far aisle"), ...spire(0.2, "far belfry"), ...nave, ...aisle(3.2, "near aisle")];
+  // Buttresses and paired pointed windows along the visible aisle and clerestory.
+  const lancet = (u: number, width: number, height: number): [number, number][] => [
+    [u - width / 2, 0], [u + width / 2, 0], [u + width / 2, height * 0.65],
+    [u + width * 0.3, height * 0.87], [u, height],
+    [u - width * 0.3, height * 0.87], [u - width / 2, height * 0.65],
+  ];
+  const buttresses: IsoShape[] = [], aisleWindows: IsoShape[] = [], clerestoryWindows: IsoShape[] = [];
+  for (const i of [1, 2.2, 3.4, 4.6, 5.8]) {
+    buttresses.push(...named("buttresses", box(i - 0.12, 3.65, i + 0.12, 3.95, 0, 1.8, STONE)));
+    if (i > 5) continue;
+    for (const offset of [-0.17, 0.17]) {
+      aisleWindows.push({ ...wallOpening([0, 3.8, 0.5], [1, 0], lancet(i + 0.6 + offset, 0.18, 0.85)), layer: "aisle windows" });
+      clerestoryWindows.push({ ...wallOpening([0, 3.2, 2.1], [1, 0], lancet(i + 0.6 + offset, 0.17, 0.5)), layer: "clerestory windows" });
+    }
+  }
+  shapes.push(...buttresses, ...aisleWindows, ...clerestoryWindows);
+  shapes.push(...named("portal", doorway([7.7, 0, 0], [0, 1], 2, 0.9, 1.5)));
+  const circle = (radius: number): [number, number][] => Array.from({ length: 16 }, (_, index) => {
+    const angle = index / 16 * Math.PI * 2;
+    return [2 + Math.cos(angle) * radius, 2.65 + Math.sin(angle) * radius];
+  });
+  shapes.push({ ...wallOpening([7.7, 0, 0], [0, 1], circle(0.52), STONE.lit), layer: "rose window stone" });
+  shapes.push({ ...wallOpening([7.7, 0, 0], [0, 1], circle(0.36), INK), layer: "rose window" });
+  shapes.push(...spire(2.45, "near belfry"));
+  if (ridge === "i") return shapes;
+  // Mirror the geometry and lighting together, keeping light from screen left.
+  return shapes.map((shape) => ({
+    ...shape,
+    points: shape.points.map(([i, j, z]) => [j, i, z] as const),
+    fill: shape.fill === STONE.lit ? STONE.shade : shape.fill === STONE.shade ? STONE.lit
+      : shape.fill === ROOF_PALETTES[0].lit ? ROOF_PALETTES[0].shade
+        : shape.fill === ROOF_PALETTES[0].shade ? ROOF_PALETTES[0].lit : shape.fill,
+    className: shape.className === "roof-lit" ? "roof-shade" : shape.className === "roof-shade" ? "roof-lit" : shape.className,
+  }));
+}
+writePart("cathedral-gable-right", cathedral("i"), [8, 4]);
+writePart("cathedral-gable-left", cathedral("j"), [4, 8]);
 
 if (skipped.length > 0) console.log(`Kept hand-edited parts (--force overwrites them): ${skipped.join(", ")}`);

@@ -764,16 +764,20 @@ function createForegroundPropRGBA(
     };
     for (let index = 0; index < total; index++) {
       const coverage = roadPropClearanceAt(roadLayer, index);
-      if (coverage <= 0) continue;
+      const shadow = (roadLayer.shadow?.alpha[index] ?? 0) / 255 * roadLayer.opacity;
+      if (coverage <= 0 && shadow <= 0) continue;
       const offset = index * 4;
       shade = roadShade?.[index] ?? 1;
       foreground[offset + 3] = Math.round(foreground[offset + 3] * (1 - coverage));
+      if (shadow > 0 && roadLayer.shadow) over(offset, roadLayer.shadow.colors[roadLayer.shadow.colorIndex[index]], shadow);
       const outline = (roadLayer.outline?.[index] ?? 0) / 255 * roadLayer.opacity;
-      if (outline > 0) over(offset, roadLayer.outlineColor, outline);
+      if (outline > 0) over(offset, roadLayer.outlineColors[roadLayer.outlineColorIndex![index]], outline);
       const ink = roadLayer.ink[index] / 255 * roadLayer.opacity;
       if (ink > 0) over(offset, roadLayer.inkColors[roadLayer.inkColorIndex[index]] ?? roadLayer.inkColors[0], ink);
       const fill = roadLayer.fill[index] / 255 * roadLayer.opacity;
-      if (fill > 0) over(offset, roadLayer.fillIsBridge[index] ? roadLayer.bridgeColor : roadLayer.fillColor, fill);
+      if (fill > 0) over(offset, roadLayer.bridgeColor, fill);
+      const bridgeOutline = (roadLayer.bridgeOutline?.[index] ?? 0) / 255 * roadLayer.opacity;
+      if (bridgeOutline > 0) over(offset, roadLayer.bridgeOutlineColor, bridgeOutline);
     }
   }
   return foreground;
@@ -3091,11 +3095,19 @@ export function renderMountainDetailDEMWithCache(
     // which the camera draws after its ridge ink.
     if (roadLayer && !roadsInForeground) {
       const shade = roadShade?.[i] ?? 1;
+      const roadShadow = (roadLayer.shadow?.alpha[i] ?? 0) / 255 * roadLayer.opacity;
+      if (roadShadow > 0 && roadLayer.shadow) {
+        const color = roadLayer.shadow.colors[roadLayer.shadow.colorIndex[i]];
+        r = blendContourColor(r, color[0] * shade, roadShadow);
+        g = blendContourColor(g, color[1] * shade, roadShadow);
+        b = blendContourColor(b, color[2] * shade, roadShadow);
+      }
       const roadOutline = (roadLayer.outline?.[i] ?? 0) / 255 * roadLayer.opacity;
       if (roadOutline > 0) {
-        r = blendContourColor(r, roadLayer.outlineColor[0] * shade, roadOutline);
-        g = blendContourColor(g, roadLayer.outlineColor[1] * shade, roadOutline);
-        b = blendContourColor(b, roadLayer.outlineColor[2] * shade, roadOutline);
+        const color = roadLayer.outlineColors[roadLayer.outlineColorIndex![i]];
+        r = blendContourColor(r, color[0] * shade, roadOutline);
+        g = blendContourColor(g, color[1] * shade, roadOutline);
+        b = blendContourColor(b, color[2] * shade, roadOutline);
       }
       const roadInk = roadLayer.ink[i] / 255 * roadLayer.opacity;
       if (roadInk > 0) {
@@ -3106,10 +3118,17 @@ export function renderMountainDetailDEMWithCache(
       }
       const roadFill = roadLayer.fill[i] / 255 * roadLayer.opacity;
       if (roadFill > 0) {
-        const fillColor = roadLayer.fillIsBridge[i] ? roadLayer.bridgeColor : roadLayer.fillColor;
+        const fillColor = roadLayer.bridgeColor;
         r = blendContourColor(r, fillColor[0] * shade, roadFill);
         g = blendContourColor(g, fillColor[1] * shade, roadFill);
         b = blendContourColor(b, fillColor[2] * shade, roadFill);
+      }
+      const roadBridgeOutline = (roadLayer.bridgeOutline?.[i] ?? 0) / 255 * roadLayer.opacity;
+      if (roadBridgeOutline > 0) {
+        const color = roadLayer.bridgeOutlineColor;
+        r = blendContourColor(r, color[0] * shade, roadBridgeOutline);
+        g = blendContourColor(g, color[1] * shade, roadBridgeOutline);
+        b = blendContourColor(b, color[2] * shade, roadBridgeOutline);
       }
     }
 

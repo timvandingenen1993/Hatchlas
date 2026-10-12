@@ -164,15 +164,22 @@ export function useStructuresEditor({
   const [terrainRevision, setTerrainRevision] = useState(-1);
 
   // Debounced persistence; empty maps are dropped from storage.
+  // A reload inside the debounce window would otherwise drop the last edit, so
+  // pending changes are also written when the page is hidden or closed.
   useEffect(() => {
-    const timer = window.setTimeout(() => {
+    const persist = () => {
       const stored: StoredStructures = { version: 1, maps: {}, routing, roadStyle, townStyle };
       for (const [key, value] of Object.entries(maps)) {
         if (value.roads.length > 0 || value.towns.length > 0) stored.maps[key] = value;
       }
       setStorageError(saveStoredStructures(stored));
-    }, SAVE_DELAY_MS);
-    return () => window.clearTimeout(timer);
+    };
+    const timer = window.setTimeout(persist, SAVE_DELAY_MS);
+    window.addEventListener("pagehide", persist);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("pagehide", persist);
+    };
   }, [maps, routing, roadStyle, townStyle]);
 
   // Icon library.
@@ -323,19 +330,16 @@ export function useStructuresEditor({
   // Only route results and road styles change the rendered map, so dragging
   // a waypoint does not restart the preview render on every mouse move.
   const roadStyleKey = JSON.stringify(structures.roads.map((road) =>
-    [road.id, road.visible, road.kind, road.color ?? null, road.lineStyle ?? "auto", road.widthScale ?? 1]));
+    [road.id, road.visible, road.kind]));
   const renderOptions = useMemo<StructureRenderOptions | undefined>(() => {
     const styles = JSON.parse(roadStyleKey) as
-      [string, boolean, Road["kind"], string | null, NonNullable<Road["lineStyle"]>, number][];
+      [string, boolean, Road["kind"]][];
     const roads = styles
       .filter(([id, visible]) => visible && liveRoutes[id])
-      .map(([id, , kind, color, lineStyle, widthScale]) => ({
+      .map(([id, , kind]) => ({
         points: liveRoutes[id].points,
         bridges: liveRoutes[id].bridges,
         kind,
-        color: color ?? undefined,
-        lineStyle,
-        widthScale,
       }));
     return roads.length > 0 ? { roads, style: roadStyle } : undefined;
   }, [roadStyleKey, liveRoutes, roadStyle]);

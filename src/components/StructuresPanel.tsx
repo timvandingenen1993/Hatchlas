@@ -3,25 +3,27 @@
  */
 import { useState, type ReactNode } from "react";
 import { Eye, EyeOff, Loader2, Plus, RotateCcw, Shuffle, Trash2, Upload, X } from "lucide-react";
-import { InspectorColor, InspectorNote, InspectorSection, InspectorSelect, InspectorToggle } from "./InspectorParts";
+import { InspectorColor, InspectorFold, InspectorNote, InspectorSection, InspectorSelect, InspectorToggle } from "./InspectorParts";
 import { NumericControl } from "./NumericControl";
+import { RoadStylePreview } from "./RoadStylePreview";
 import { generatePOIName } from "../utils/fantasyNames";
 import type { StructuresEditor } from "../structures/useStructuresEditor";
 import { settlementIconUrl, townIconUrl } from "../structures/iconStore";
 import {
   DEFAULT_ROAD_STYLE,
+  DEFAULT_ROAD_KIND_STYLE,
   DEFAULT_ROUTING_SETTINGS,
   DEFAULT_TOWN_SIZE,
   DEFAULT_TOWN_STYLE,
   randomTownSeed,
   ROAD_KIND_LABELS,
+  roadKindStyle,
   SETTLEMENT_ICON_PREFIX,
   SETTLEMENT_KINDS,
   settlementOfIcon,
-  ROAD_LINE_STYLE_LABELS,
   TOWN_FONT_STACKS,
   type RoadKind,
-  type RoadLineStyle,
+  type RoadKindStyle,
   type RoadStyle,
   type TownFont,
   type TownLabelPosition,
@@ -99,6 +101,46 @@ function Stat({ label, value }: { label: string; value: string }) {
   </>;
 }
 
+function RoadTypeControls({ kind, value, style, onChange, onReset }: {
+  kind: RoadKind; value: RoadKindStyle; style: RoadStyle;
+  onChange: (patch: Partial<RoadKindStyle>) => void; onReset: () => void;
+}) {
+  const defaults = DEFAULT_ROAD_KIND_STYLE;
+  const setField = <K extends keyof RoadKindStyle>(key: K) => (next: RoadKindStyle[K]) => onChange({ [key]: next });
+  return <InspectorFold title={ROAD_KIND_LABELS[kind]} defaultOpen={kind === "road"}>
+    <button type="button" onClick={onReset} aria-label={`Reset ${ROAD_KIND_LABELS[kind].toLowerCase()} style`}
+      className="flex items-center gap-1 self-end text-[11px] text-slate-400 hover:text-slate-100">
+      <RotateCcw size={11} /> Reset style
+    </button>
+    <RoadStylePreview style={style} kind={kind} />
+    <NumericControl label="Width" value={value.width} min={0.5} max={16} step={0.1} unit="px"
+      defaultValue={defaults.width} limits={[0.2, 40]} onChange={setField("width")} />
+    <InspectorColor label="Color" value={value.color} onChange={setField("color")} />
+    <NumericControl label="Dash spacing" value={value.dashSpacing} min={0} max={40} step={0.5} unit="px"
+      defaultValue={defaults.dashSpacing} limits={[0, 100]} onChange={setField("dashSpacing")}
+      title="Gap between dashes. Set to 0 for a continuous line." />
+    <NumericControl label="Section length" value={value.dashLength} min={2} max={60} step={0.5} unit="px"
+      defaultValue={defaults.dashLength} limits={[1, 200]} disabled={value.dashSpacing === 0} onChange={setField("dashLength")}
+      title="Length of each dash. Only used when dash spacing is above 0." />
+    <InspectorFold title="Outline">
+      <InspectorToggle label="Outline" checked={value.outline} onChange={setField("outline")} />
+      <InspectorColor label="Outline color" value={value.outlineColor} disabled={!value.outline} onChange={setField("outlineColor")} />
+      <NumericControl label="Outline width" value={value.outlineWidth} min={0} max={6} step={0.1} unit="px"
+        defaultValue={defaults.outlineWidth} limits={[0, 12]} disabled={!value.outline} onChange={setField("outlineWidth")} />
+    </InspectorFold>
+    <InspectorFold title="Shadow">
+      <NumericControl label="Shadow opacity" value={value.shadowOpacity} min={0} max={1} step={0.01} unit="%"
+        defaultValue={defaults.shadowOpacity} onChange={setField("shadowOpacity")} />
+      <InspectorColor label="Shadow color" value={value.shadowColor} disabled={value.shadowOpacity === 0} onChange={setField("shadowColor")} />
+      <NumericControl label="Shadow offset" value={value.shadowOffset} min={0} max={12} step={0.1} unit="px"
+        defaultValue={defaults.shadowOffset} limits={[0, 40]} disabled={value.shadowOpacity === 0} onChange={setField("shadowOffset")} />
+      <NumericControl label="Shadow blur" value={value.shadowBlur} min={0} max={10} step={0.1} unit="px"
+        defaultValue={defaults.shadowBlur} limits={[0, 20]} disabled={value.shadowOpacity === 0} onChange={setField("shadowBlur")}
+        title="How far the shadow edge fades out." />
+    </InspectorFold>
+  </InspectorFold>;
+}
+
 export function StructuresPanel({ editor, onStartRoad, onStartTown }: StructuresPanelProps) {
   const {
     structures, routes, routingRoadIds, routing, setRouting, selection, setSelection, icons,
@@ -125,7 +167,7 @@ export function StructuresPanel({ editor, onStartRoad, onStartTown }: Structures
       </div>
     )}
 
-    <InspectorSection title="Roads" collapsible={false} aside={
+    <InspectorSection title="Roads" aside={
       <button type="button" onClick={onStartRoad}
         className="flex items-center gap-1 rounded bg-sky-600 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-sky-500">
         <Plus size={12} /> New road
@@ -154,101 +196,94 @@ export function StructuresPanel({ editor, onStartRoad, onStartTown }: Structures
         <InspectorSelect label="Type" value={selectedRoad.kind}
           options={(Object.keys(ROAD_KIND_LABELS) as RoadKind[]).map((kind) => [kind, ROAD_KIND_LABELS[kind]] as const)}
           onChange={(kind) => editor.updateRoad(selectedRoad.id, { kind })} />
-        <InspectorSelect<RoadLineStyle> label="Line" value={selectedRoad.lineStyle ?? "auto"}
-          options={(Object.keys(ROAD_LINE_STYLE_LABELS) as RoadLineStyle[]).map((style) => [style, ROAD_LINE_STYLE_LABELS[style]] as const)}
-          onChange={(lineStyle) => editor.updateRoad(selectedRoad.id, { lineStyle })} />
-        <NumericControl label="Width" value={selectedRoad.widthScale ?? 1} min={0.3} max={3} step={0.05} unit="×"
-          defaultValue={1} limits={[0.2, 5]}
-          onChange={(widthScale) => editor.updateRoad(selectedRoad.id, { widthScale })} />
-        <div className="flex items-center gap-1">
-          <div className="min-w-0 flex-1">
-            <InspectorColor label={selectedRoad.color ? "Ink" : "Ink (map style)"} value={selectedRoad.color ?? roadStyle.color}
-              onChange={(color) => editor.updateRoad(selectedRoad.id, { color })} />
-          </div>
-          {selectedRoad.color && <button type="button" className={iconButton} title="Use the map road color" aria-label="Use the map road color"
-            onClick={() => editor.updateRoad(selectedRoad.id, { color: undefined })}><RotateCcw size={12} /></button>}
-        </div>
-        {selectedRoad.waypoints.length < 2
-          ? <InspectorNote>Click the map to add at least two points.</InspectorNote>
-          : selectedRoute && <div className="grid grid-cols-[auto_auto] justify-between gap-x-3 gap-y-0.5 text-[12px]">
-            <Stat label="Length" value={`${selectedRoute.lengthKm.toFixed(1)} km`} />
-            <Stat label="Total climb" value={`${Math.round(selectedRoute.ascentM).toLocaleString()} m`} />
-            <Stat label="Steepest grade" value={`${selectedRoute.maxGradePct.toFixed(0)} %`} />
-            <Stat label="Bridges" value={String(selectedRoute.bridgeCount)} />
-            {selectedRoute.fordCount > 0 && <Stat label="Fords" value={String(selectedRoute.fordCount)} />}
-          </div>}
-        {selectedRoute?.blocked && <InspectorNote>Part of this road is cut off by sea or lake and is drawn as a straight line.</InspectorNote>}
-        <InspectorNote>Click the road to add a steering point. Drag points to move them (or use the Select tool, V); Delete removes the selected point; Enter finishes the road.</InspectorNote>
+        <InspectorFold title="Route details">
+          {selectedRoad.waypoints.length < 2
+            ? <InspectorNote>Click the map to add at least two points.</InspectorNote>
+            : selectedRoute && <div className="grid grid-cols-[auto_auto] justify-between gap-x-3 gap-y-0.5 text-[12px]">
+              <Stat label="Length" value={`${selectedRoute.lengthKm.toFixed(1)} km`} />
+              <Stat label="Total climb" value={`${Math.round(selectedRoute.ascentM).toLocaleString()} m`} />
+              <Stat label="Steepest grade" value={`${selectedRoute.maxGradePct.toFixed(0)} %`} />
+              <Stat label="Bridges" value={String(selectedRoute.bridgeCount)} />
+              {selectedRoute.fordCount > 0 && <Stat label="Fords" value={String(selectedRoute.fordCount)} />}
+            </div>}
+          {selectedRoute?.blocked && <InspectorNote>Part of this road is cut off by sea or lake and is drawn as a straight line.</InspectorNote>}
+          <InspectorNote>Click the road to add a steering point. Drag points to move them (or use the Select tool, V); Delete removes the selected point; Enter finishes the road.</InspectorNote>
+        </InspectorFold>
       </div>}
     </InspectorSection>
 
     <InspectorSection title="Road routing">
-      <NumericControl label="Max grade" value={routing.maxGradePct / 100} min={0.03} max={0.25} step={0.005} unit="%"
-        defaultValue={DEFAULT_ROUTING_SETTINGS.maxGradePct / 100} limits={[0.03, 0.3]}
-        title="Comfortable climb for a standard road. Tracks accept 1.5× this, highways two thirds."
-        onChange={(value) => setRouting((previous) => ({ ...previous, maxGradePct: value * 100 }))} />
-      <NumericControl label="Slope avoidance" value={routing.slopeAvoidance} min={0} max={3} step={0.1} unit="×"
-        defaultValue={DEFAULT_ROUTING_SETTINGS.slopeAvoidance}
-        title="How strongly roads detour to stay on gentle ground below the maximum grade."
-        onChange={(value) => setRouting((previous) => ({ ...previous, slopeAvoidance: value }))} />
-      <NumericControl label="Bridge reluctance" value={routing.bridgeReluctanceKm} min={0} max={10} step={0.1} unit="km"
-        defaultValue={DEFAULT_ROUTING_SETTINGS.bridgeReluctanceKm} limits={[0, 10]}
-        title="Fixed cost of a bridge, as km of detour, before its length is counted."
-        onChange={(value) => setRouting((previous) => ({ ...previous, bridgeReluctanceKm: value }))} />
-      <NumericControl label="Straightness" value={routing.straightness} min={0} max={1} step={0.01} unit="%"
-        defaultValue={DEFAULT_ROUTING_SETTINGS.straightness}
-        title="On climbs only: how readily wiggles become long straight legs and switchbacks. Level stretches keep natural curves."
-        onChange={(value) => setRouting((previous) => ({ ...previous, straightness: value }))} />
-      <NumericControl label="Min leg length" value={routing.minLegLengthM} min={0} max={800} step={10} unit="m"
-        defaultValue={DEFAULT_ROUTING_SETTINGS.minLegLengthM} limits={[0, 2000]}
-        title="On climbs: the shortest stretch between two turns. Shorter zigzags are rebuilt as longer switchbacks."
-        onChange={(value) => setRouting((previous) => ({ ...previous, minLegLengthM: value }))} />
-      <NumericControl label="Typical bridge" value={routing.typicalBridgeLengthM} min={20} max={500} step={5} unit="m"
-        defaultValue={DEFAULT_ROUTING_SETTINGS.typicalBridgeLengthM} limits={[10, 2000]}
-        title="Bridges longer than this get steeply more expensive, so a short detour to a narrower crossing wins."
-        onChange={(value) => setRouting((previous) => ({ ...previous, typicalBridgeLengthM: value }))} />
-      <NumericControl label="Max bridge length" value={routing.maxBridgeLengthM} min={40} max={1500} step={10} unit="m"
-        defaultValue={DEFAULT_ROUTING_SETTINGS.maxBridgeLengthM} limits={[20, 3000]}
-        title="Longest bridge, bank to bank. Wider water is routed around."
-        onChange={(value) => setRouting((previous) => ({ ...previous, maxBridgeLengthM: value }))} />
-      <NumericControl label="Forest avoidance" value={routing.forestAvoidance} min={0} max={3} step={0.1} unit="×"
-        defaultValue={DEFAULT_ROUTING_SETTINGS.forestAvoidance}
-        title="How strongly roads steer around forest and shrub stands. Uses the stands drawn on the Map view."
-        onChange={(value) => setRouting((previous) => ({ ...previous, forestAvoidance: value }))} />
-      <InspectorToggle label="Ford small streams" checked={routing.allowFords}
-        onChange={(allowFords) => setRouting((previous) => ({ ...previous, allowFords }))} />
+      <InspectorFold title="Terrain avoidance" defaultOpen>
+        <NumericControl label="Max grade" value={routing.maxGradePct / 100} min={0.03} max={0.25} step={0.005} unit="%"
+          defaultValue={DEFAULT_ROUTING_SETTINGS.maxGradePct / 100} limits={[0.03, 0.3]}
+          title="Comfortable climb for a standard road. Tracks accept 1.5× this, highways two thirds."
+          onChange={(value) => setRouting((previous) => ({ ...previous, maxGradePct: value * 100 }))} />
+        <NumericControl label="Slope avoidance" value={routing.slopeAvoidance} min={0} max={3} step={0.1} unit="×"
+          defaultValue={DEFAULT_ROUTING_SETTINGS.slopeAvoidance}
+          title="How strongly roads detour to stay on gentle ground below the maximum grade."
+          onChange={(value) => setRouting((previous) => ({ ...previous, slopeAvoidance: value }))} />
+        <NumericControl label="Forest avoidance" value={routing.forestAvoidance} min={0} max={3} step={0.1} unit="×"
+          defaultValue={DEFAULT_ROUTING_SETTINGS.forestAvoidance}
+          title="How strongly roads steer around forest and shrub stands. Uses the stands drawn on the Map view."
+          onChange={(value) => setRouting((previous) => ({ ...previous, forestAvoidance: value }))} />
+      </InspectorFold>
+      <InspectorFold title="Water crossings">
+        <NumericControl label="Bridge reluctance" value={routing.bridgeReluctanceKm} min={0} max={10} step={0.1} unit="km"
+          defaultValue={DEFAULT_ROUTING_SETTINGS.bridgeReluctanceKm} limits={[0, 10]}
+          title="Fixed cost of a bridge, as km of detour, before its length is counted."
+          onChange={(value) => setRouting((previous) => ({ ...previous, bridgeReluctanceKm: value }))} />
+        <NumericControl label="Typical bridge" value={routing.typicalBridgeLengthM} min={20} max={500} step={5} unit="m"
+          defaultValue={DEFAULT_ROUTING_SETTINGS.typicalBridgeLengthM} limits={[10, 2000]}
+          title="Bridges longer than this get steeply more expensive, so a short detour to a narrower crossing wins."
+          onChange={(value) => setRouting((previous) => ({ ...previous, typicalBridgeLengthM: value }))} />
+        <NumericControl label="Max bridge length" value={routing.maxBridgeLengthM} min={40} max={1500} step={10} unit="m"
+          defaultValue={DEFAULT_ROUTING_SETTINGS.maxBridgeLengthM} limits={[20, 3000]}
+          title="Longest bridge, bank to bank. Wider water is routed around."
+          onChange={(value) => setRouting((previous) => ({ ...previous, maxBridgeLengthM: value }))} />
+        <InspectorToggle label="Ford small streams" checked={routing.allowFords}
+          onChange={(allowFords) => setRouting((previous) => ({ ...previous, allowFords }))} />
+      </InspectorFold>
+      <InspectorFold title="Switchbacks">
+        <NumericControl label="Straightness" value={routing.straightness} min={0} max={1} step={0.01} unit="%"
+          defaultValue={DEFAULT_ROUTING_SETTINGS.straightness}
+          title="On climbs only: how readily wiggles become long straight legs and switchbacks. Level stretches keep natural curves."
+          onChange={(value) => setRouting((previous) => ({ ...previous, straightness: value }))} />
+        <NumericControl label="Min leg length" value={routing.minLegLengthM} min={0} max={800} step={10} unit="m"
+          defaultValue={DEFAULT_ROUTING_SETTINGS.minLegLengthM} limits={[0, 2000]}
+          title="On climbs: the shortest stretch between two turns. Shorter zigzags are rebuilt as longer switchbacks."
+          onChange={(value) => setRouting((previous) => ({ ...previous, minLegLengthM: value }))} />
+      </InspectorFold>
     </InspectorSection>
 
     <InspectorSection title="Road style" aside={
       <button type="button" className={iconButton} title="Reset road style" aria-label="Reset road style"
         onClick={() => setRoadStyle({ ...DEFAULT_ROAD_STYLE })}><RotateCcw size={12} /></button>}>
-      <InspectorColor label="Color" value={roadStyle.color} onChange={setRoadField("color")} />
-      <NumericControl label="Opacity" value={roadStyle.opacity} min={0} max={1} step={0.01} unit="%"
-        defaultValue={DEFAULT_ROAD_STYLE.opacity} onChange={setRoadField("opacity")} />
-      <NumericControl label="Width" value={roadStyle.widthScale} min={0.3} max={3} step={0.05} unit="×"
-        defaultValue={DEFAULT_ROAD_STYLE.widthScale} limits={[0.2, 5]} onChange={setRoadField("widthScale")} />
-      <InspectorToggle label="Hand-drawn ink" checked={roadStyle.handDrawn} onChange={setRoadField("handDrawn")}
-        title="The map's charcoal pen: tapered strokes with breaks; off draws clean, even lines." />
-      {roadStyle.handDrawn && <>
-        <NumericControl label="Interruptions" value={roadStyle.interruptions} min={0} max={1} step={0.01} unit="%"
-          defaultValue={DEFAULT_ROAD_STYLE.interruptions} onChange={setRoadField("interruptions")}
-          title="Chance that a charcoal stroke ends in a small break." />
-        <InspectorToggle label="Dots in breaks" checked={roadStyle.gapDots} onChange={setRoadField("gapDots")} />
-      </>}
-      <InspectorToggle label="Outline" checked={roadStyle.outline} onChange={setRoadField("outline")} />
-      {roadStyle.outline && <>
-        <InspectorColor label="Outline color" value={roadStyle.outlineColor} onChange={setRoadField("outlineColor")} />
-        <NumericControl label="Outline width" value={roadStyle.outlineWidth} min={0.2} max={6} step={0.1} unit="px"
-          defaultValue={DEFAULT_ROAD_STYLE.outlineWidth} limits={[0, 12]} onChange={setRoadField("outlineWidth")} />
-      </>}
-      <InspectorColor label="Double-line fill" value={roadStyle.fillColor} onChange={setRoadField("fillColor")} />
-      <InspectorColor label="Bridge deck" value={roadStyle.bridgeColor} onChange={setRoadField("bridgeColor")} />
-      <NumericControl label="Tree clearance" value={roadStyle.clearance} min={0} max={20} step={0.5} unit="px"
-        defaultValue={DEFAULT_ROAD_STYLE.clearance} limits={[0, 40]} onChange={setRoadField("clearance")}
-        title="Corridor beside the road kept free of trees, shrubs and boulders. Widths are pixels of a 2048px map." />
+      <InspectorNote>All types use the same line. Style each type below; pixel sizes refer to a 2048px map.</InspectorNote>
+      {(Object.keys(ROAD_KIND_LABELS) as RoadKind[]).map((kind) => <RoadTypeControls key={kind} kind={kind}
+        value={roadKindStyle(roadStyle, kind)} style={roadStyle}
+        onChange={(patch) => setRoadStyle((previous) => ({ ...previous,
+          byKind: { ...previous.byKind, [kind]: { ...previous.byKind?.[kind], ...patch } },
+        }))}
+        onReset={() => setRoadStyle((previous) => ({ ...previous,
+          byKind: { ...previous.byKind, [kind]: { ...DEFAULT_ROAD_KIND_STYLE } },
+        }))} />)}
+      <InspectorFold title="Shared settings">
+        <NumericControl label="Opacity" value={roadStyle.opacity} min={0} max={1} step={0.01} unit="%"
+          defaultValue={DEFAULT_ROAD_STYLE.opacity} onChange={setRoadField("opacity")} />
+        <InspectorToggle label="Charcoal outline" checked={roadStyle.handDrawn} onChange={setRoadField("handDrawn")}
+          title="Draw road outlines with the map's charcoal pen texture. Lines and dashes stay clean." />
+        <InspectorColor label="Bridge deck" value={roadStyle.bridgeColor} onChange={setRoadField("bridgeColor")} />
+        <InspectorColor label="Bridge outline" value={roadStyle.bridgeOutlineColor} onChange={setRoadField("bridgeOutlineColor")} />
+        <NumericControl label="Bridge outline width" value={roadStyle.bridgeOutlineWidth} min={0.2} max={4} step={0.1} unit="px"
+          defaultValue={DEFAULT_ROAD_STYLE.bridgeOutlineWidth} limits={[0.2, 8]} onChange={setRoadField("bridgeOutlineWidth")}
+          title="Thickness of the lines drawn around a bridge and along its side sections." />
+        <NumericControl label="Tree clearance" value={roadStyle.clearance} min={0} max={20} step={0.5} unit="px"
+          defaultValue={DEFAULT_ROAD_STYLE.clearance} limits={[0, 40]} onChange={setRoadField("clearance")}
+          title="Corridor beside the road kept free of trees, shrubs and boulders." />
+      </InspectorFold>
     </InspectorSection>
 
-    <InspectorSection title="Towns" collapsible={false} aside={
+    <InspectorSection title="Towns" aside={
       <button type="button" onClick={onStartTown}
         className="flex items-center gap-1 rounded bg-sky-600 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-sky-500">
         <Plus size={12} /> Place town
@@ -275,39 +310,48 @@ export function StructuresPanel({ editor, onStartRoad, onStartTown }: Structures
             <Shuffle size={12} />
           </button>
         </div>
-        <TextField label="Label" value={selectedTown.subtitle ?? ""} placeholder="e.g. Market town"
-          onChange={(subtitle) => editor.updateTown(selectedTown.id, { subtitle: subtitle || undefined })} />
-        <InspectorToggle label="Show label" checked={selectedTown.showLabel}
-          onChange={(showLabel) => editor.updateTown(selectedTown.id, { showLabel })} />
-        <InspectorSelect<TownLabelPosition> label="Label position" value={selectedTown.labelPosition}
-          options={[["below", "Below"], ["right", "Right"], ["above", "Above"]]}
-          onChange={(labelPosition) => editor.updateTown(selectedTown.id, { labelPosition })} />
-        <NumericControl label="Size" value={selectedTown.size} min={16} max={160} step={1} unit="px" limits={[8, 160]}
-          defaultValue={DEFAULT_TOWN_SIZE} onChange={(size) => editor.updateTown(selectedTown.id, { size })} />
-        <div className="py-0.5 text-[12px] text-slate-300">Settlement</div>
-        <div role="radiogroup" aria-label="Settlement" className="grid grid-cols-3 gap-1">
-          {SETTLEMENT_KINDS.map((settlement) => {
-            const iconId = SETTLEMENT_ICON_PREFIX + settlement.kind;
-            const selected = selectedTown.iconId === iconId;
-            return <button type="button" role="radio" key={iconId} aria-checked={selected} title={settlement.label}
-              onClick={() => editor.updateTown(selectedTown.id, iconPatch(selectedTown, iconId))}
-              className={`${iconTile(selected)} flex-col gap-0.5`}>
-              <img src={settlementIconUrl(settlement.kind, selectedTown.seed)} alt="" className="min-h-0 max-w-full flex-1 object-contain" />
-              <span className="text-[10px] leading-none text-slate-400">{settlement.label}</span>
-            </button>;
-          })}
-        </div>
-        {settlementOfIcon(selectedTown.iconId) && <SeedField value={selectedTown.seed}
-          onChange={(seed) => editor.updateTown(selectedTown.id, { seed })} />}
-        {icons.length > 0 && <>
-          <div className="py-0.5 text-[12px] text-slate-300">Uploaded symbols</div>
-          <div role="radiogroup" aria-label="Uploaded town symbol" className="grid grid-cols-6 gap-1">
-            {icons.map((icon) => <button type="button" role="radio" key={icon.id} aria-checked={selectedTown.iconId === icon.id}
-              title={icon.name} onClick={() => editor.updateTown(selectedTown.id, iconPatch(selectedTown, icon.id))}
-              className={iconTile(selectedTown.iconId === icon.id)}>
-              <img src={icon.url} alt={icon.name} className="max-h-full max-w-full object-contain" />
-            </button>)}
+        <InspectorFold title="Label" defaultOpen>
+          <TextField label="Subtitle" value={selectedTown.subtitle ?? ""} placeholder="e.g. Market town"
+            onChange={(subtitle) => editor.updateTown(selectedTown.id, { subtitle: subtitle || undefined })} />
+          <InspectorToggle label="Show label" checked={selectedTown.showLabel}
+            onChange={(showLabel) => editor.updateTown(selectedTown.id, { showLabel })} />
+          <InspectorSelect<TownLabelPosition> label="Label position" value={selectedTown.labelPosition}
+            options={[["below", "Below"], ["right", "Right"], ["above", "Above"]]}
+            disabled={!selectedTown.showLabel}
+            onChange={(labelPosition) => editor.updateTown(selectedTown.id, { labelPosition })} />
+          <NumericControl label="Label offset" value={selectedTown.labelOffset ?? 0} min={-40} max={80} step={1} unit="px"
+            defaultValue={0} limits={[-160, 320]} disabled={!selectedTown.showLabel}
+            title="Extra distance from the town icon. Negative values move the label closer; pixels refer to a 2048px map."
+            onChange={(labelOffset) => editor.updateTown(selectedTown.id, { labelOffset })} />
+        </InspectorFold>
+        <InspectorFold title="Settlement" defaultOpen>
+          <NumericControl label="Size" value={selectedTown.size} min={16} max={160} step={1} unit="px" limits={[8, 160]}
+            defaultValue={DEFAULT_TOWN_SIZE} onChange={(size) => editor.updateTown(selectedTown.id, { size })} />
+          <div role="radiogroup" aria-label="Settlement" className="grid grid-cols-3 gap-1">
+            {SETTLEMENT_KINDS.map((settlement) => {
+              const iconId = SETTLEMENT_ICON_PREFIX + settlement.kind;
+              const selected = selectedTown.iconId === iconId;
+              return <button type="button" role="radio" key={iconId} aria-checked={selected} title={settlement.label}
+                onClick={() => editor.updateTown(selectedTown.id, iconPatch(selectedTown, iconId))}
+                className={`${iconTile(selected)} flex-col gap-0.5`}>
+                <img src={settlementIconUrl(settlement.kind, selectedTown.seed)} alt="" className="min-h-0 max-w-full flex-1 object-contain" />
+                <span className="text-[10px] leading-none text-slate-400">{settlement.label}</span>
+              </button>;
+            })}
           </div>
+          {settlementOfIcon(selectedTown.iconId) && <SeedField value={selectedTown.seed}
+            onChange={(seed) => editor.updateTown(selectedTown.id, { seed })} />}
+        </InspectorFold>
+        {icons.length > 0 && <>
+          <InspectorFold title="Uploaded symbols">
+            <div role="radiogroup" aria-label="Uploaded town symbol" className="grid grid-cols-6 gap-1">
+              {icons.map((icon) => <button type="button" role="radio" key={icon.id} aria-checked={selectedTown.iconId === icon.id}
+                title={icon.name} onClick={() => editor.updateTown(selectedTown.id, iconPatch(selectedTown, icon.id))}
+                className={iconTile(selectedTown.iconId === icon.id)}>
+                <img src={icon.url} alt={icon.name} className="max-h-full max-w-full object-contain" />
+              </button>)}
+            </div>
+          </InspectorFold>
         </>}
       </div>}
     </InspectorSection>
@@ -315,24 +359,30 @@ export function StructuresPanel({ editor, onStartRoad, onStartTown }: Structures
     <InspectorSection title="Label style" aside={
       <button type="button" className={iconButton} title="Reset label style" aria-label="Reset label style"
         onClick={() => setTownStyle({ ...DEFAULT_TOWN_STYLE })}><RotateCcw size={12} /></button>}>
-      <InspectorSelect<TownFont> label="Font" value={townStyle.font} onChange={setLabelField("font")}
-        options={(Object.keys(TOWN_FONT_STACKS) as TownFont[]).map((font) => [font, TOWN_FONT_STACKS[font].label] as const)} />
-      <InspectorToggle label="Bold names" checked={townStyle.bold} onChange={setLabelField("bold")} />
-      <InspectorToggle label="Uppercase" checked={townStyle.uppercase} onChange={setLabelField("uppercase")} />
-      <InspectorToggle label="Italic subtitle" checked={townStyle.subtitleItalic} onChange={setLabelField("subtitleItalic")} />
-      <InspectorColor label="Text color" value={townStyle.textColor} onChange={setLabelField("textColor")} />
-      <NumericControl label="Name size" value={townStyle.labelScale} min={0.4} max={2.5} step={0.05} unit="×"
-        defaultValue={DEFAULT_TOWN_STYLE.labelScale} limits={[0.3, 4]} onChange={setLabelField("labelScale")} />
-      <NumericControl label="Subtitle size" value={townStyle.subtitleScale} min={0.4} max={1.2} step={0.02} unit="×"
-        defaultValue={DEFAULT_TOWN_STYLE.subtitleScale} limits={[0.3, 1.5]} onChange={setLabelField("subtitleScale")} />
-      <NumericControl label="Letter spacing" value={townStyle.letterSpacing} min={0} max={0.5} step={0.01} unit="em"
-        defaultValue={DEFAULT_TOWN_STYLE.letterSpacing} limits={[-0.1, 1]} onChange={setLabelField("letterSpacing")} />
-      <InspectorColor label="Outline color" value={townStyle.haloColor} onChange={setLabelField("haloColor")} />
-      <NumericControl label="Outline width" value={townStyle.haloWidth} min={0} max={3} step={0.05} unit="×"
-        defaultValue={DEFAULT_TOWN_STYLE.haloWidth} limits={[0, 4]} onChange={setLabelField("haloWidth")} />
-      <NumericControl label="Outline opacity" value={townStyle.haloOpacity} min={0} max={1} step={0.01} unit="%"
-        defaultValue={DEFAULT_TOWN_STYLE.haloOpacity} onChange={setLabelField("haloOpacity")} />
-      <InspectorNote>Fonts come from this computer; a missing font falls back to a similar one.</InspectorNote>
+      <InspectorFold title="Typography" defaultOpen>
+        <InspectorSelect<TownFont> label="Font" value={townStyle.font} onChange={setLabelField("font")}
+          options={(Object.keys(TOWN_FONT_STACKS) as TownFont[]).map((font) => [font, TOWN_FONT_STACKS[font].label] as const)} />
+        <InspectorToggle label="Bold names" checked={townStyle.bold} onChange={setLabelField("bold")} />
+        <InspectorToggle label="Uppercase" checked={townStyle.uppercase} onChange={setLabelField("uppercase")} />
+        <InspectorToggle label="Italic subtitle" checked={townStyle.subtitleItalic} onChange={setLabelField("subtitleItalic")} />
+        <InspectorColor label="Text color" value={townStyle.textColor} onChange={setLabelField("textColor")} />
+        <InspectorNote>Fonts come from this computer; a missing font falls back to a similar one.</InspectorNote>
+      </InspectorFold>
+      <InspectorFold title="Size and spacing" defaultOpen>
+        <NumericControl label="Name size" value={townStyle.labelScale} min={0.4} max={2.5} step={0.05} unit="×"
+          defaultValue={DEFAULT_TOWN_STYLE.labelScale} limits={[0.3, 4]} onChange={setLabelField("labelScale")} />
+        <NumericControl label="Subtitle size" value={townStyle.subtitleScale} min={0.4} max={1.2} step={0.02} unit="×"
+          defaultValue={DEFAULT_TOWN_STYLE.subtitleScale} limits={[0.3, 1.5]} onChange={setLabelField("subtitleScale")} />
+        <NumericControl label="Letter spacing" value={townStyle.letterSpacing} min={0} max={0.5} step={0.01} unit="em"
+          defaultValue={DEFAULT_TOWN_STYLE.letterSpacing} limits={[-0.1, 1]} onChange={setLabelField("letterSpacing")} />
+      </InspectorFold>
+      <InspectorFold title="Outline">
+        <InspectorColor label="Outline color" value={townStyle.haloColor} onChange={setLabelField("haloColor")} />
+        <NumericControl label="Outline width" value={townStyle.haloWidth} min={0} max={3} step={0.05} unit="×"
+          defaultValue={DEFAULT_TOWN_STYLE.haloWidth} limits={[0, 4]} onChange={setLabelField("haloWidth")} />
+        <NumericControl label="Outline opacity" value={townStyle.haloOpacity} min={0} max={1} step={0.01} unit="%"
+          defaultValue={DEFAULT_TOWN_STYLE.haloOpacity} onChange={setLabelField("haloOpacity")} />
+      </InspectorFold>
     </InspectorSection>
 
     <InspectorSection title="Town icons">

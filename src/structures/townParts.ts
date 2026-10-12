@@ -3,6 +3,9 @@
  * grid footprints, and the back-to-front order for placing them. Shared by
  * the settlement and castle composers.
  */
+import { parseSettlements, SETTLEMENT_ATTRIBUTE } from "./partPlacement";
+import type { SettlementKind } from "./types";
+
 const PART_SOURCES = import.meta.glob<string>("../assets/structures/town-parts/*.svg", {
   query: "?raw",
   import: "default",
@@ -11,6 +14,8 @@ const PART_SOURCES = import.meta.glob<string>("../assets/structures/town-parts/*
 
 export interface TownPart {
   name: string;
+  /** Explicit placement overrides from the saved SVG; absent keeps the original defaults. */
+  settlements?: readonly SettlementKind[];
   /** Cells covered along i and j. */
   cellsI: number;
   cellsJ: number;
@@ -19,6 +24,7 @@ export interface TownPart {
   /** Viewbox position of the footprint's grid point (0, 0). */
   originX: number;
   originY: number;
+  /** Visible SVG content in coordinates normalized to the viewBox's top-left. */
   body: string;
 }
 
@@ -35,19 +41,25 @@ export function parseTownPart(name: string, source: string): TownPart {
     || ![...footprint, ...origin, ...viewBox].every(Number.isFinite) || !group) {
     throw new Error(`Town part ${name} needs a viewBox, data-footprint, data-origin and a <g class="part"> body`);
   }
+  // Layer names and hidden layers are for the editor only. Saved edits can
+  // grow the viewBox into negative coordinates, so normalize the paths along
+  // with the origin; composers measure each part from (0, 0) to (width, height).
+  const content = group[1]
+    .replace(/<\w+\b[^>]*\sdisplay="none"[^>]*\/>\s*/g, "")
+    .replace(/ data-layer="[^"]*"/g, "")
+    .trim();
+  const body = viewBox[0] === 0 && viewBox[1] === 0 ? content
+    : `<g transform="translate(${-viewBox[0]} ${-viewBox[1]})">${content}</g>`;
   return {
     name,
+    settlements: parseSettlements(new RegExp(`\\b${SETTLEMENT_ATTRIBUTE}="([^"]*)"`).exec(root[1])?.[1]),
     cellsI: footprint[0],
     cellsJ: footprint[1],
     width: viewBox[2],
     height: viewBox[3],
     originX: origin[0] - viewBox[0],
     originY: origin[1] - viewBox[1],
-    // Layer names and layers hidden in /structure-lab are for the editor only.
-    body: group[1]
-      .replace(/<\w+\b[^>]*\sdisplay="none"[^>]*\/>\s*/g, "")
-      .replace(/ data-layer="[^"]*"/g, "")
-      .trim(),
+    body,
   };
 }
 
