@@ -12,6 +12,8 @@ import {
   type ForestStandGeometry,
 } from "./forestStandGeometry";
 import { renderForestStandCanvas } from "./forestStandRenderer";
+import { buildForestInkGeometry, DEFAULT_FOREST_INK_PENS, mapForestInkGeometry, type ForestInkGeometry, type ForestInkType } from "./forestInkStands";
+import { renderForestInkCanvas } from "./forestInkRenderer";
 
 /**
  * /forest-lab: a synthetic alpine slope (ground, form lines, crest lines)
@@ -26,6 +28,42 @@ export interface ForestLabSettings {
   seed: number;
   /** Which stand profile to draw: the same code paints both in the map. */
   standKind: "trees" | "shrubs";
+  /** "wash": colour wash with tree marks; "ink": pen marks only (tutorial style). */
+  standStyle: "wash" | "ink";
+  /** "paper": plain paper without terrain, for comparing against ink references. */
+  ground: "terrain" | "paper";
+  /** "slope": stands from the terrain; "blobs": a few large rounded patches, as in ink tutorials. */
+  forestShape: "slope" | "blobs";
+  /** Ink style: tree shape (deciduous, coniferous or shrubs). */
+  inkForestType: ForestInkType;
+  /** Ink style: width of a crown mark in map pixels. */
+  inkMarkSize: number;
+  /** Ink style: how tightly the crown marks fill a stand. */
+  inkDensity: number;
+  /** Ink style: second, half-hidden row of crowns behind the front edge. */
+  inkEdgeRows: number;
+  /** Ink style: how tightly trees pack along the front and back edges. */
+  inkEdgeDensity: number;
+  /** Ink style: how far edge trees stand in front of or behind the outline. */
+  inkEdgeDepth: number;
+  /** Ink style: dotted grass runs around stands. */
+  inkGrass: number;
+  /** Ink style: opacity of the light tint under stands and crowns. */
+  inkWash: number;
+  /** Ink style: tint colour under stands and crowns. */
+  inkWashColor: string;
+  /** Ink style: dry charcoal grain and pressure taper in the strokes. */
+  inkCharcoal: number;
+  /** Ink style: how often strokes break where the pen skipped. */
+  inkInterruptions: number;
+  /** Ink style: line weight per kind of tree (multiples of the outline pen). */
+  inkLineFront: number;
+  inkLineSecond: number;
+  inkLineBack: number;
+  inkLineNearEdge: number;
+  inkLineFill: number;
+  inkLineLone: number;
+  inkLineGrass: number;
   /** Tree height in map pixels. */
   treeSize: number;
   /** Shrub height as a fraction of the tree height (the map uses about 0.36). */
@@ -69,6 +107,27 @@ export interface ForestLabSettings {
 export const DEFAULT_FOREST_LAB_SETTINGS: ForestLabSettings = {
   seed: 7,
   standKind: "trees",
+  standStyle: "wash",
+  ground: "terrain",
+  forestShape: "slope",
+  inkForestType: "deciduous",
+  inkMarkSize: 8,
+  inkDensity: 1,
+  inkEdgeRows: 0.8,
+  inkEdgeDensity: 1,
+  inkEdgeDepth: 1,
+  inkGrass: 1,
+  inkWash: 0.55,
+  inkWashColor: "#5f7a45",
+  inkCharcoal: 0.6,
+  inkInterruptions: 0.35,
+  inkLineFront: DEFAULT_FOREST_INK_PENS.front,
+  inkLineSecond: DEFAULT_FOREST_INK_PENS.second,
+  inkLineBack: DEFAULT_FOREST_INK_PENS.back,
+  inkLineNearEdge: DEFAULT_FOREST_INK_PENS.nearEdge,
+  inkLineFill: DEFAULT_FOREST_INK_PENS.fill,
+  inkLineLone: DEFAULT_FOREST_INK_PENS.lone,
+  inkLineGrass: DEFAULT_FOREST_INK_PENS.grass,
   treeSize: 13,
   shrubScale: SHRUB_STAND_PROFILE.size,
   forestCover: 0.5,
@@ -205,6 +264,14 @@ function buildFields(settings: ForestLabSettings): Fields {
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const i = y * width + x;
+      if (settings.forestShape === "blobs") {
+        // Broad rounded patches, wider than tall, with the odd clearing.
+        const u = x / width;
+        const v = y / width;
+        const blob = fbm(patchNoise, u * 2.6 + 31, v * 4.2, 3) + fbm(patchNoise, u * 7 + 5, v * 9, 2) * 0.12;
+        rawForest[i] = smoothStep(0.2 - settings.forestCover * 0.3, 0.24 - settings.forestCover * 0.3, blob);
+        continue;
+      }
       const ragged = raggedNoise.noise2D(x / 7, y / 7) * 0.05 + raggedNoise.noise2D(x / 2.5, y / 2.5) * 0.025;
       rawForest[i] = smoothStep(threshold - 0.02, threshold + 0.02, suitability[i] + ragged);
     }
@@ -473,6 +540,8 @@ interface LabCache {
   fields?: Fields;
   standsKey?: string;
   stands?: ForestStandGeometry;
+  inkKey?: string;
+  ink?: ForestInkGeometry;
   mappedKey?: string;
   mapped?: ForestStandGeometry;
   groundKey?: string;
@@ -495,7 +564,7 @@ export function renderForestLab(canvas: HTMLCanvasElement, settings: ForestLabSe
     cache = {};
     labCaches.set(canvas, cache);
   }
-  const fieldsKey = JSON.stringify([settings.seed, settings.treeline, settings.gullyAffinity, settings.forestCover]);
+  const fieldsKey = JSON.stringify([settings.seed, settings.treeline, settings.gullyAffinity, settings.forestCover, settings.forestShape]);
   if (!cache.fields || cache.fieldsKey !== fieldsKey) {
     cache.fields = buildFields(settings);
     cache.fieldsKey = fieldsKey;
@@ -506,9 +575,18 @@ export function renderForestLab(canvas: HTMLCanvasElement, settings: ForestLabSe
   const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
-  const groundKey = JSON.stringify([fieldsKey, scale, settings.meadowColor, settings.rockColor,
+  const groundKey = JSON.stringify([fieldsKey, scale, settings.ground, settings.meadowColor, settings.rockColor,
     settings.groundShade, settings.formLineDensity, settings.inkColor, settings.inkWeight]);
-  if (!cache.ground || cache.groundKey !== groundKey) {
+  if (settings.ground === "paper") {
+    if (!cache.ground || cache.groundKey !== groundKey) {
+      const ground = new OffscreenCanvas(canvas.width, canvas.height);
+      const groundCtx = ground.getContext("2d")!;
+      groundCtx.fillStyle = "#fbfbf3";
+      groundCtx.fillRect(0, 0, ground.width, ground.height);
+      cache.ground = ground;
+      cache.groundKey = groundKey;
+    }
+  } else if (!cache.ground || cache.groundKey !== groundKey) {
     const ground = new OffscreenCanvas(canvas.width, canvas.height);
     const groundCtx = ground.getContext("2d")!;
     const rng = mulberry(settings.seed);
@@ -521,7 +599,58 @@ export function renderForestLab(canvas: HTMLCanvasElement, settings: ForestLabSe
     cache.ground = ground;
     cache.groundKey = groundKey;
   }
-  ctx.drawImage(cache.ground, 0, 0);
+  ctx.drawImage(cache.ground!, 0, 0);
+  if (settings.standStyle === "ink") {
+    const inkKey = JSON.stringify([fieldsKey, settings.inkForestType, settings.inkMarkSize, settings.inkDensity, settings.inkEdgeRows, settings.inkEdgeDensity, settings.inkEdgeDepth,
+      settings.inkGrass, settings.fringeDensity, settings.treeLight]);
+    if (!cache.ink || cache.inkKey !== inkKey) {
+      cache.ink = buildForestInkGeometry({
+        width: fields.width,
+        height: fields.height,
+        forest: fields.forest,
+        seed: settings.seed,
+        settings: {
+          type: settings.inkForestType,
+          markSize: settings.inkMarkSize,
+          density: settings.inkDensity,
+          edgeRows: settings.inkEdgeRows,
+          edgeDensity: settings.inkEdgeDensity,
+          edgeDepth: settings.inkEdgeDepth,
+          meadowTrees: settings.fringeDensity,
+          grass: settings.inkGrass,
+        },
+        light: fields.shade,
+        lightStrength: settings.treeLight,
+        slope: fields.slope,
+        suitability: fields.suitability,
+      });
+      cache.inkKey = inkKey;
+    }
+    const inkView = mapForestInkGeometry(cache.ink, scale, scale, 0, 0, canvas.width, canvas.height);
+    const inkLayer = renderForestInkCanvas(canvas.width, canvas.height, inkView, {
+      inkColor: settings.inkColor,
+      inkWeight: settings.inkWeight,
+      washColor: settings.inkWashColor,
+      washAlpha: settings.inkWash,
+      washVariation: settings.washVariation,
+      washSoftness: settings.washSoftness,
+      lightStrength: settings.treeLight,
+      charcoal: settings.inkCharcoal,
+      interruptions: settings.inkInterruptions,
+      thickness: {
+        front: settings.inkLineFront,
+        second: settings.inkLineSecond,
+        back: settings.inkLineBack,
+        nearEdge: settings.inkLineNearEdge,
+        fill: settings.inkLineFill,
+        lone: settings.inkLineLone,
+        grass: settings.inkLineGrass,
+      },
+    });
+    if (inkLayer) ctx.drawImage(inkLayer, 0, 0);
+    finishLab(ctx, canvas, cache, settings);
+    return;
+  }
   const shrubs = settings.standKind === "shrubs";
   const standsKey = JSON.stringify([fieldsKey, settings.standKind, shrubs ? settings.shrubScale : 1, settings.treeSize, settings.standSpacing,
     settings.edgeMarks, settings.interiorMarks, settings.fringeDensity, settings.accentTrees]);
@@ -568,6 +697,10 @@ export function renderForestLab(canvas: HTMLCanvasElement, settings: ForestLabSe
     },
   );
   if (forestLayer) ctx.drawImage(forestLayer, 0, 0);
+  finishLab(ctx, canvas, cache, settings);
+}
+
+function finishLab(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement, cache: LabCache, settings: ForestLabSettings): void {
   const grainKey = JSON.stringify([settings.seed, canvas.width, canvas.height]);
   if (!cache.grain || cache.grainKey !== grainKey) {
     cache.grain = buildPaperGrain(canvas.width, canvas.height, settings.seed);

@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { mountainCameraIllustrationTexture, mountainHatchCoreAlpha, paintMountainCameraSegment } from '../src/rendering/mountainCameraLinework';
+import {
+  mountainCameraIllustrationInkAlpha,
+  mountainCameraIllustrationTexture,
+  mountainHatchCoreAlpha,
+  mountainIllustrationInkAlpha,
+  paintMountainCameraSegment,
+} from '../src/rendering/mountainCameraLinework';
 import { getMountainPatternOptions, type MountainRenderOptions } from '../src/rendering/mountainDetailRenderer';
 import type { MountainIllustration } from '../src/rendering/mountainIllustrationRenderer';
 import {
@@ -156,6 +162,27 @@ describe('study linework in the production camera', () => {
     expect(Array.from(horizontalOnly.slice(4, 7))).toEqual([220, 220, 220]);
     expect(Array.from(verticalOnly.slice(0, 3))).toEqual([220, 220, 220]);
     expect(Array.from(verticalOnly.slice(4, 7))).not.toEqual([220, 220, 220]);
+  });
+
+  it('reports the ink coverage the texture painted, for the compositor', () => {
+    const illustration = {
+      materialRgba: new Uint8ClampedArray(4 * 4).fill(220),
+      silhouetteAlpha: new Uint8Array([0, 0, 0, 255]),
+      charcoalAlpha: new Uint8Array([128, 255, 0, 0]),
+      faceStrokeAlpha: new Uint8Array([0, 255, 0, 0]),
+      horizontalHatchAlpha: new Uint8Array([128, 0, 0, 0]),
+      verticalHatchAlpha: new Uint8Array([0, 255, 0, 0]),
+      horizontalHatchOpacity: 1,
+      verticalHatchOpacity: 1,
+      interiorRidgeAlpha: new Uint8Array([0, 0, 0, 0]),
+    } as MountainIllustration;
+    // Halving the contour family halves its reported ink; the baked crest
+    // pixel is left to the mesh pass, so the texture reports no ink there.
+    expect(Array.from(mountainCameraIllustrationInkAlpha(illustration, {
+      horizontalHatchOpacity: 0.5,
+      verticalHatchOpacity: 1,
+    }))).toEqual([64, 255, 0, 0]);
+    expect(Array.from(mountainIllustrationInkAlpha(illustration))).toEqual([128, 255, 0, 255]);
   });
 
   it('keeps low-opacity rendered hatch coverage visible in the camera texture', () => {

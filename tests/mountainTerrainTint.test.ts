@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { tintMountainLand } from "../src/rendering/mountainTerrainTint";
+import { mountainGrassAmount, tintMountainLand } from "../src/rendering/mountainTerrainTint";
 
 describe("tintMountainLand", () => {
   const tundra: [number, number, number] = [147, 131, 98];
@@ -16,5 +16,16 @@ describe("tintMountainLand", () => {
     const summit = tintMountainLand(tundra, { ...terrain, normElev: 0.95, slopeDeg: 4 }, green);
     const lowland = tintMountainLand(tundra, { ...terrain, slopeDeg: 4 }, green);
     expect(summit[1] - summit[0]).toBeLessThan(lowland[1] - lowland[0]);
+  });
+});
+
+describe("mountainGrassAmount", () => {
+  it("is grass on the flat low ground the tint paints green and nowhere else", () => {
+    expect(mountainGrassAmount(3, 0.4, 0)).toBe(1);
+    expect(mountainGrassAmount(30, 0.4, 0)).toBe(0);
+    expect(mountainGrassAmount(3, 0.95, 0)).toBe(0);
+    // Half grass at the meadow biome's limits.
+    expect(mountainGrassAmount(11, 0.4, 0)).toBeCloseTo(0.5, 1);
+    expect(mountainGrassAmount(3, 0.7, 0)).toBeCloseTo(0.5, 1);
   });
 });

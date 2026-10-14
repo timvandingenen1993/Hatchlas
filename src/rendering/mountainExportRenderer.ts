@@ -45,7 +45,12 @@ import {
   mountainProjectionSupportPixels,
   normalizeMountainSnowfallSettings,
 } from "./mountainProjection";
-import { mountainCameraIllustrationTexture } from './mountainCameraLinework';
+import {
+  mountainCameraIllustrationInkAlpha,
+  mountainCameraIllustrationTexture,
+  mountainIllustrationInkAlpha,
+  type MountainCameraIllustrationStyle,
+} from './mountainCameraLinework';
 import {
   createMountainPathSpatialIndex,
   queryMountainPathSpatialIndex,
@@ -746,8 +751,9 @@ function cropWaterOverlay(
 
 /** Copy the illustration into the detail frame; pixels it doesn't cover stay
  * transparent (they lie in the halo, which is cropped after compositing). */
-function placeMountainIllustrationRGBA(
-  rgba: Uint8ClampedArray,
+function placeMountainIllustrationPixels<T extends Uint8Array | Uint8ClampedArray>(
+  pixels: T,
+  channels: number,
   sourceX: number,
   sourceY: number,
   sourceWidth: number,
@@ -756,16 +762,18 @@ function placeMountainIllustrationRGBA(
   targetY: number,
   targetWidth: number,
   targetHeight: number,
-): Uint8ClampedArray {
-  const result = new Uint8ClampedArray(targetWidth * targetHeight * 4);
+): T {
+  const result = new (pixels.constructor as new (length: number) => T)(
+    targetWidth * targetHeight * channels,
+  );
   const x0 = Math.max(sourceX, targetX);
   const x1 = Math.min(sourceX + sourceWidth, targetX + targetWidth);
   if (x1 <= x0) return result;
   for (let y = Math.max(sourceY, targetY); y < Math.min(sourceY + sourceHeight, targetY + targetHeight); y++) {
-    const sourceOffset = ((y - sourceY) * sourceWidth + (x0 - sourceX)) * 4;
+    const sourceOffset = ((y - sourceY) * sourceWidth + (x0 - sourceX)) * channels;
     result.set(
-      rgba.subarray(sourceOffset, sourceOffset + (x1 - x0) * 4),
-      ((y - targetY) * targetWidth + (x0 - targetX)) * 4,
+      pixels.subarray(sourceOffset, sourceOffset + (x1 - x0) * channels),
+      ((y - targetY) * targetWidth + (x0 - targetX)) * channels,
     );
   }
   return result;
@@ -1488,30 +1496,37 @@ export function renderPreparedMountainExportTile(
       mountainStage: MountainIllustration | MountainCameraIllustrationLayers | undefined,
     ): ImageData => {
     hooks.onTileStage?.(cameraTile ? "Composing camera illustration texture" : "Preparing mountain illustration texture");
+    const cameraStyle: MountainCameraIllustrationStyle = {
+      hatchColor: expandedRenderOptions.mountainHatchColor ?? expandedRenderOptions.vegetation?.inkColor,
+      hatchOpacity:
+        expandedRenderOptions.mountainHatchOpacity ??
+        expandedRenderOptions.mountainLineworkOpacity ??
+        expandedRenderOptions.vegetation?.strokeOpacity ??
+        expandedRenderOptions.waterOutlineOpacity ??
+        0.8,
+      horizontalHatchOpacity:
+        expandedRenderOptions.mountainHatchHorizontalOpacity ??
+        expandedRenderOptions.mountainHatchOpacity ??
+        expandedRenderOptions.mountainLineworkOpacity ??
+        expandedRenderOptions.vegetation?.strokeOpacity ??
+        expandedRenderOptions.waterOutlineOpacity ??
+        0.8,
+      verticalHatchOpacity:
+        expandedRenderOptions.mountainHatchVerticalOpacity ??
+        expandedRenderOptions.mountainHatchOpacity ??
+        expandedRenderOptions.mountainLineworkOpacity ??
+        expandedRenderOptions.vegetation?.strokeOpacity ??
+        expandedRenderOptions.waterOutlineOpacity ??
+        0.8,
+    };
     const cameraTexture = mountainStage && cameraTile
-      ? mountainCameraIllustrationTexture(mountainStage as MountainCameraIllustrationLayers, {
-                hatchColor: expandedRenderOptions.mountainHatchColor ?? expandedRenderOptions.vegetation?.inkColor,
-                hatchOpacity:
-                  expandedRenderOptions.mountainHatchOpacity ??
-                  expandedRenderOptions.mountainLineworkOpacity ??
-                  expandedRenderOptions.vegetation?.strokeOpacity ??
-                  expandedRenderOptions.waterOutlineOpacity ??
-                  0.8,
-                horizontalHatchOpacity:
-                  expandedRenderOptions.mountainHatchHorizontalOpacity ??
-                  expandedRenderOptions.mountainHatchOpacity ??
-                  expandedRenderOptions.mountainLineworkOpacity ??
-                  expandedRenderOptions.vegetation?.strokeOpacity ??
-                  expandedRenderOptions.waterOutlineOpacity ??
-                  0.8,
-                verticalHatchOpacity:
-                  expandedRenderOptions.mountainHatchVerticalOpacity ??
-                  expandedRenderOptions.mountainHatchOpacity ??
-                  expandedRenderOptions.mountainLineworkOpacity ??
-                  expandedRenderOptions.vegetation?.strokeOpacity ??
-                  expandedRenderOptions.waterOutlineOpacity ??
-                  0.8,
-              })
+      ? mountainCameraIllustrationTexture(mountainStage as MountainCameraIllustrationLayers, cameraStyle)
+      : undefined;
+    // Ink coverage of the same texture keeps the compositor's washes off it.
+    const mountainInkAlpha = mountainStage
+      ? cameraTile
+        ? mountainCameraIllustrationInkAlpha(mountainStage as MountainCameraIllustrationLayers, cameraStyle)
+        : mountainIllustrationInkAlpha(mountainStage as MountainIllustration)
       : undefined;
     // `waterOnly` frames feed just the ocean-wave water overlay, so they skip
     // the illustration and vegetation inputs that the compositor frame needs.
@@ -1534,10 +1549,19 @@ export function renderPreparedMountainExportTile(
       detailHeight,
     );
     const mountainIllustrationRGBA = mountainStage && !waterOnly
-      ? placeMountainIllustrationRGBA(
+      ? placeMountainIllustrationPixels(
           cameraTile
             ? cameraTexture!
             : (mountainStage as MountainIllustration).rgba,
+          4,
+          mountainX, mountainY, mountainWidth, mountainHeight,
+          detailTileX, detailTileY, detailWidth, detailHeight,
+        )
+      : undefined;
+    const mountainIllustrationInkAlpha = mountainInkAlpha && !waterOnly
+      ? placeMountainIllustrationPixels(
+          mountainInkAlpha,
+          1,
           mountainX, mountainY, mountainWidth, mountainHeight,
           detailTileX, detailTileY, detailWidth, detailHeight,
         )
@@ -1611,6 +1635,7 @@ export function renderPreparedMountainExportTile(
       heightmapLowerLimitMOverride: heightmapLowerLimitM,
       maxErosionDepthMOverride: maxErosionDepthM,
       mountainIllustrationRGBA,
+      mountainIllustrationInkAlpha,
     };
     return { frame, dem: detailDem, options: detailOptions };
     };

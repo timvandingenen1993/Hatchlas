@@ -64,26 +64,45 @@ export interface ForestRenderSettings {
   centerSegmentRemoval: number;
   showCenterDebug: boolean;
   showFootprints: boolean;
+  /**
+   * Stand debug view: the map's stands in black and white, showing the
+   * placed plants (stand or lone), the stand area they form and the area
+   * left after rounding, with one summary line per stand.
+   */
+  showStandDebug: boolean;
   overlapLowerInterruptionMultiplier: number;
   charcoalInterruptionLength: number;
-  /**
-   * Alpine forest stands (forestStandGeometry): placement controls rebuild
-   * the vegetation geometry; the wash and ink controls only repaint.
-   * Stand trees use `alpineCanopyColor` for their body (the wash is that
-   * colour darkened) and `outlineColor` for ink.
-   */
-  standMarkSpacing: number;
-  standEdgeTrees: number;
-  standInteriorTrees: number;
-  standMeadowTrees: number;
-  /** Share of shrub-stand plants drawn as wetland trees. */
+  /** Share of shrub-stand plants drawn as trees. */
   standAccentTrees: number;
-  standInkWeight: number;
-  standWashStrength: number;
-  standWashVariation: number;
-  standWashSoftness: number;
-  /** How strongly terrain light colours stand trees and wash. */
-  standLightStrength: number;
+  /** Largest gap, in stand trees, between plants that still join into one stand. */
+  standJoin: number;
+  /**
+   * Width, in stand trees, of the band where neighbouring biomes' trees and
+   * shrubs reach into each other and their stand colours blend (0 = hard border).
+   */
+  biomeBlend: number;
+  /**
+   * Pen-and-ink forest stands (forestInkStands, as tuned in /forest-lab).
+   * The placement controls (size to light) rebuild the vegetation geometry;
+   * ink weight, tint, charcoal, interruptions and line weights only repaint.
+   * The tint is the biome's tree (or shrub) colour; the ink is `outlineColor`.
+   */
+  inkFillDensity: number;
+  inkEdgeDensity: number;
+  inkEdgeRows: number;
+  inkEdgeDepth: number;
+  inkMeadowTrees: number;
+  inkGrass: number;
+  /** How strongly terrain light shades the wash and thins and weights the fill. */
+  inkLight: number;
+  /** Line thickness: one multiplier for every stand line (kinds of tree keep their relative weights). */
+  inkWeight: number;
+  /** Watercolour wash under the stands (strength, splotch variation, edge softness). */
+  inkTint: number;
+  inkWashVariation: number;
+  inkWashSoftness: number;
+  inkCharcoal: number;
+  inkInterruptions: number;
 }
 
 /**
@@ -129,18 +148,26 @@ export const DEFAULT_FOREST_RENDER_SETTINGS: ForestRenderSettings = {
   centerSegmentRemoval: 0.7,
   showCenterDebug: false,
   showFootprints: false,
+  showStandDebug: false,
   overlapLowerInterruptionMultiplier: 3,
   charcoalInterruptionLength: 2.5,
-  standMarkSpacing: 0.5,
-  standEdgeTrees: 0.9,
-  standInteriorTrees: 0.08,
-  standMeadowTrees: 0.5,
   standAccentTrees: 0.18,
-  standInkWeight: 0.9,
-  standWashStrength: 0.85,
-  standWashVariation: 1,
-  standWashSoftness: 0.25,
-  standLightStrength: 0.7,
+  standJoin: 2.5,
+  biomeBlend: 0,
+  // Ink stands as tuned in /forest-lab.
+  inkFillDensity: 0.75,
+  inkEdgeDensity: 0.7,
+  inkEdgeRows: 0.5,
+  inkEdgeDepth: 1.95,
+  inkMeadowTrees: 0.2,
+  inkGrass: 0.4,
+  inkLight: 0.2,
+  inkWeight: 0.55,
+  inkTint: 0.5,
+  inkWashVariation: 0.5,
+  inkWashSoftness: 0.35,
+  inkCharcoal: 0.7,
+  inkInterruptions: 0.55,
 };
 
 export function forestRenderSettingsSignature(
@@ -165,9 +192,10 @@ export const FOREST_SETTING_LIMITS: Partial<Record<keyof ForestRenderSettings, r
   overlapLowerInterruptionMultiplier: [1, Infinity], charcoalInterruptionLength: [P, Infinity],
   propCharcoalAlpha: [0, 1], hueVariance: [0, 360], saturationVariance: [0, 1],
   valueVariance: [0, 1], terrainShadeStrength: [0, 1],
-  standMarkSpacing: [0.05, Infinity], standEdgeTrees: [0, Infinity], standInteriorTrees: [0, Infinity],
-  standMeadowTrees: [0, Infinity], standAccentTrees: [0, Infinity], standInkWeight: [0, Infinity], standWashStrength: [0, 1],
-  standWashVariation: [0, Infinity], standWashSoftness: [0, 1], standLightStrength: [0, Infinity],
+  standAccentTrees: [0, 1], standJoin: [0.5, Infinity], biomeBlend: [0, Infinity],
+  inkFillDensity: [0.2, Infinity], inkEdgeDensity: [0.2, Infinity], inkEdgeRows: [0, 1],
+  inkEdgeDepth: [0, Infinity], inkMeadowTrees: [0, Infinity], inkGrass: [0, Infinity], inkLight: [0, Infinity],
+  inkWeight: [0, Infinity], inkTint: [0, 1], inkWashVariation: [0, Infinity], inkWashSoftness: [0, 1], inkCharcoal: [0, 1], inkInterruptions: [0, 1],
 };
 
 export function normalizeForestRenderSettings(
@@ -182,7 +210,7 @@ export function normalizeForestRenderSettings(
     if (typeof candidate !== "number" || !Number.isFinite(candidate)) continue;
     (normalized as unknown as Record<string, unknown>)[key] = Math.max(range[0], Math.min(range[1], candidate));
   }
-  for (const key of ["showCenterDebug", "showFootprints"] as const) {
+  for (const key of ["showCenterDebug", "showFootprints", "showStandDebug"] as const) {
     if (typeof saved[key] === "boolean") normalized[key] = saved[key] as never;
   }
   if (typeof saved.lightColor === "string" && /^#[0-9a-f]{6}$/i.test(saved.lightColor))

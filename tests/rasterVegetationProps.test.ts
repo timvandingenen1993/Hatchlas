@@ -1,6 +1,6 @@
 import { createMountainRenderStageCache, renderMountainDetailDEMWithCache } from "../src/rendering/mountainDetailRenderer";
 import { describe, expect, it } from "vitest";
-import { buildForestStandGeometry, SHRUB_STAND_PROFILE } from "../src/rendering/forestStandGeometry";
+import { buildForestStandGeometry } from "../src/rendering/forestStandGeometry";
 import type { MountainDEMData } from "../src/terrain/mountainBaseDEM";
 import { makeMountainFoothillReviewAssets } from "./mountainFoothillReviewAssets";
 import {
@@ -425,6 +425,21 @@ describe("grid-authored raster vegetation props", () => {
     expect(buildVegetationRasterPropPlacements(dem, { ...options, rasterPropDensity: 0 })).toEqual([]);
   });
 
+  it("thins trees on river silt without clearing it", () => {
+    const dem = makeDem(640, 480, 3);
+    // Deep silt over the right half.
+    dem.siltDepth = new Float32Array(640 * 480);
+    for (let y = 0; y < 480; y++) for (let x = 320; x < 640; x++) dem.siltDepth[y * 640 + x] = 1;
+    const options = { density: 0, motifDensity: 0, rasterPropCellSize: 4,
+      rasterPropDensity: 0.8, rasterPropClustering: 0.72, rasterPropAssets: [makeTreeAsset("fir")] };
+    const props = buildVegetationRasterPropPlacements(dem, options);
+    const dry = props.filter((prop) => prop.x < 300).length;
+    const silt = props.filter((prop) => prop.x > 340).length;
+    expect(dry).toBeGreaterThan(200);
+    expect(silt).toBeGreaterThan(0);
+    expect(silt).toBeLessThan(dry * 0.45);
+  });
+
   it("increases forest population above the old density saturation point", () => {
     const dem = makeDem(640, 480, 3);
     const options = { density: 0, motifDensity: 0, rasterPropCellSize: 4,
@@ -532,8 +547,160 @@ describe("grid-authored raster vegetation props", () => {
     expect(new Set(placements.map((prop) => prop.rotation))).toEqual(new Set([0]));
     // The vegetation geometry draws alpine forest as stands, not per-tree props.
     const geometry = buildVegetationGeometry(dem, options);
-    expect(geometry.stands?.find((stand) => stand.group === "alpine-forest")?.geometry.items.length).toBeGreaterThan(0);
+    expect(geometry.stands?.find((stand) => stand.group === "alpine-forest")?.geometry.marks.length).toBeGreaterThan(0);
     expect(geometry.rasterProps?.some((prop) => prop.assetKey === asset.key)).toBe(false);
+  });
+
+  /** Alpine forest stands on a flat 480 × 360 map, without the ink's own meadow trees. */
+  function alpineStand(clustering: number, standSize: number) {
+    const geometry = buildVegetationGeometry(makeDem(480, 360, 4), {
+      density: 0,
+      motifDensity: 0,
+      rasterPropDensity: 1.5,
+      rasterPropCellSize: 8,
+      rasterPropAssets: [standAsset("alpine-tree", "alpine-forest", [4])],
+      rasterPropClustering: clustering,
+      rasterPropStandSize: standSize,
+      rasterPropPlacementNoiseScale: 0.45,
+      forestSettings: { inkMeadowTrees: 0 },
+    });
+    return geometry.stands!.find((stand) => stand.group === "alpine-forest")!.geometry;
+  }
+
+  it("splits stands along river silt, leaving a few lone trees out on it", () => {
+    const dem = makeDem(480, 360, 4);
+    // A silted channel down the middle of the woodland.
+    dem.siltDepth = new Float32Array(480 * 360);
+    for (let y = 0; y < 360; y++) for (let x = 200; x < 280; x++) dem.siltDepth[y * 480 + x] = 1;
+    const geometry = buildVegetationGeometry(dem, {
+      density: 0,
+      motifDensity: 0,
+      rasterPropDensity: 1.5,
+      rasterPropCellSize: 8,
+      rasterPropAssets: [standAsset("alpine-tree", "alpine-forest", [4])],
+      rasterPropClustering: 1,
+      rasterPropStandSize: 1,
+      forestSettings: { inkMeadowTrees: 0 },
+    });
+    const { mask, marks } = geometry.stands!.find((stand) => stand.group === "alpine-forest")!.geometry;
+    // The stand reaches at most a tree or so into the silt; past that, open land.
+    for (let y = 20; y < 340; y++) for (let x = 225; x < 255; x++) expect(mask[y * 480 + x]).toBeLessThan(0.5);
+    const inCore = (mark: { x: number }) => mark.x >= 225 && mark.x < 255;
+    expect(marks.filter((mark) => inCore(mark) && mark.role !== "lone" && mark.role !== "grass")).toEqual([]);
+    expect(marks.some((mark) => inCore(mark) && mark.role === "lone")).toBe(true);
+    // Woodland on both banks.
+    const covered = (x0: number, x1: number) => {
+      let count = 0;
+      for (let y = 20; y < 340; y++) for (let x = x0; x < x1; x++) if (mask[y * 480 + x] >= 0.5) count++;
+      return count / ((x1 - x0) * 320);
+    };
+    expect(covered(40, 180)).toBeGreaterThan(0.3);
+    expect(covered(300, 440)).toBeGreaterThan(0.3);
+  });
+
+  it("grows lone trees on open ground as clustering drops", () => {
+    // Before, every plant grew inside the woodland, so any plant had company
+    // and almost none stayed lone, whatever the clustering.
+    const loneMarks = (clustering: number) =>
+      alpineStand(clustering, 0.5).marks.filter((mark) => mark.role === "lone").length;
+    const tight = loneMarks(1);
+    const half = loneMarks(0.5);
+    const loose = loneMarks(0);
+    expect(half).toBeGreaterThan(tight * 2);
+    expect(loose).toBeGreaterThan(Math.max(20, half * 1.4));
+  });
+
+  it("breaks the woodland into smaller stands at a lower stand size", () => {
+    // Before, a low stand size only shrank the clearings below the joining
+    // distance, so the stands merged into one wood covering more ground.
+    const stands = (standSize: number) => {
+      const { mask, maskWidth: width, maskHeight: height } = alpineStand(1, standSize);
+      const seen = new Uint8Array(mask.length);
+      let area = 0;
+      let count = 0;
+      for (let start = 0; start < mask.length; start++) {
+        if (seen[start] || mask[start] < 0.5) continue;
+        count++;
+        const stack = [start];
+        seen[start] = 1;
+        while (stack.length > 0) {
+          const index = stack.pop()!;
+          area++;
+          const x = index % width;
+          for (const next of [x > 0 ? index - 1 : -1, x < width - 1 ? index + 1 : -1, index - width, index + width]) {
+            if (next < 0 || next >= mask.length || seen[next] || mask[next] < 0.5) continue;
+            seen[next] = 1;
+            stack.push(next);
+          }
+        }
+      }
+      return { share: area / (width * height), meanArea: area / Math.max(1, count) };
+    };
+    const small = stands(0);
+    const large = stands(1);
+    expect(small.share).toBeLessThan(large.share * 0.8);
+    expect(small.meanArea).toBeLessThan(large.meanArea * 0.5);
+  });
+
+  /** Two forest biomes meeting on a vertical border at x = 240. */
+  function splitForestDem() {
+    const dem = makeDem(480, 360, 3);
+    for (let y = 0; y < dem.height; y++) for (let x = 240; x < dem.width; x++) dem.biomeType[y * dem.width + x] = 4;
+    return dem;
+  }
+  const splitOptions = (biomeBlend: number) => ({
+    density: 0,
+    motifDensity: 0,
+    rasterPropDensity: 1.5,
+    rasterPropCellSize: 8,
+    rasterPropAssets: [standAsset("alpine-tree", "alpine-forest", [3, 4])],
+    // Different tree colours keep the two biomes in separate stands.
+    rasterPropBiomeSettings: { 3: { treeColor: "#2f6a3a" }, 4: { treeColor: "#8a9a3c" } },
+    forestSettings: { biomeBlend },
+  });
+
+  it("lets neighbouring biomes' trees reach into each other across the biome blend band", () => {
+    // Before, every plant took the biome map's biome at its spot, so the two
+    // biomes met on a straight line.
+    const intrusion = (biomeBlend: number) => {
+      let left = 0;
+      let right = 0;
+      let deepest = 0;
+      for (const plant of buildVegetationRasterPropPlacements(splitForestDem(), splitOptions(biomeBlend))) {
+        const depth = plant.biomeId === 3 ? plant.x - 240 : 240 - plant.x;
+        if (depth > 8) {
+          if (plant.biomeId === 3) right++;
+          else left++;
+        }
+        deepest = Math.max(deepest, depth);
+      }
+      return { left, right, deepest };
+    };
+    const hard = intrusion(0);
+    expect(hard.left + hard.right).toBe(0);
+    const blended = intrusion(6);
+    // Both biomes reach across, but only within the band (6 trees of 10.6 px).
+    expect(blended.left).toBeGreaterThan(10);
+    expect(blended.right).toBeGreaterThan(10);
+    expect(blended.deepest).toBeLessThan(6 * 10.6 * 1.1);
+  });
+
+  it("grades stand colours across a biome border by where each biome's plants grew", () => {
+    const blended = buildVegetationGeometry(splitForestDem(), splitOptions(6));
+    expect(blended.stands?.length).toBe(2);
+    const shares = blended.stands![0].biomeShares!;
+    expect(blended.stands![1].biomeShares).toBe(shares);
+    expect(shares.biomeIds).toEqual([3, 4]);
+    const shareOf3 = (x: number) => {
+      const row = Math.floor(180 / shares.step);
+      return shares.shares[(row * shares.columns + Math.floor(x / shares.step)) * 2];
+    };
+    expect(shareOf3(60)).toBeGreaterThan(0.95);
+    expect(shareOf3(420)).toBeLessThan(0.05);
+    expect(shareOf3(240)).toBeGreaterThan(0.2);
+    expect(shareOf3(240)).toBeLessThan(0.8);
+    // No blend, no grading: each stand keeps its own flat colour.
+    expect(buildVegetationGeometry(splitForestDem(), splitOptions(0)).stands?.every((stand) => !stand.biomeShares)).toBe(true);
   });
 
   it("draws wetland shrubs as shrub stands through the same stand workflow", () => {
@@ -555,7 +722,8 @@ describe("grid-authored raster vegetation props", () => {
     };
     const geometry = buildVegetationGeometry(dem, options);
     expect(geometry.stands?.map((stand) => stand.group)).toEqual(["wetland-shrubs"]);
-    expect(geometry.stands?.[0].geometry.items.length).toBeGreaterThan(0);
+    expect(geometry.stands?.[0].forest).toBe("shrub");
+    expect(geometry.stands?.[0].geometry.marks.length).toBeGreaterThan(0);
     // Neighbouring shrubs must form washed patches, not only lone L1s. With
     // the mask sized from the small shrub plant, only ~16% was washed here.
     const mask = geometry.stands![0].geometry.mask;
@@ -586,7 +754,7 @@ describe("grid-authored raster vegetation props", () => {
 
     const geometry = buildVegetationGeometry(makeDem(320, 240, 17), options);
     expect(geometry.stands?.map((stand) => [stand.group, stand.biomeIds])).toEqual([["wetland-shrubs", [17]]]);
-    expect(geometry.stands?.[0].geometry.items.length).toBeGreaterThan(0);
+    expect(geometry.stands?.[0].geometry.marks.length).toBeGreaterThan(0);
     expect(geometry.rasterProps?.some((prop) => prop.assetKey === asset.key)).toBe(false);
   });
 
@@ -647,8 +815,9 @@ describe("grid-authored raster vegetation props", () => {
     };
     const accentTrees = (biome: number, settings: typeof options) =>
       buildVegetationGeometry(makeDem(320, 240, biome), settings).stands!
-        .flatMap((stand) => stand.geometry.items)
-        .filter((item) => item.fills.some((fill) => fill.style === "accent")).length;
+        .flatMap((stand) => stand.geometry.marks)
+        // Trees among the shrubs are drawn as deciduous trees.
+        .filter((mark) => mark.kind === "oval" && mark.forest === "deciduous").length;
     // The wetland keeps the stand setting; other biomes have none until set.
     expect(accentTrees(7, options)).toBeGreaterThan(0);
     expect(accentTrees(17, options)).toBe(0);
@@ -730,8 +899,26 @@ describe("grid-authored raster vegetation props", () => {
       rasterPropAssets: [alpine, shrub],
       wetlandImagePropDrynessBias: 1,
     });
-    const size = (group: string) => geometry.stands?.find((stand) => stand.group === group)?.geometry.treeSize ?? NaN;
-    expect(size("wetland-shrubs") / size("alpine-forest")).toBeCloseTo(SHRUB_STAND_PROFILE.size, 5);
+    const size = (group: string) => geometry.stands?.find((stand) => stand.group === group)?.geometry.markSize ?? NaN;
+    // Shrub marks are three quarters of a stand tree's, at any prop scale.
+    expect(size("wetland-shrubs") / size("alpine-forest")).toBeCloseTo(0.75, 5);
+  });
+
+  it("draws each biome's trees in its own shape", () => {
+    const alpine = { ...makeAsset("alpine-tree", [3, 4]), outlineGroup: "alpine-forest" };
+    const options = {
+      density: 0,
+      motifDensity: 0,
+      rasterPropDensity: 1,
+      rasterPropCellSize: 16,
+      rasterPropAssets: [alpine],
+    };
+    const forestOf = (biome: number) => buildVegetationGeometry(makeDem(320, 240, biome), options).stands
+      ?.find((stand) => stand.group === "alpine-forest");
+    // Subalpine conifer forest gets conifers; montane broadleaf woodland, broadleaf trees.
+    expect(forestOf(3)?.forest).toBe("conifer");
+    expect(forestOf(3)?.geometry.marks.filter((mark) => mark.kind !== "dot").every((mark) => mark.forest === "conifer")).toBe(true);
+    expect(forestOf(4)?.forest).toBe("deciduous");
   });
 
   it("rejects alpine trees from cliffs, including the sparse coverage fallback", () => {

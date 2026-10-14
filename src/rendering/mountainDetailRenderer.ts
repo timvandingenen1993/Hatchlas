@@ -33,8 +33,12 @@ import {
   type MountainSnowTransportFields,
   type MountainWindFields,
 } from './mountainIllustrationRenderer';
-import { tintMountainLand } from './mountainTerrainTint';
-import { mountainCameraIllustrationTexture } from './mountainCameraLinework';
+import { isMountainTintBiome, tintMountainLand } from './mountainTerrainTint';
+import {
+  mountainCameraIllustrationInkAlpha,
+  mountainCameraIllustrationTexture,
+  mountainIllustrationInkAlpha,
+} from './mountainCameraLinework';
 import {
   normalizeMountainProjectionSettings,
   normalizeMountainLineworkSettings,
@@ -302,6 +306,8 @@ export interface MountainRenderOptions {
   textureCoordinateDomainHeight?: number;
   /** Precomputed mountain illustration pixels for tiled export compositing. */
   mountainIllustrationRGBA?: Uint8ClampedArray;
+  /** Ink coverage (0..255) of `mountainIllustrationRGBA`; washes stay off it. */
+  mountainIllustrationInkAlpha?: Uint8Array;
   /** Local pixels an export tile keeps; offshore waves paint only near it. */
   waterPaintWindow?: WaterPaintWindow;
   /** Internal export crop: intermediate fields retain halos, final pixels do not. */
@@ -494,6 +500,9 @@ export function vegetationGeometryStageKey(options: MountainRenderOptions): stri
     vegetation?.wetlandImagePropDrynessBias,
     // Dunes replace sand-desert flow lines, so toggling them changes seeding.
     vegetation?.desertDunes,
+    // Silt edges are inked as grass borders.
+    options.siltReachM,
+    options.siltTopRemoved,
     vegetationMotifAssetSignature(vegetation?.motifAssets),
     vegetationRasterPropAssetSignature(vegetation?.rasterPropAssets),
     // Biome colours only repaint, unless they change which biomes share a stand.
@@ -517,11 +526,18 @@ export function vegetationGeometryStageKey(options: MountainRenderOptions): stri
     // Forest stand placement lives in the geometry; its paint settings only
     // affect the overlay stage.
     vegetation?.forestSettings?.seed,
-    vegetation?.forestSettings?.standMarkSpacing,
-    vegetation?.forestSettings?.standEdgeTrees,
-    vegetation?.forestSettings?.standInteriorTrees,
-    vegetation?.forestSettings?.standMeadowTrees,
     vegetation?.forestSettings?.standAccentTrees,
+    vegetation?.forestSettings?.standJoin,
+    vegetation?.forestSettings?.biomeBlend,
+    vegetation?.forestSettings?.inkFillDensity,
+    vegetation?.forestSettings?.inkEdgeDensity,
+    vegetation?.forestSettings?.inkEdgeRows,
+    vegetation?.forestSettings?.inkEdgeDepth,
+    vegetation?.forestSettings?.inkMeadowTrees,
+    vegetation?.forestSettings?.inkGrass,
+    vegetation?.forestSettings?.inkLight,
+    // The debug view keeps each stand's plants and raw area in the geometry.
+    vegetation?.forestSettings?.showStandDebug,
   ]);
 }
 
@@ -2096,18 +2112,32 @@ export function renderMountainDetailDEMWithCache(
         preparedFieldSet,
       )
     : undefined;
+  const mountainCameraStyle = {
+    hatchColor: options.mountainHatchColor ?? options.vegetation?.inkColor,
+    hatchOpacity: mountainHatchOpacity,
+    horizontalHatchOpacity: mountainHatchHorizontalOpacity,
+    verticalHatchOpacity: mountainHatchVerticalOpacity,
+  };
+  const externalMountainIllustration =
+    options.mountainIllustrationRGBA?.length === totalCells * 4;
   const mountainIllustrationRGBA = control?.omitMountainIllustration
     ? undefined
-    : options.mountainIllustrationRGBA?.length === totalCells * 4
+    : externalMountainIllustration
       ? options.mountainIllustrationRGBA
       : mountainIllustration && shouldRenderFullTerrainIllustration
-        ? mountainCameraIllustrationTexture(mountainIllustration, {
-            hatchColor: options.mountainHatchColor ?? options.vegetation?.inkColor,
-            hatchOpacity: mountainHatchOpacity,
-            horizontalHatchOpacity: mountainHatchHorizontalOpacity,
-            verticalHatchOpacity: mountainHatchVerticalOpacity,
-        })
+        ? mountainCameraIllustrationTexture(mountainIllustration, mountainCameraStyle)
         : mountainIllustration?.rgba;
+  // Ink coverage of that texture: the biome transition re-tint below must
+  // not paint over hatches and ridges.
+  const mountainInkAlpha = !mountainIllustrationRGBA
+    ? undefined
+    : externalMountainIllustration
+      ? options.mountainIllustrationInkAlpha?.length === totalCells
+        ? options.mountainIllustrationInkAlpha
+        : undefined
+      : mountainIllustration && shouldRenderFullTerrainIllustration
+        ? mountainCameraIllustrationInkAlpha(mountainIllustration, mountainCameraStyle)
+        : mountainIllustration && mountainIllustrationInkAlpha(mountainIllustration);
   const vegetationTransitionWashRGB =
     layer === 'vegetation_patterns' && mountainIllustrationRGBA
       ? new Uint8ClampedArray(totalCells * 3)
@@ -2418,7 +2448,7 @@ export function renderMountainDetailDEMWithCache(
         // tinting the flow field by a barely perceptible amount.
         const washShade = 0.55 + 0.45 * effectiveShade;
         const biomeId = dem.biomeType[i];
-        const tinted = biomeId >= 1 && biomeId <= 5 || biomeId === 20
+        const tinted = isMountainTintBiome(biomeId)
           ? tintMountainLand(washColor, {
             slopeDeg: dem.slopeDeg[i],
             normElev,
@@ -2928,15 +2958,18 @@ export function renderMountainDetailDEMWithCache(
 
     // Mountain faces sit above the vegetation wash. Reintroduce a restrained
     // portion of the noisy biome transition over those faces so the regional
-    // color boundary remains legible without flattening their relief.
+    // color boundary remains legible without flattening their relief. Only
+    // the material share is re-tinted: mountain ink stays on top of washes.
+    const mountainMaterialAlpha = Math.max(0,
+      mountainIllustrationAlpha - (mountainInkAlpha?.[i] ?? 0) / 255);
     if (
-      mountainIllustrationAlpha > 0 &&
+      mountainMaterialAlpha > 0 &&
       vegetationTransitionWashRGB &&
       vegetationTransitionStrength
     ) {
       const transitionAlpha =
         (vegetationTransitionStrength[i] / 255) *
-        mountainIllustrationAlpha * Math.min(1, 0.72 * vegetationBiomeTransitionStrength);
+        mountainMaterialAlpha * Math.min(1, 0.72 * vegetationBiomeTransitionStrength);
       if (transitionAlpha > 0) {
         const washOffset = i * 3;
         r = blendContourColor(r, vegetationTransitionWashRGB[washOffset], transitionAlpha);

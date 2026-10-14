@@ -212,6 +212,43 @@ it('keeps ridge and hatch ink opaque at a fading mountain edge', () => {
   expect(edgeLinePixels.every(index => result.rgba[index * 4 + 3] === 255)).toBe(true);
 });
 
+it('fades the rock on the grass flats of the land tint but keeps its ink', () => {
+  const dem = flatMountain();
+  // Left half flat low ground (grass), right half a steep face.
+  for (let y = 0; y < dem.height; y++) for (let x = 0; x < dem.width; x++) {
+    const index = y * dem.width + x;
+    dem.slopeDeg[index] = x < 48 ? 3 : 30;
+    dem.normalizedElevation[index] = 0.4;
+    dem.tpi[index] = 0;
+  }
+  const coverage = new Uint8Array(dem.width * dem.height).fill(255);
+  const ridge = Array.from({ length: 60 }, (_, index) => ({ x: 20, y: 18 + index }));
+  const pattern: MountainPatternOverlay = {
+    coverage, snow: new Float32Array(coverage.length), ink: new Uint8Array(coverage.length),
+    wash: new Float32Array(coverage.length),
+    paths: [{ kind: 'ridge', key: 41, width: 1, opacity: 1, primary: true, points: ridge }],
+  };
+  const options = { ...illustrationOptions, snowfallAmount: 0, stride: dem.width };
+  const plain = renderMountainIllustration(dem, pattern, new Float32Array(coverage.length), options);
+  const green = renderMountainIllustration(dem, pattern, new Float32Array(coverage.length),
+    { ...options, landGreenColor: [106, 151, 78] });
+  const alphaAt = (result: typeof plain, x: number, y: number): number => result.rgba[(y * dem.width + x) * 4 + 3];
+  // Rock on the flat is gone, rock on the face is untouched.
+  expect(alphaAt(plain, 36, 48)).toBeGreaterThan(200);
+  expect(alphaAt(green, 36, 48)).toBe(0);
+  expect(alphaAt(green, 72, 48)).toBe(alphaAt(plain, 72, 48));
+  // The crest across the flat keeps its ink at full strength: its opacity is
+  // the crest's own ink coverage, only the rock that filled the rest is gone.
+  let core = 0;
+  let crestInk = 0;
+  for (let y = 30; y < 66; y++) {
+    core = Math.max(core, alphaAt(green, 20, y));
+    crestInk = Math.max(crestInk, green.silhouetteAlpha[y * dem.width + 20]);
+  }
+  expect(crestInk).toBeGreaterThan(150);
+  expect(core).toBe(crestInk);
+});
+
 function flatMountain(width = 96, height = 96): MountainDEMData {
   const dem = processMountainBaseDEM(new Float32Array(width * height).fill(0.5), width, height, {
     domainWidthKm: 3, domainHeightKm: 3, minElevationM: 400, maxElevationM: 3800, riverThresholdKm2: 100,

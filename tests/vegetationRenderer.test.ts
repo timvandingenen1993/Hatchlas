@@ -259,11 +259,12 @@ describe("procedural vegetation flow renderer", () => {
       rasterPropStandSize: 0.7,
       rasterPropClustering: 0.62,
     });
-    const gapScale = Math.min(
+    const gapScale = Math.max(canopySize * 4, Math.min(
       canopySize * (3.5 + options.rasterPropStandSize * 7),
       Math.min(width, height) * (0.2 + options.rasterPropStandSize * 0.24),
-    );
-    const gaps = Array.from({ length: Math.ceil(width * height / (gapScale * gapScale) * 0.7) }, (_, index) => {
+    ));
+    const gapCount = 0.7 + 0.7 * (1 - options.rasterPropStandSize) ** 2;
+    const gaps = Array.from({ length: Math.ceil(width * height / (gapScale * gapScale) * gapCount) }, (_, index) => {
       const key = Math.imul(index + 1, 1597334677) ^ options.seed ^ 0x3c6ef372;
       const angle = hash01(key, 901) * Math.PI * 2;
       return {
@@ -296,12 +297,12 @@ describe("procedural vegetation flow renderer", () => {
         const edge = 1 + 0.18 * Math.sin(angle * 3 + gap.phase) + 0.1 * Math.sin(angle * 5 - gap.phase);
         woodland = Math.min(woodland, smoothStep(0.8, 1.25, Math.hypot(u, v) / edge));
       }
-      const scatteredFraction = (1 - options.rasterPropClustering) ** 3;
-      const presence = scatteredFraction + (1 - scatteredFraction) * woodland;
-      if (hash01(key, 929) < presence) expected.push({ key, x, y });
+      if (hash01(key, 929) < woodland) expected.push({ key, x, y });
     }
 
-    expect(buildForestCandidates({ width, height }, canopySize, options)).toEqual(expected);
+    // Lone trees on open ground come from their own pass.
+    expect(buildForestCandidates({ width, height }, canopySize, options).filter((candidate) => !candidate.lone))
+      .toEqual(expected);
   });
 
   it("uses placement noise scale to change clearing size while staying seeded", () => {
@@ -340,7 +341,8 @@ describe("procedural vegetation flow renderer", () => {
   it("keeps every generated point in eligible dry biomes", () => {
     const dem = makeVegetationDem();
     const geometry = buildVegetationGeometry(dem, { seed: 77, density: 2 });
-    for (const path of geometry.paths) {
+    // Streamlines only: inked biome borders lie on the border itself.
+    for (const path of geometry.paths.filter((path) => !path.border)) {
       for (const point of path.points) {
         const x = Math.round(point.x);
         const y = Math.round(point.y);
@@ -372,7 +374,7 @@ describe("procedural vegetation flow renderer", () => {
     expect(Number.isFinite(direction.x)).toBe(true);
     expect(Number.isFinite(direction.y)).toBe(true);
     expect(Math.hypot(direction.x, direction.y)).toBeCloseTo(1, 6);
-    expect(buildVegetationGeometry(dem, { density: 0 }).paths).toHaveLength(0);
+    expect(buildVegetationGeometry(dem, { density: 0 }).paths.filter((path) => !path.border)).toHaveLength(0);
   });
 
   it("allows lower vegetation flow stroke thickness", () => {
@@ -395,7 +397,8 @@ describe("procedural vegetation flow renderer", () => {
     const dem = makeVegetationDem();
     const sparse = buildVegetationGeometry(dem, { seed: 501, density: 0.45 });
     const dense = buildVegetationGeometry(dem, { seed: 501, density: 2 });
-    expect(dense.paths.length).toBeGreaterThan(sparse.paths.length);
+    const streamlines = (paths: VegetationStrokePath[]) => paths.filter((path) => !path.border);
+    expect(streamlines(dense.paths).length).toBeGreaterThan(streamlines(sparse.paths).length);
 
     const short = buildVegetationGeometry(dem, { seed: 502, density: 2, strokeLength: 0.4 });
     const long = buildVegetationGeometry(dem, { seed: 502, density: 2, strokeLength: 2.5 });
@@ -447,11 +450,14 @@ describe("procedural vegetation flow renderer", () => {
       motifSize: 0.8,
     });
     expect(geometry.paths.length).toBeGreaterThan(0);
+    // Borders pack their marks into a line on purpose.
+    const borderKeys = new Set(geometry.paths.filter((path) => path.border).map((path) => path.key));
     expect(geometry.motifs.length).toBeGreaterThan(0);
 
     const motifsPerPath = new Map<number, number>();
     for (const motif of geometry.motifs) {
       expect(motif.pathKey).toBeTypeOf("number");
+      if (borderKeys.has(motif.pathKey!)) continue;
       motifsPerPath.set(
         motif.pathKey!,
         (motifsPerPath.get(motif.pathKey!) ?? 0) + 1,
@@ -560,7 +566,8 @@ describe("procedural vegetation flow renderer", () => {
     expect(adaptive.motifs.length).toBeGreaterThan(0);
     expect(adaptive.motifs.every((motif) => universalKeys.has(motif.assetKey))).toBe(true);
     expect(forced.motifs.every((motif) => universalKeys.has(motif.assetKey))).toBe(true);
-    expect(new Set(adaptive.motifs.map((motif) => motif.biomeId))).toEqual(new Set([2, 5]));
+    // The flat forest frame is the land tint's grass, drawn as meadow (20).
+    expect(new Set(adaptive.motifs.map((motif) => motif.biomeId))).toEqual(new Set([2, 5, 20]));
   });
 
   it("uses only reeds-01 for wetland flow motifs when the asset is available", () => {

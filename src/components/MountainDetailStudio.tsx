@@ -36,8 +36,6 @@ import {
 import {
   VEGETATION_MOTIF_DEFINITIONS,
   VEGETATION_RASTER_PROP_DEFINITIONS,
-  ALPINE_TREE_75_ASSET_URLS,
-  WETLAND_VEGETATION_PROP_DEFINITIONS,
   loadVegetationMotifAssets,
   loadMountainDetailPropAssets,
 } from "../rendering/vegetationMotifs";
@@ -4368,17 +4366,10 @@ export function MountainDetailStudio({
               onTreeScaleChange={setVegetationRasterPropScale}
               standSize={vegetationRasterPropStandSize}
               onStandSizeChange={setVegetationRasterPropStandSize}
-              sourceZoom={forestSourceZoom}
-              onSourceZoomChange={setForestSourceZoom}
-              sourceUrls={[
-                ...ALPINE_TREE_75_ASSET_URLS,
-                ...WETLAND_VEGETATION_PROP_DEFINITIONS.map((definition) => definition.url),
-              ]}
             />
             <InspectorFold title="Colors">
-              <InspectorColor label="Wood" value={forestSettings.wetlandWoodColor}
-                onChange={(color) => setForestSettings((previous) => ({ ...previous, wetlandWoodColor: color }))} />
-              <InspectorColor label="Outline" value={forestOutlineColor} onChange={setForestOutlineColor} />
+              <InspectorColor label="Outline" value={forestOutlineColor} onChange={setForestOutlineColor}
+                title="Ink colour of the stands, lone trees and grass, and of the other props' outlines." />
             </InspectorFold>
           </InspectorSection>
 

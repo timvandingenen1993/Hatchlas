@@ -30,6 +30,33 @@ function smoothstep(edge0: number, edge1: number, value: number): number {
   return t * t * (3 - 2 * t);
 }
 
+/**
+ * Biomes whose vegetation wash the tint modulates: bare rock, tundra, the
+ * forest and woodland belts, riparian shrubland and montane meadow.
+ */
+export function isMountainTintBiome(biomeId: number): boolean {
+  return biomeId >= 1 && biomeId <= 5 || biomeId === 20;
+}
+
+/** How green the tint paints this ground before pigment noise, 0..GREEN_STRENGTH-ish. */
+function baseGreenAmount(slopeDeg: number, normElev: number, tpi: number): number {
+  const flat = 1 - smoothstep(FLAT_SLOPE[0], FLAT_SLOPE[1], slopeDeg);
+  const ridge = Math.max(-1, Math.min(1, tpi / 60));
+  return (flat * GREEN_STRENGTH + Math.max(0, -ridge) * 0.15)
+    * (1 - smoothstep(GREEN_FADE_ELEV[0], GREEN_FADE_ELEV[1], normElev));
+}
+
+/**
+ * 0..1 share of this ground that the tint turns into grass: flat, low-to-mid
+ * ground. It is 0.5 where the green is half strength (about 11 degrees, or
+ * 0.7 of the elevation range), the same limits the meadow biome uses. The
+ * vegetation ink treats this ground as meadow, and the mountain illustration
+ * fades its rock there so the grass wash and flow lines show.
+ */
+export function mountainGrassAmount(slopeDeg: number, normElev: number, tpi: number): number {
+  return smoothstep(0.35, 0.65, baseGreenAmount(slopeDeg, normElev, tpi) / GREEN_STRENGTH);
+}
+
 function luminance(color: TintRGB): number {
   return color[0] * 0.299 + color[1] * 0.587 + color[2] * 0.114;
 }
@@ -47,7 +74,6 @@ export function tintMountainLand(
   green: Readonly<TintRGB>,
 ): TintRGB {
   const baseLum = luminance(base as TintRGB);
-  const flat = 1 - smoothstep(FLAT_SLOPE[0], FLAT_SLOPE[1], input.slopeDeg);
   const steep = smoothstep(STEEP_SLOPE[0], STEEP_SLOPE[1], input.slopeDeg);
   const highness = smoothstep(COOL_ELEV[0], COOL_ELEV[1], input.normElev);
   const ridge = Math.max(-1, Math.min(1, input.tpi / 60));
@@ -58,9 +84,7 @@ export function tintMountainLand(
   const greenLum = Math.max(1, luminance(green as TintRGB));
   const greenGain = Math.max(0.5, Math.min(1.6, baseLum / greenLum));
   const greenAmount = Math.max(0, Math.min(1,
-    (flat * GREEN_STRENGTH + Math.max(0, -ridge) * 0.15)
-    * (1 - smoothstep(GREEN_FADE_ELEV[0], GREEN_FADE_ELEV[1], input.normElev))
-    * (1 + input.noise * 0.35)));
+    baseGreenAmount(input.slopeDeg, input.normElev, input.tpi) * (1 + input.noise * 0.35)));
   r += (green[0] * greenGain - r) * greenAmount;
   g += (green[1] * greenGain - g) * greenAmount;
   b += (green[2] * greenGain - b) * greenAmount;

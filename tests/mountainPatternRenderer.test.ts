@@ -652,6 +652,44 @@ describe('mountain cartographic patterns', () => {
     }
   });
 
+  it('keeps mountain ink above the biome transition re-tint', () => {
+    const dem = mountain();
+    dem.biomeRegionScaleKm = 0.8;
+    dem.biomeType.fill(3);
+    for (let y = 0; y < dem.height; y++) {
+      for (let x = 48; x < dem.width; x++) dem.biomeType[y * dem.width + x] = 4;
+    }
+    dem.isOcean.fill(0);
+    dem.isRiverChannel.fill(0);
+    // A solid hatch column straddling the forest/woodland border.
+    const mountainIllustrationRGBA = new Uint8ClampedArray(dem.width * dem.height * 4);
+    const mountainIllustrationInkAlpha = new Uint8Array(dem.width * dem.height);
+    for (let y = 0; y < dem.height; y++) {
+      for (let x = 42; x < 55; x++) {
+        const index = y * dem.width + x;
+        mountainIllustrationRGBA.set([20, 20, 20, 255], index * 4);
+        mountainIllustrationInkAlpha[index] = 255;
+      }
+    }
+    const renderOptions: MountainRenderOptions = {
+      ...options,
+      mountainIllustrationRGBA,
+      mountainIllustrationInkAlpha,
+      vegetationBiomeTransitionStrength: 2,
+      vegetationBiomeColors: { 3: '#205020', 4: '#dcba78' },
+    };
+    const pixel = (image: ImageData, x: number, y: number): number[] =>
+      Array.from(image.data.subarray((y * image.width + x) * 4, (y * image.width + x) * 4 + 3));
+    const inked = renderMountainDetailDEMWithCache(dem, renderOptions);
+    expect(pixel(inked, 47, 40)).toEqual([20, 20, 20]);
+    // Without the ink coverage the same pixel is re-tinted by the wash.
+    const washedOver = renderMountainDetailDEMWithCache(dem, {
+      ...renderOptions,
+      mountainIllustrationInkAlpha: undefined,
+    });
+    expect(pixel(washedOver, 47, 40)[0]).toBeGreaterThan(60);
+  });
+
   it('reuses geometry for lighting edits and renders an inspection artifact', async () => {
     const dem = mountain(320, 240);
     const cache = createMountainRenderStageCache();

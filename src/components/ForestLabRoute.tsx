@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ChangeEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import {
   DEFAULT_FOREST_LAB_SETTINGS,
   FOREST_LAB_WIDTH,
@@ -14,13 +14,21 @@ import {
 const STORAGE_KEY = "forest-lab-settings";
 
 function loadSettings(): ForestLabSettings {
+  // ?settings={...} overrides stored settings, so a link reproduces a view.
+  let fromUrl: Partial<ForestLabSettings> = {};
+  try {
+    const raw = new URLSearchParams(window.location.search).get("settings");
+    if (raw) fromUrl = JSON.parse(raw) as Partial<ForestLabSettings>;
+  } catch {
+    // Ignore a malformed link.
+  }
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (raw) return { ...DEFAULT_FOREST_LAB_SETTINGS, ...(JSON.parse(raw) as Partial<ForestLabSettings>) };
+    if (raw) return { ...DEFAULT_FOREST_LAB_SETTINGS, ...(JSON.parse(raw) as Partial<ForestLabSettings>), ...fromUrl };
   } catch {
     // Storage is a convenience only.
   }
-  return DEFAULT_FOREST_LAB_SETTINGS;
+  return { ...DEFAULT_FOREST_LAB_SETTINGS, ...fromUrl };
 }
 
 type NumberKey = {
@@ -64,6 +72,32 @@ const SLIDERS: {
       { key: "inkWeight", label: "Ink weight", min: 0, max: 2, step: 0.05 },
     ],
   },
+  {
+    group: "Ink style",
+    items: [
+      { key: "inkMarkSize", label: "Crown mark size (map px)", min: 2, max: 14, step: 0.25 },
+      { key: "inkDensity", label: "Fill density", min: 0.3, max: 1.6, step: 0.05 },
+      { key: "inkEdgeDensity", label: "Edge density", min: 0.4, max: 1.6, step: 0.05 },
+      { key: "inkEdgeDepth", label: "Edge depth variance", min: 0, max: 2, step: 0.05 },
+      { key: "inkEdgeRows", label: "Second front row", min: 0, max: 1, step: 0.05 },
+      { key: "inkGrass", label: "Grass dots", min: 0, max: 2, step: 0.05 },
+      { key: "inkWash", label: "Ink stand wash", min: 0, max: 1, step: 0.05 },
+      { key: "inkCharcoal", label: "Charcoal grain", min: 0, max: 1, step: 0.05 },
+      { key: "inkInterruptions", label: "Stroke interruptions", min: 0, max: 1, step: 0.05 },
+    ],
+  },
+  {
+    group: "Ink line thickness",
+    items: [
+      { key: "inkLineFront", label: "Front row", min: 0.1, max: 2.5, step: 0.01 },
+      { key: "inkLineSecond", label: "Second row", min: 0.1, max: 2.5, step: 0.01 },
+      { key: "inkLineBack", label: "Back edge", min: 0.1, max: 2.5, step: 0.01 },
+      { key: "inkLineNearEdge", label: "Near-edge trees", min: 0.1, max: 2.5, step: 0.01 },
+      { key: "inkLineFill", label: "Fill trees", min: 0.1, max: 2.5, step: 0.01 },
+      { key: "inkLineLone", label: "Lone trees", min: 0.1, max: 2.5, step: 0.01 },
+      { key: "inkLineGrass", label: "Grass dots", min: 0.1, max: 2.5, step: 0.01 },
+    ],
+  },
 ];
 
 const COLORS: { key: keyof ForestLabSettings; label: string }[] = [
@@ -71,13 +105,17 @@ const COLORS: { key: keyof ForestLabSettings; label: string }[] = [
   { key: "rockColor", label: "Rock" },
   { key: "washColor", label: "Stand wash" },
   { key: "shrubWashColor", label: "Shrub wash" },
+  { key: "inkWashColor", label: "Ink stand tint" },
   { key: "accentColor", label: "Wetland tree" },
   { key: "trunkColor", label: "Wetland tree trunk" },
   { key: "inkColor", label: "Ink" },
 ];
 
 export function ForestLabRoute() {
-  const [settings, setSettings] = useState<ForestLabSettings>(loadSettings);
+  const [storedSettings, setSettings] = useState<ForestLabSettings>(loadSettings);
+  // Fill in controls added since the settings were stored (or since this
+  // page loaded, during development), so no slider starts empty.
+  const settings = useMemo(() => ({ ...DEFAULT_FOREST_LAB_SETTINGS, ...storedSettings }), [storedSettings]);
   const [zoom, setZoom] = useState(() => Number(new URLSearchParams(window.location.search).get("zoom")) || 1.5);
   const [renderMs, setRenderMs] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -139,6 +177,39 @@ export function ForestLabRoute() {
             onChange={(event) => update("standKind", event.currentTarget.value as ForestLabSettings["standKind"])}>
             <option value="trees">Trees</option>
             <option value="shrubs">Shrubs</option>
+          </select>
+        </label>
+        <label className="mb-3 flex items-center justify-between">
+          <span>Stand style</span>
+          <select className="rounded bg-slate-800 px-1" value={settings.standStyle}
+            onChange={(event) => update("standStyle", event.currentTarget.value as ForestLabSettings["standStyle"])}>
+            <option value="wash">Wash + tree marks</option>
+            <option value="ink">Pen and ink</option>
+          </select>
+        </label>
+        <label className="mb-3 flex items-center justify-between">
+          <span>Forest type (ink)</span>
+          <select className="rounded bg-slate-800 px-1" value={settings.inkForestType}
+            onChange={(event) => update("inkForestType", event.currentTarget.value as ForestLabSettings["inkForestType"])}>
+            <option value="deciduous">Deciduous</option>
+            <option value="conifer">Coniferous</option>
+            <option value="shrub">Shrubs</option>
+          </select>
+        </label>
+        <label className="mb-3 flex items-center justify-between">
+          <span>Ground</span>
+          <select className="rounded bg-slate-800 px-1" value={settings.ground}
+            onChange={(event) => update("ground", event.currentTarget.value as ForestLabSettings["ground"])}>
+            <option value="terrain">Terrain</option>
+            <option value="paper">Plain paper</option>
+          </select>
+        </label>
+        <label className="mb-3 flex items-center justify-between">
+          <span>Forest shape</span>
+          <select className="rounded bg-slate-800 px-1" value={settings.forestShape}
+            onChange={(event) => update("forestShape", event.currentTarget.value as ForestLabSettings["forestShape"])}>
+            <option value="slope">From the slope</option>
+            <option value="blobs">Rounded blobs</option>
           </select>
         </label>
         {SLIDERS.map((group) => (
