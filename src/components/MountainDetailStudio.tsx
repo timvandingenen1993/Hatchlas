@@ -184,6 +184,15 @@ const MOUNTAIN_PROFILE_QUERY =
 // enabled run; `2` is therefore an alias for enabling the same profiler.
 const MOUNTAIN_PROFILE_ENABLED =
   MOUNTAIN_PROFILE_QUERY === "1" || MOUNTAIN_PROFILE_QUERY === "2";
+// Export tile helpers size their memory from the reported RAM; `?exportMemoryGb=`
+// overrides that when the browser under-reports (or to test a tighter budget).
+const EXPORT_HELPER_MEMORY_GB: number | undefined =
+  typeof window !== "undefined"
+    ? (() => {
+        const value = Number(new URLSearchParams(window.location.search).get("exportMemoryGb"));
+        return Number.isFinite(value) && value > 0 ? value : undefined;
+      })()
+    : undefined;
 // Use the fast GPU path by default; URL options can still select CPU or approximate rendering.
 const MOUNTAIN_GPU_RENDER_MODE: MountainRenderOptions["gpuRenderMode"] =
   typeof window !== "undefined"
@@ -3498,6 +3507,7 @@ export function MountainDetailStudio({
       tileSize: 1024,
       halo: 32,
       profile: MOUNTAIN_PROFILE_ENABLED,
+      helperMemoryGb: EXPORT_HELPER_MEMORY_GB,
       filename: `mountain_detail_${activeLayer}_${activePalette}_${outputSize.width}x${outputSize.height}.png`,
       ...(regionPixels && {
         ...regionPixels,

@@ -739,19 +739,15 @@ function profileRenderSettings(options: MountainRenderOptions): Record<string, u
     wetlandPuddleSizeMin: options.wetlandPuddleSizeMin,
     wetlandPuddleSizeMax: options.wetlandPuddleSizeMax,
     wetlandPuddleCoastDistance: options.wetlandPuddleCoastDistance,
-    vegetation: vegetation
-      ? {
-          preset: vegetation.preset,
-          seed: vegetation.seed,
-          density: vegetation.density,
-          patternScale: vegetation.patternScale,
-          strokeLength: vegetation.strokeLength,
-          strokeThickness: vegetation.strokeThickness,
-          strokeOpacity: vegetation.strokeOpacity,
-          mountainSideRidgeDensity: vegetation.mountainSideRidgeDensity,
-          mountainMainRidgeThickness: vegetation.mountainMainRidgeThickness,
-        }
-      : undefined,
+    // Every vegetation setting by name (assets excluded), so a profile names
+    // the slider that moved instead of reporting no change.
+    ...(vegetation
+      ? Object.fromEntries(
+          Object.entries(vegetation)
+            .filter(([key]) => key !== "motifAssets" && key !== "rasterPropAssets")
+            .map(([key, value]) => [`vegetation.${key}`, value]),
+        )
+      : {}),
   };
 }
 
@@ -1322,6 +1318,7 @@ const renderCoordinator = new LatestRequestCoordinator<
         height: dem.height,
         layer: options.layer,
         changedSettings,
+        quality: request.quality ?? "final",
       })
     : undefined;
   profiler?.setMetadata({

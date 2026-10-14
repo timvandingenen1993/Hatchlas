@@ -3930,6 +3930,91 @@ function standPropKind(asset: VegetationRasterPropAsset): "tree" | "shrub" | und
 /** Seed salt for shrub candidates sharing a biome with trees, so the two kinds do not compete for the same spots. */
 const SHRUB_CANDIDATE_SEED_SALT = 0x5a1b7e;
 
+/** Raster props placed by biome (foothill boulders are placed separately). */
+function placementRasterPropAssets(
+  options: ResolvedVegetationPatternOptions,
+): VegetationRasterPropAsset[] {
+  return options.rasterPropAssets.filter((asset) =>
+    (asset.placementRole ?? "vegetation") !== "mountain-foothill",
+  );
+}
+
+/** The biomes props are placed in, in placement order. */
+function rasterPropBiomeOrder(assets: readonly VegetationRasterPropAsset[]): number[] {
+  return [...new Set(assets.flatMap((asset) => [...asset.eligibleBiomeIds]))];
+}
+
+/**
+ * One biome's raster props. Each biome has its own collision grid and
+ * candidates, so biomes can be placed independently (also on other workers)
+ * and joined in `rasterPropBiomeOrder`.
+ */
+function placeRasterPropsInBiome(
+  geometry: VegetationGeometry,
+  dem: VegetationPlacementTerrain,
+  options: ResolvedVegetationPatternOptions,
+  vegetationAssets: readonly VegetationRasterPropAsset[],
+  biome: number,
+  profiler?: MountainProfiler,
+  reportProgress?: VegetationPreparationReporter,
+): void {
+  const settings = rasterPropSettingsForBiome(options, biome);
+  const kindDensity = { tree: settings.treeDensity, shrub: settings.shrubDensity };
+  // Stand kinds turned off for this biome take no part in its placement,
+  // including the habitat fields they would otherwise trigger.
+  const biomeAssets = vegetationAssets.filter((asset) => {
+    if (!asset.eligibleBiomeIds.includes(biome)) return false;
+    const kind = standPropKind(asset);
+    return kind === undefined || kindDensity[kind] > 0;
+  });
+  if (biomeAssets.length === 0) return;
+  placeRasterProps(
+    geometry,
+    dem,
+    {
+      ...options,
+      rasterPropAssets: biomeAssets,
+      rasterPropDensity: settings.density,
+      rasterPropClustering: settings.clustering,
+    },
+    biome,
+    profiler,
+    reportProgress,
+    kindDensity,
+  );
+}
+
+/** The biomes raster props are placed in, in placement order. */
+export function rasterPropPlacementBiomes(rawOptions?: VegetationPatternOptions): number[] {
+  return rasterPropBiomeOrder(placementRasterPropAssets(resolveVegetationPatternOptions(rawOptions)));
+}
+
+/**
+ * The raster props of the given biomes, one list per biome. Concatenating
+ * the lists of every biome in `rasterPropPlacementBiomes` order gives exactly
+ * the placements of a full `buildVegetationGeometry` pass.
+ */
+export function placeRasterPropsInBiomes(
+  dem: VegetationPlacementTerrain,
+  rawOptions: VegetationPatternOptions | undefined,
+  biomes: readonly number[],
+  profiler?: MountainProfiler,
+): VegetationRasterPropPlacement[][] {
+  const options = resolveVegetationPatternOptions(rawOptions);
+  const assets = placementRasterPropAssets(options);
+  return biomes.map((biome) => {
+    const geometry: VegetationGeometry = {
+      width: dem.width,
+      height: dem.height,
+      paths: [],
+      motifs: [],
+      rasterProps: [],
+    };
+    placeRasterPropsInBiome(geometry, dem, options, assets, biome, profiler);
+    return geometry.rasterProps ?? [];
+  });
+}
+
 function placeRasterProps(
   geometry: VegetationGeometry,
   dem: VegetationPlacementTerrain,
@@ -3939,39 +4024,11 @@ function placeRasterProps(
   reportProgress?: VegetationPreparationReporter,
   standDensity?: { tree: number; shrub: number },
 ): void {
-  const vegetationAssets = options.rasterPropAssets.filter((asset) =>
-    (asset.placementRole ?? "vegetation") !== "mountain-foothill",
-  );
+  const vegetationAssets = placementRasterPropAssets(options);
   if (vegetationAssets.length === 0) return;
   if (targetBiome === undefined) {
-    const biomes = new Set(
-      vegetationAssets.flatMap((asset) => [...asset.eligibleBiomeIds]),
-    );
-    for (const biome of biomes) {
-      const settings = rasterPropSettingsForBiome(options, biome);
-      const kindDensity = { tree: settings.treeDensity, shrub: settings.shrubDensity };
-      // Stand kinds turned off for this biome take no part in its placement,
-      // including the habitat fields they would otherwise trigger.
-      const biomeAssets = vegetationAssets.filter((asset) => {
-        if (!asset.eligibleBiomeIds.includes(biome)) return false;
-        const kind = standPropKind(asset);
-        return kind === undefined || kindDensity[kind] > 0;
-      });
-      if (biomeAssets.length === 0) continue;
-      placeRasterProps(
-        geometry,
-        dem,
-        {
-          ...options,
-          rasterPropAssets: biomeAssets,
-          rasterPropDensity: settings.density,
-          rasterPropClustering: settings.clustering,
-        },
-        biome,
-        profiler,
-        reportProgress,
-        kindDensity,
-      );
+    for (const biome of rasterPropBiomeOrder(vegetationAssets)) {
+      placeRasterPropsInBiome(geometry, dem, options, vegetationAssets, biome, profiler, reportProgress);
     }
     return;
   }
@@ -4581,12 +4638,18 @@ function buildVegetationPropGeometry(
   options: ResolvedVegetationPatternOptions,
   profiler: MountainProfiler | undefined,
   reportProgress: VegetationPreparationReporter | undefined,
+  rasterPropPlacements?: readonly VegetationRasterPropPlacement[],
 ): void {
   const rasterPlacementStop = profiler?.begin(
     "vegetation raster prop placement",
   );
   reportProgress?.("Placing raster vegetation");
-  placeRasterProps(geometry, dem, options, undefined, profiler, reportProgress);
+  if (rasterPropPlacements) {
+    // Placed per biome elsewhere (in parallel) and joined in biome order.
+    geometry.rasterProps = [...rasterPropPlacements];
+  } else {
+    placeRasterProps(geometry, dem, options, undefined, profiler, reportProgress);
+  }
   rasterPlacementStop?.();
   const foothillPlacementStop = profiler?.begin(
     "vegetation mountain foothill placement",
@@ -4638,6 +4701,8 @@ export function buildVegetationGeometry(
   profiler?: MountainProfiler,
   onProgress?: VegetationPreparationReporter,
   part: VegetationLayerPart = "all",
+  /** Placements from `placeRasterPropsInBiomes`, joined in biome order. */
+  rasterPropPlacements?: readonly VegetationRasterPropPlacement[],
 ): VegetationGeometry {
   const reportProgress = createThrottledPreparationReporter(onProgress);
   const options = resolveVegetationPatternOptions(rawOptions);
@@ -4649,7 +4714,9 @@ export function buildVegetationGeometry(
     rasterProps: [],
   };
   if (part !== "props") buildVegetationFlowGeometry(geometry, dem, options, profiler, reportProgress);
-  if (part !== "flow") buildVegetationPropGeometry(geometry, dem, options, profiler, reportProgress);
+  if (part !== "flow") {
+    buildVegetationPropGeometry(geometry, dem, options, profiler, reportProgress, rasterPropPlacements);
+  }
   return geometry;
 }
 

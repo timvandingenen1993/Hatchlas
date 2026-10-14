@@ -26,13 +26,16 @@ import {
   type MountainProfileReport,
 } from "./mountainProfiler";
 
+import type { MountainLayerPreparationMode } from "./mountainLayerWorkerPool";
+import { placeRasterPropsInParallel } from "./parallelPropPlacement";
+
 interface PrepareMessage {
   type: "prepare";
   id: number;
   dem: MountainDEMData;
   options: MountainRenderOptions;
   vegetationGeometryOverride?: VegetationGeometry;
-  mode?: "all" | "water" | "vegetationGeometry" | "vegetation" | "vegetationFlow" | "vegetationProps";
+  mode?: MountainLayerPreparationMode;
   profile?: boolean;
 }
 
@@ -44,7 +47,7 @@ interface CancelMessage {
 interface PreparationResult {
   type: "result";
   id: number;
-  mode: "all" | "water" | "vegetationGeometry" | "vegetation" | "vegetationFlow" | "vegetationProps";
+  mode: MountainLayerPreparationMode;
   waterGeometry: WaterOverlayGeometry | null;
   waterOverlay: WaterOverlay | null;
   vegetationGeometry: VegetationGeometry | null;
@@ -123,7 +126,7 @@ function postCancellation(id: number): void {
   } satisfies FailureResult);
 }
 
-function prepare(message: PrepareMessage): void {
+async function prepare(message: PrepareMessage): Promise<void> {
   const { id, dem, options, mode = "all" } = message;
   const workerStartedAt = absoluteNow();
   const profiler = message.profile
@@ -139,11 +142,14 @@ function prepare(message: PrepareMessage): void {
       postCancellation(id);
       return;
     }
-    const stage = mode === "vegetationGeometry"
+    // Export halves need only the geometry: no water and no overlay.
+    const geometryOnly = mode === "vegetationGeometryFlow" || mode === "vegetationGeometryProps";
+    const withoutWater = mode === "vegetationGeometry" || geometryOnly;
+    const stage = withoutWater
       ? { shouldBuildWater: false, options: buildMountainWaterStageInputs(dem, options).options }
       : buildMountainWaterStageInputs(dem, options);
     const waterGeometryStarted = performance.now();
-    const shouldBuildWater = mode !== "vegetationGeometry" && stage.shouldBuildWater;
+    const shouldBuildWater = !withoutWater && stage.shouldBuildWater;
     const waterGeometry = shouldBuildWater
       ? buildWaterOverlayGeometry(dem, stage.options, profiler)
       : null;
@@ -158,9 +164,9 @@ function prepare(message: PrepareMessage): void {
     const vegetationJob = mode === "vegetation" || mode === "vegetationFlow" || mode === "vegetationProps";
     // "vegetationFlow" and "vegetationProps" are the two independent halves
     // of a "vegetation" job, run on separate workers and merged afterwards.
-    const vegetationPart: VegetationLayerPart = mode === "vegetationFlow"
+    const vegetationPart: VegetationLayerPart = mode === "vegetationFlow" || mode === "vegetationGeometryFlow"
       ? "flow"
-      : mode === "vegetationProps" ? "props" : "all";
+      : mode === "vegetationProps" || mode === "vegetationGeometryProps" ? "props" : "all";
     const waterOverlay = waterGeometry && !vegetationJob
       ? renderWaterOverlayFromGeometry(dem, stage.options, waterGeometry, profiler)
       : null;
@@ -195,9 +201,27 @@ function prepare(message: PrepareMessage): void {
       "vegetation geometry input",
       Boolean(message.vegetationGeometryOverride),
     );
+    // Prop placement is the longest part of the props half; its biomes are
+    // independent, so they are placed on helper workers side by side.
+    const rasterPropPlacements = shouldBuildVegetation
+      && !message.vegetationGeometryOverride
+      && vegetationPart !== "flow"
+      ? await placeRasterPropsInParallel(vegetationDem, options.vegetation, profiler)
+      : undefined;
+    if (isCancelled(id)) {
+      postCancellation(id);
+      return;
+    }
     const vegetationGeometry = shouldBuildVegetation
       ? message.vegetationGeometryOverride ??
-        buildVegetationGeometry(vegetationDem, options.vegetation, profiler, undefined, vegetationPart)
+        buildVegetationGeometry(
+          vegetationDem,
+          options.vegetation,
+          profiler,
+          undefined,
+          vegetationPart,
+          rasterPropPlacements,
+        )
       : null;
     const vegetationGeometryMs = performance.now() - vegetationGeometryStarted;
     if (isCancelled(id)) {
@@ -205,7 +229,7 @@ function prepare(message: PrepareMessage): void {
       return;
     }
     const vegetationOverlayStarted = performance.now();
-    const vegetationOverlay = vegetationGeometry
+    const vegetationOverlay = vegetationGeometry && !geometryOnly
       ? renderVegetationOverlay(
           vegetationDem,
           vegetationGeometry,

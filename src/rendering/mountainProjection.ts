@@ -73,6 +73,13 @@ export const MOUNTAIN_MAX_LIFT_PIXELS = 128;
 export const MOUNTAIN_VALLEY_SUPPORT_PIXELS = 160;
 /** Brush, face, and derivative padding around the broad source support. */
 export const MOUNTAIN_PROJECTION_SUPPORT_PADDING_PIXELS = 96;
+/**
+ * Filter padding without lift (camera exports); see mountainProjectionSupportPixels.
+ * Measured by comparing split tiles with one full render: seams appear at 40
+ * and below at both 4.5x and 6x pixel scale, none above 44. 56 keeps a margin
+ * while camera tiles render ~27% fewer pixels than with the lift padding (96).
+ */
+export const MOUNTAIN_LIFT_FREE_SUPPORT_PADDING_PIXELS = 56;
 
 export interface MountainProjectionSettings {
   viewAngleDeg: number;
@@ -206,7 +213,7 @@ export function mountainProjectionSupportPixels(
 ): number {
   const pixelScale = Math.max(0.25, scale);
   if (!liftEnabled) {
-    return Math.ceil(MOUNTAIN_PROJECTION_SUPPORT_PADDING_PIXELS * pixelScale)
+    return Math.ceil(MOUNTAIN_LIFT_FREE_SUPPORT_PADDING_PIXELS * pixelScale)
       + Math.max(0, Math.ceil(snowRedistributionSteps));
   }
   return Math.ceil(
