@@ -2783,6 +2783,13 @@ export function renderMountainDetailDEMWithCache(
       b = Math.round(b * (1 - effectiveRainAlpha) + rainB * effectiveRainAlpha);
     }
 
+    // The ground's colours and washes before any linework, shown under
+    // forest stand crowns (see rasterPropStandCover).
+    const standCover = (vegetationOverlay?.rasterPropStandCover?.[i] ?? 0) / 255;
+    let groundR = r;
+    let groundG = g;
+    let groundB = b;
+
     // Contour Lines Generator
     if (!hasWaterWash && showContours && contourOpacity > 0) {
       const elev = contourElevation[i];
@@ -2962,6 +2969,11 @@ export function renderMountainDetailDEMWithCache(
     // the material share is re-tinted: mountain ink stays on top of washes.
     const mountainMaterialAlpha = Math.max(0,
       mountainIllustrationAlpha - (mountainInkAlpha?.[i] ?? 0) / 255);
+    if (standCover > 0 && mountainMaterialAlpha > 0) {
+      groundR = blendContourColor(groundR, mountainIllustrationRGBA![idx4], mountainMaterialAlpha);
+      groundG = blendContourColor(groundG, mountainIllustrationRGBA![idx4 + 1], mountainMaterialAlpha);
+      groundB = blendContourColor(groundB, mountainIllustrationRGBA![idx4 + 2], mountainMaterialAlpha);
+    }
     if (
       mountainMaterialAlpha > 0 &&
       vegetationTransitionWashRGB &&
@@ -2975,7 +2987,19 @@ export function renderMountainDetailDEMWithCache(
         r = blendContourColor(r, vegetationTransitionWashRGB[washOffset], transitionAlpha);
         g = blendContourColor(g, vegetationTransitionWashRGB[washOffset + 1], transitionAlpha);
         b = blendContourColor(b, vegetationTransitionWashRGB[washOffset + 2], transitionAlpha);
+        groundR = blendContourColor(groundR, vegetationTransitionWashRGB[washOffset], transitionAlpha);
+        groundG = blendContourColor(groundG, vegetationTransitionWashRGB[washOffset + 1], transitionAlpha);
+        groundB = blendContourColor(groundB, vegetationTransitionWashRGB[washOffset + 2], transitionAlpha);
       }
+    }
+
+    // Forest stand crowns hide the linework beneath them: their wash (in the
+    // raster props below) lies on the ground colours alone, so the stand
+    // wash strength mixes the ground into the crowns.
+    if (standCover > 0) {
+      r = blendContourColor(r, groundR, standCover);
+      g = blendContourColor(g, groundG, standCover);
+      b = blendContourColor(b, groundB, standCover);
     }
 
     // This preview-only diagnostic colors the placement suitability score

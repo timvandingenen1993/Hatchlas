@@ -334,6 +334,51 @@ describe('full terrain orthographic camera', () => {
     expect(assembled).toEqual(direct.data);
   });
 
+  it('sizes camera band working sets by the bytes the texture cache holds per pixel', async () => {
+    const dem = makeDem(24, 24);
+    const source = sourceImage(256, 128);
+    const tileSize = 16;
+    const budget = 80 * 1024;
+    const settings = {
+      cameraType: 'orthographic' as const,
+      elevationDeg: 58,
+      heightExaggeration: 1,
+      outputWidth: source.width,
+      outputHeight: source.height,
+      projection: undefined as ReturnType<typeof prepareFullTerrainCameraProjection> | undefined,
+    };
+    settings.projection = prepareFullTerrainCameraProjection(dem, settings);
+    const run = async (bytesPerPixel: number) => {
+      const regions: Array<{ keys: readonly string[]; workingSetBytes: number }> = [];
+      const count = await processFullTerrainCameraBandWithinTextureBudget(
+        dem,
+        0,
+        source.height,
+        settings,
+        tileSize,
+        budget,
+        async (_plan, tileKeys, workingSetBytes) => {
+          regions.push({ keys: tileKeys, workingSetBytes });
+        },
+        undefined,
+        bytesPerPixel,
+      );
+      return { count, regions };
+    };
+    const rgba = await run(4);
+    const withForeground = await run(8);
+    // A cache that also holds a foreground layer per tile needs smaller regions.
+    expect(withForeground.count).toBeGreaterThan(rgba.count);
+    for (const region of withForeground.regions) {
+      const cached = region.keys.reduce((bytes, key) => {
+        const [x, y] = key.split(',').map(Number);
+        return bytes + Math.min(tileSize, source.width - x) * Math.min(tileSize, source.height - y) * 8;
+      }, 0);
+      expect(region.workingSetBytes).toBe(cached);
+      expect(cached).toBeLessThanOrEqual(budget);
+    }
+  });
+
   it('reprojects the complete raster with finite pixels and preserves the source', () => {
     const dem = makeDem();
     const source = sourceImage(dem.width, dem.height);

@@ -353,6 +353,8 @@ async function createCameraTileWorker(
 }
 
 const CAMERA_TILE_CACHE_BUDGET_BYTES = 256 * 1024 * 1024;
+// A cached camera tile holds RGBA plus the foreground-prop RGBA layer.
+const CAMERA_TILE_CACHE_BYTES_PER_PIXEL = 8;
 // Each helper holds one prepared tile plus the renderer scratch, so its memory
 // depends on the tile size only, never on the size of the export. Tiles are
 // admitted one by one against a budget that scales with the machine's RAM
@@ -1110,6 +1112,8 @@ async function runExport(request: MountainExportRequest): Promise<void> {
       : undefined,
   };
   let cameraHelperPromise: Promise<CameraTileWorkerClient[]> = Promise.resolve([]);
+  /** Starts one more helper with the pool's settings (to replace a restarted one). */
+  let startCameraTileHelper: (() => Promise<CameraTileWorkerClient | undefined>) | undefined;
   const helperMemoryBudget = getExportHelperMemoryBudget(
     readDeviceMemoryGb(),
     request.helperMemoryGb,
@@ -1167,13 +1171,15 @@ async function runExport(request: MountainExportRequest): Promise<void> {
     activeCameraTileWorkerCancels.set(request.id, () => {
       for (const cancel of cancels) cancel();
     });
+    startCameraTileHelper = () => createCameraTileWorker(
+      profiler,
+      request.profile === true,
+      cancel => cancels.push(cancel),
+      message => console.warn("[mountain export] camera tile helper could not start:", message),
+    );
+    const startHelper = startCameraTileHelper;
     cameraHelperPromise = Promise.all(
-      Array.from({ length: helperCount }, () => createCameraTileWorker(
-        profiler,
-        request.profile === true,
-        cancel => cancels.push(cancel),
-        message => console.warn("[mountain export] camera tile helper could not start:", message),
-      )),
+      Array.from({ length: helperCount }, () => startHelper()),
     ).then(helpers => {
       const started = helpers.filter((helper): helper is CameraTileWorkerClient => helper !== undefined);
       if (started.length < helperCount) {
@@ -1417,14 +1423,25 @@ async function runExport(request: MountainExportRequest): Promise<void> {
     };
     const tileOutputBytes = (key: string): number => {
       const tile = tileFromKey(key);
-      // RGBA plus the foreground-prop RGBA layer.
-      return tile.width * tile.height * 8;
+      return tile.width * tile.height * CAMERA_TILE_CACHE_BYTES_PER_PIXEL;
     };
     const scheduler = new CameraTileScheduler<PreparedMountainExportTile, CameraTileWorkerResult>({
-      helpers: helpers.map(helper => ({
-        render: (prepared, transfer) => withHelperTimeout(helper.render(prepared, transfer)),
-        dispose: () => helper.dispose(),
-      })),
+      helpers: helpers.map(initial => {
+        let helper = initial;
+        return {
+          render: (prepared, transfer) => withHelperTimeout(helper.render(prepared, transfer)),
+          dispose: () => helper.dispose(),
+          restart: async () => {
+            if (!startCameraTileHelper) return false;
+            // Terminating the worker releases its whole heap at once.
+            helper.dispose();
+            const next = await startCameraTileHelper();
+            if (!next) return false;
+            helper = next;
+            return true;
+          },
+        };
+      }),
       prepare: async (key) => {
         const prepareStarted = performance.now();
         const tile = tileFromKey(key);
@@ -1489,7 +1506,17 @@ async function runExport(request: MountainExportRequest): Promise<void> {
         );
         profiler?.recordMetric("camera tile memory pressure retries", 1, "tiles");
       },
+      onHelperRestart: (key, error, reducedBudgetBytes) => {
+        console.warn(
+          "[mountain export] tile " + key + " ran out of memory with every helper idle ("
+            + (error instanceof Error ? error.message : String(error))
+            + "); restarting the helpers to free their memory and retrying, helper memory budget now "
+            + Math.round(reducedBudgetBytes / 1048576) + " MiB",
+        );
+        profiler?.recordMetric("camera tile memory pressure helper restarts", 1, "times");
+      },
       onHelperFailure: (_key, error, reducedBudgetBytes) => {
+        profiler?.recordMetric("camera tile helper failed", 1, "helpers");
         console.warn(
           "[mountain export] camera tile helper failed:",
           error instanceof Error ? error.message : error,
@@ -1869,6 +1896,7 @@ async function runExport(request: MountainExportRequest): Promise<void> {
               prepareFullTerrainCameraBand(dem, start, end, settings),
             )
           : prepareFullTerrainCameraBand(dem, start, end, settings),
+        CAMERA_TILE_CACHE_BYTES_PER_PIXEL,
       );
       if (regionCount > 1) {
         profiler?.recordMetric("camera band subdivisions", regionCount - 1, "regions");
@@ -1979,6 +2007,7 @@ async function runExport(request: MountainExportRequest): Promise<void> {
   finishProfile("completed");
   post({ type: "result", id: request.id, filename: request.filename, blob, completedStages });
   } catch (error) {
+    profiler?.setMetadata({ failure: error instanceof Error ? error.message : String(error) });
     finishProfile(cancelled.has(request.id) ? "cancelled" : "failed");
     throw error;
   } finally {

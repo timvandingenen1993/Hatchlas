@@ -302,6 +302,96 @@ describe("camera tile scheduler", () => {
     await retried;
   });
 
+  it("never lets a requeued look-ahead tile block tiles a band is waiting for", async () => {
+    const t = setup({ helpers: 1, lookaheadBudget: 2 });
+    let outOfMemory = 0;
+    // Same setup, but out-of-memory errors keep the helper.
+    const jobs = t.jobs;
+    const scheduler = new CameraTileScheduler<string, string>({
+      helpers: [{
+        render: (key) => new Promise<string>((resolve, reject) =>
+          jobs.push({ key, resolve: () => resolve(key), reject })),
+        dispose: () => {},
+      }],
+      prepare: (key) => ({ prepared: key, transfer: [] }),
+      renderLocally: () => {},
+      store: (key) => { t.cache.add(key); },
+      isAvailable: (key) => t.cache.has(key),
+      helperBytes: () => 1,
+      outputBytes: () => 1,
+      cachedBytes: () => t.cache.size,
+      helperBudgetBytes: 10,
+      lookaheadBudgetBytes: 2,
+      cancelled: () => false,
+      yieldToEvents: () => Promise.resolve(),
+      isOutOfMemory: (error) => error instanceof Error && /allocation failed/.test(error.message),
+      onMemoryPressure: () => { outOfMemory++; },
+    });
+    scheduler.prefetch(["A"]);
+    await t.settle();
+    await t.finish("A");
+    scheduler.prefetch(["X"]);
+    await t.settle();
+    expect(jobs.map(job => job.key)).toEqual(["X"]);
+    // A band needs two tiles: "n1" is prepared ahead, "n2" waits in the queue.
+    const band = scheduler.ensure(["n1", "n2"]);
+    await t.settle();
+    // The look-ahead tile runs out of memory and goes back to the queue's
+    // front, where it no longer fits the look-ahead budget.
+    jobs.splice(0, 1)[0].reject(new Error("Array buffer allocation failed"));
+    await t.settle();
+    expect(outOfMemory).toBe(1);
+    await t.finish("n1");
+    // The band's second tile must still be rendered.
+    expect(jobs.map(job => job.key)).toEqual(["n2"]);
+    await t.finish("n2");
+    await band;
+  });
+
+  it("restarts idle helpers when a tile runs out of memory with none running, then retries it once", async () => {
+    const run = async (failures: number) => {
+      const cache = new Set<string>();
+      const restarts: number[] = [];
+      let preparations = 0;
+      const helpers: CameraTileHelper<string, string>[] = [0, 1].map(id => ({
+        render: (key: string) => Promise.resolve(key),
+        dispose: () => {},
+        restart: async () => { restarts.push(id); return true; },
+      }));
+      const scheduler = new CameraTileScheduler<string, string>({
+        helpers,
+        prepare: (key) => {
+          preparations++;
+          if (preparations <= failures) throw new RangeError("Array buffer allocation failed");
+          return { prepared: key, transfer: [] };
+        },
+        renderLocally: () => {},
+        store: (key) => { cache.add(key); },
+        isAvailable: (key) => cache.has(key),
+        helperBytes: () => 1,
+        outputBytes: () => 1,
+        cachedBytes: () => cache.size,
+        helperBudgetBytes: 10,
+        lookaheadBudgetBytes: 10,
+        cancelled: () => false,
+        yieldToEvents: () => Promise.resolve(),
+        isOutOfMemory: (error) => error instanceof RangeError,
+      });
+      const outcome = await scheduler.ensure(["coast"]).then(() => "rendered", (error: Error) => error.message);
+      return { outcome, restarts, preparations };
+    };
+    const recovered = await run(1);
+    expect(recovered.outcome).toBe("rendered");
+    expect(recovered.restarts.sort()).toEqual([0, 1]);
+    expect(recovered.preparations).toBe(2);
+    // A tile that still does not fit after the restart fails the export
+    // instead of restarting the helpers forever.
+    const failed = await run(2);
+    expect(failed.outcome).toBe("Array buffer allocation failed");
+    expect(failed.restarts).toHaveLength(2);
+    expect(failed.preparations).toBe(2);
+  });
+
   it("renders everything locally without helpers", async () => {
     const t = setup({ helpers: 0 });
     t.scheduler.prefetch(["ahead"]);

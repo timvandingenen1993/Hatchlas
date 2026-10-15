@@ -263,12 +263,13 @@ export function logMountainProfileReport(report: MountainProfileReport): void {
 
 /** Total plus the most expensive stages by self time, as plain text. */
 export function formatMountainProfileSummary(report: MountainProfileReport, limit = 30): string {
-  const quality = (report as { quality?: unknown }).quality;
+  const { quality, failure } = report as { quality?: unknown; failure?: unknown };
   const changed = report.changedSettings ?? [];
   const lines = [
     `[profile summary] #${report.requestId ?? "?"} ${report.layer ?? ""}`
       + `${typeof quality === "string" ? ` ${quality}` : ""} ${report.width ?? "?"}x${report.height ?? "?"} `
       + `${report.status} total ${(report.totalMs / 1000).toFixed(1)} s`,
+    ...(typeof failure === "string" ? [`  failure: ${failure}`] : []),
     // A first render lists every setting; a change lists just what moved.
     `  changed: ${changed.length === 0 ? "none" : changed.length > 12
       ? `${changed.length} settings (first render)` : changed.join(", ")}`,

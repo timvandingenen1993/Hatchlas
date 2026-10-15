@@ -528,6 +528,12 @@ export interface VegetationOverlay {
    * skips this share.
    */
   rasterPropStandShare?: Uint8Array;
+  /**
+   * Coverage (0..255) of forest stand crowns. The map shows its ground
+   * colours without linework there, under the raster props, so the stand
+   * wash mixes the ground into the crowns.
+   */
+  rasterPropStandCover?: Uint8Array;
 }
 
 /**
@@ -571,6 +577,7 @@ export interface VegetationOverlayStageCache {
   rasterPropCharcoalAlpha?: Uint8Array;
   rasterPropShadowAlpha?: Uint8Array;
   rasterPropStandShare?: Uint8Array;
+  rasterPropStandCover?: Uint8Array;
 }
 
 const BIOME_SUITABILITY: Readonly<Record<number, number>> = {
@@ -7323,6 +7330,7 @@ interface RasterPropLayers {
   rasterPropCharcoalAlpha: Uint8Array;
   rasterPropShadowAlpha: Uint8Array;
   rasterPropStandShare?: Uint8Array;
+  rasterPropStandCover?: Uint8Array;
 }
 
 /**
@@ -7384,6 +7392,10 @@ function renderRasterPropLayers(
   let rasterPropStandShare =
     stageCache?.rasterPropKey === rasterPropKey
       ? stageCache.rasterPropStandShare
+      : undefined;
+  let rasterPropStandCover =
+    stageCache?.rasterPropKey === rasterPropKey
+      ? stageCache.rasterPropStandCover
       : undefined;
   const rasterPropsCacheHit = Boolean(
     rasterPropRGBA && rasterPropShadowAlpha && rasterPropCharcoalAlpha,
@@ -7630,6 +7642,10 @@ function renderRasterPropLayers(
     if (standsCanvas) {
       const standStop = profiler?.begin("vegetation forest stands");
       const settings = options.forestSettings;
+      // Crown bodies, for the compositor to show line-free ground under.
+      const coverCanvas = settings.showStandDebug
+        ? null
+        : new OffscreenCanvas(dem.width, dem.height).getContext("2d", { willReadFrequently: true });
       // Every stand paints onto one canvas. A later stand goes underneath
       // the earlier ones, so stands are drawn last to first.
       for (let standIndex = allStands.length - 1; standIndex >= 0; standIndex--) {
@@ -7659,11 +7675,18 @@ function renderRasterPropLayers(
           charcoal: settings.inkCharcoal,
           interruptions: settings.inkInterruptions,
           thickness: STAND_LINE_WEIGHTS,
-        }, standsCanvas);
+        }, standsCanvas, coverCanvas ?? undefined);
       }
       standStop?.();
       const readbackStop = profiler?.begin("vegetation forest stand readback");
       const standPixels = standsCanvas.getImageData(0, 0, dem.width, dem.height).data;
+      if (coverCanvas) {
+        const coverPixels = coverCanvas.getImageData(0, 0, dem.width, dem.height).data;
+        rasterPropStandCover = new Uint8Array(dem.width * dem.height);
+        for (let pixel = 0; pixel < rasterPropStandCover.length; pixel++) {
+          rasterPropStandCover[pixel] = coverPixels[pixel * 4 + 3];
+        }
+      }
       readbackStop?.();
       rasterPropStandShare ??= new Uint8Array(dem.width * dem.height);
       // Stands are background: composite them beneath every other prop.
@@ -7704,10 +7727,11 @@ function renderRasterPropLayers(
       stageCache.rasterPropCharcoalAlpha = rasterPropCharcoalAlpha;
       stageCache.rasterPropShadowAlpha = rasterPropShadowAlpha;
       stageCache.rasterPropStandShare = rasterPropStandShare;
+      stageCache.rasterPropStandCover = rasterPropStandCover;
     }
   }
   rasterPropsStop?.();
-  return { rasterPropRGBA, rasterPropCharcoalAlpha, rasterPropShadowAlpha, rasterPropStandShare };
+  return { rasterPropRGBA, rasterPropCharcoalAlpha, rasterPropShadowAlpha, rasterPropStandShare, rasterPropStandCover };
 }
 
 function emptyRasterPropLayers(): RasterPropLayers {
@@ -7729,6 +7753,7 @@ export function mergeVegetationOverlay(
     rasterPropCharcoalAlpha: props.rasterPropCharcoalAlpha,
     rasterPropShadowAlpha: props.rasterPropShadowAlpha,
     rasterPropStandShare: props.rasterPropStandShare,
+    rasterPropStandCover: props.rasterPropStandCover,
   };
 }
 
@@ -8238,5 +8263,6 @@ export function renderVegetationOverlay(
     rasterPropCharcoalAlpha: propLayers.rasterPropCharcoalAlpha,
     rasterPropShadowAlpha: propLayers.rasterPropShadowAlpha,
     rasterPropStandShare: propLayers.rasterPropStandShare,
+    rasterPropStandCover: propLayers.rasterPropStandCover,
   };
 }

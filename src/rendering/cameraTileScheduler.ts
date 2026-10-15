@@ -12,6 +12,11 @@
 export interface CameraTileHelper<Prepared, Result> {
   render(prepared: Prepared, transfer: Transferable[]): Promise<Result>;
   dispose(): void;
+  /**
+   * Replaces the helper's worker with a fresh one, releasing everything the
+   * old one still held. Resolves false when no new worker could start.
+   */
+  restart?(): Promise<boolean>;
 }
 
 export interface CameraTileSchedulerOptions<Prepared, Result> {
@@ -43,6 +48,8 @@ export interface CameraTileSchedulerOptions<Prepared, Result> {
   isOutOfMemory?(error: unknown): boolean;
   /** Preparing `key` ran out of memory; `helperBudgetBytes` is the reduced budget. */
   onMemoryPressure?(key: string, error: unknown, helperBudgetBytes: number): void;
+  /** Preparing `key` ran out of memory with every helper idle; they are restarted. */
+  onHelperRestart?(key: string, error: unknown, helperBudgetBytes: number): void;
   /** A reduced budget grew back after clean tiles. */
   onBudgetRecovered?(helperBudgetBytes: number): void;
   /** A helper failed; `helperBudgetBytes` is the reduced budget from now on. */
@@ -89,6 +96,8 @@ export class CameraTileScheduler<Prepared, Result> {
   private cleanCompletions = 0;
   /** Clean completions that double a reduced budget again (up to the configured one). */
   private static readonly RECOVERY_COMPLETIONS = 4;
+  /** Keys whose preparation already restarted the idle helpers once. */
+  private readonly restartedFor = new Set<string>();
   private failure: unknown;
 
   constructor(options: CameraTileSchedulerOptions<Prepared, Result>) {
@@ -206,23 +215,38 @@ export class CameraTileScheduler<Prepared, Result> {
       <= this.options.lookaheadBudgetBytes;
   }
 
-  /** The next queued key that still needs rendering, dropping finished ones. */
+  /**
+   * The next key to prepare, moved to the queue's front: the first one a band
+   * waits for, else the first look-ahead key. Finished keys are dropped.
+   * Required keys must win wherever they sit: a look-ahead tile put back at
+   * the front after a failure may not fit the look-ahead budget, and stopping
+   * there would leave a band waiting with nothing running to wake it.
+   */
   private nextKey(): string | undefined {
-    while (this.queue.length > 0) {
-      const key = this.queue[0];
+    let first = -1;
+    let index = 0;
+    while (index < this.queue.length) {
+      const key = this.queue[index];
       if (this.options.isAvailable(key)) {
-        this.queue.shift();
+        this.queue.splice(index, 1);
         this.settle(key);
         continue;
       }
       // Already on its way: its waiters settle when it is stored.
       if (this.running.has(key) || this.staged?.key === key || this.preparingKey === key) {
-        this.queue.shift();
+        this.queue.splice(index, 1);
         continue;
       }
-      return key;
+      if (this.required.has(key)) {
+        if (index > 0) this.queue.unshift(...this.queue.splice(index, 1));
+        return key;
+      }
+      if (first < 0) first = index;
+      index++;
     }
-    return undefined;
+    if (first < 0) return undefined;
+    if (first > 0) this.queue.unshift(...this.queue.splice(first, 1));
+    return this.queue[0];
   }
 
   private async pump(): Promise<void> {
@@ -279,16 +303,28 @@ export class CameraTileScheduler<Prepared, Result> {
       try {
         preparation = await this.options.prepare(key);
       } catch (error) {
+        this.preparingKey = undefined;
+        if (!this.options.isOutOfMemory?.(error)) throw error;
         // Out of memory while helpers still hold tiles: retry this tile once
         // they have finished, with fewer tiles side by side from now on.
         // Retrying at once (or on another path) only digs into swap.
-        if (this.running.size === 0 || !this.options.isOutOfMemory?.(error)) throw error;
+        if (this.running.size > 0) {
+          this.queue.unshift(key);
+          this.reduceBudget();
+          this.options.onMemoryPressure?.(key, error, this.helperBudgetBytes);
+          return;
+        }
+        // Every helper is idle, yet an idle helper keeps its last tile's
+        // buffers until its own garbage collector runs, which this worker
+        // cannot trigger. Restarting the helpers frees all of it; the tile
+        // is retried once, and fails the export if it still does not fit.
+        if (this.restartedFor.has(key) || !this.idle.some(helper => helper.restart)) throw error;
+        this.restartedFor.add(key);
         this.queue.unshift(key);
-        this.helperBudgetBytes /= 2;
-        this.cleanCompletions = 0;
-        this.lowMemory = true;
-        this.options.onMemoryPressure?.(key, error, this.helperBudgetBytes);
-        return;
+        this.reduceBudget();
+        this.options.onHelperRestart?.(key, error, this.helperBudgetBytes);
+        await this.restartIdleHelpers();
+        continue;
       } finally {
         this.preparingKey = undefined;
       }
@@ -296,6 +332,27 @@ export class CameraTileScheduler<Prepared, Result> {
       this.staged = { key, prepared: preparation.prepared, transfer: preparation.transfer };
       await this.options.yieldToEvents();
     }
+  }
+
+  private reduceBudget(): void {
+    this.helperBudgetBytes /= 2;
+    this.cleanCompletions = 0;
+    this.lowMemory = true;
+  }
+
+  /** Restarts every idle helper; one that cannot start again is retired. */
+  private async restartIdleHelpers(): Promise<void> {
+    const idle = [...this.idle];
+    const restarted = await Promise.all(idle.map(helper =>
+      helper.restart ? helper.restart().catch(() => false) : Promise.resolve(true)));
+    idle.forEach((helper, index) => {
+      if (restarted[index]) return;
+      helper.dispose();
+      const idleAt = this.idle.indexOf(helper);
+      if (idleAt >= 0) this.idle.splice(idleAt, 1);
+      const helperAt = this.helpers.indexOf(helper);
+      if (helperAt >= 0) this.helpers.splice(helperAt, 1);
+    });
   }
 
   private dispatch(key: string, prepared: Prepared, transfer: Transferable[]): void {

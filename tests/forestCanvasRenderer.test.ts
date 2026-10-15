@@ -306,4 +306,71 @@ describe("mountain forest canvas settings and layer", () => {
     const offset = target * 4;
     expect(Array.from(image.data.slice(offset, offset + 3))).toEqual([86, 123, 84]);
   });
+
+  it("mixes stand crowns with the ground colours beneath, without its linework", () => {
+    const width = 8;
+    const height = 8;
+    const total = width * height;
+    const target = 3 * width + 3;
+    const dem = processMountainBaseDEM(new Float32Array(total).fill(0.5), width, height, {
+      domainWidthKm: 1,
+      domainHeightKm: 1,
+      minElevationM: 100,
+      maxElevationM: 500,
+      oceanElevationM: 0,
+      riverThresholdKm2: 100,
+    });
+    const render = (lines: boolean, cover: number, paintAlpha: number) => {
+      const alpha = new Uint8Array(total);
+      if (lines) alpha[target] = 255;
+      const rasterPropRGBA = new Uint8ClampedArray(total * 4);
+      rasterPropRGBA.set([40, 90, 50, paintAlpha], target * 4);
+      const rasterPropStandCover = new Uint8Array(total);
+      rasterPropStandCover[target] = cover;
+      const image = renderMountainDetailDEM(dem, {
+        layer: "vegetation_patterns",
+        palette: "swiss_topo",
+        sunAzimuthDeg: 315,
+        sunAltitudeDeg: 45,
+        verticalExaggeration: 1,
+        ambientOcclusionStrength: 0.35,
+        skipMountainIllustrationStage: true,
+        showRivers: false,
+        riverThresholdKm2: 1,
+        showContours: false,
+        contourIntervalM: 100,
+        vegetationGeometryOverride: { width, height, paths: [], motifs: [], rasterProps: [] },
+        vegetationOverlayOverride: {
+          width,
+          height,
+          alpha,
+          backgroundTone: new Float32Array(total).fill(0.5),
+          backgroundNoise: new Float32Array(total),
+          backgroundDryness: new Float32Array(total),
+          wetlandDryness: new Float32Array(total),
+          wetlandImagePropHabitat: new Float32Array(total),
+          washShadowAlpha: new Uint8Array(total),
+          shadowAlpha: new Uint8Array(total),
+          flowGuideAlpha: new Uint8Array(total),
+          rasterPropRGBA,
+          rasterPropCharcoalAlpha: new Uint8Array(total),
+          rasterPropShadowAlpha: new Uint8Array(total),
+          rasterPropStandShare: new Uint8Array(total).fill(255),
+          rasterPropStandCover,
+        },
+        vegetation: { rasterPropAssets: [] },
+      });
+      return Array.from(image.data.slice(target * 4, target * 4 + 3));
+    };
+    const ground = render(false, 0, 0);
+    // Without a crown the ink line shows; a crown at wash 0 shows the bare ground.
+    expect(render(true, 0, 0)).not.toEqual(ground);
+    expect(render(true, 255, 0)).toEqual(ground);
+    // At half strength the crown is half ground, half wash colour.
+    const mixed = render(true, 255, 128);
+    const half = 128 / 255;
+    mixed.forEach((channel, index) => {
+      expect(channel).toBeCloseTo(ground[index] * (1 - half) + [40, 90, 50][index] * half, -0.5);
+    });
+  });
 });

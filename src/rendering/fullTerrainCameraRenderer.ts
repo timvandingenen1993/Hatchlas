@@ -978,7 +978,10 @@ export function getCameraBandTextureTileKeys(
 
 /** Processes only row regions whose complete bilinear texture footprint fits
  * the caller's cache budget. Oversized regions are rasterized as two smaller
- * regions, releasing the parent plan before either child is prepared. */
+ * regions, releasing the parent plan before either child is prepared.
+ * `bytesPerPixel` must match what the caller's cache holds per source pixel
+ * (8 when every tile also carries a foreground layer), or a region that
+ * "fits" overflows the cache once its tiles are pinned. */
 export async function processFullTerrainCameraBandWithinTextureBudget(
   dem: MountainDEMData,
   rowStart: number,
@@ -997,6 +1000,7 @@ export async function processFullTerrainCameraBandWithinTextureBudget(
     settings: FullTerrainCameraSettings,
   ) => FullTerrainCameraBandPlan = (start, end, settings) =>
     prepareFullTerrainCameraBand(dem, start, end, settings),
+  bytesPerPixel = 4,
 ): Promise<number> {
   const sourceWidth = Math.max(2, Math.floor(
     requested.outputWidth ?? requested.projection?.width ?? dem.width,
@@ -1009,7 +1013,7 @@ export async function processFullTerrainCameraBandWithinTextureBudget(
     for (const key of keys) {
       const [tileX, tileY] = key.split(',').map(Number);
       bytes += Math.min(tileSize, sourceWidth - tileX)
-        * Math.min(tileSize, sourceHeight - tileY) * 4;
+        * Math.min(tileSize, sourceHeight - tileY) * bytesPerPixel;
     }
     return bytes;
   };

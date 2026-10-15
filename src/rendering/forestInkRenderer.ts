@@ -31,7 +31,10 @@ export interface ForestInkPaint {
    * local colour.
    */
   washField?: ForestInkWashField;
-  /** Wash strength; 0 leaves the marks on bare ground, as on paper. */
+  /**
+   * Wash strength: how far the wash and crowns shift from the ground below
+   * toward the wash colour. 0 leaves the marks on bare ground, as on paper.
+   */
   washAlpha?: number;
   /** 0 = flat wash, 1 = default splotches, 2 = strong colour and value variation. */
   washVariation?: number;
@@ -362,6 +365,11 @@ function scratchContexts(width: number, height: number): { ink: Ctx; tint: Ctx }
  * With `target`, the stand is drawn onto it (several stands share one
  * canvas and one readback); otherwise onto a new canvas. The geometry's own
  * mapping places it (see mapForestInkGeometry).
+ *
+ * With `cover`, every crown body is also filled onto it, opaque: the map
+ * shows its ground colours without linework there, under the crown's wash,
+ * so the wash strength mixes the ground into the crowns rather than letting
+ * contours and other lines show through them.
  */
 export function renderForestInkCanvas(
   width: number,
@@ -369,6 +377,7 @@ export function renderForestInkCanvas(
   geometry: ForestInkGeometry,
   paint: ForestInkPaint,
   target?: Ctx,
+  cover?: Ctx,
 ): OffscreenCanvas | null {
   if (width <= 0 || height <= 0 || typeof OffscreenCanvas === "undefined") return null;
   const contexts = scratchContexts(width, height);
@@ -376,6 +385,13 @@ export function renderForestInkCanvas(
   const { ink: ctx } = contexts;
   const { scaleX, scaleY, offsetX, offsetY } = geometry;
   ctx.setTransform(scaleX, 0, 0, scaleY, -offsetX, -offsetY);
+  if (cover) {
+    cover.save();
+    cover.setTransform(scaleX, 0, 0, scaleY, -offsetX, -offsetY);
+    cover.globalAlpha = 1;
+    cover.globalCompositeOperation = "source-over";
+    cover.fillStyle = "#000";
+  }
   const washAlpha = paint.washColor ? Math.max(0, Math.min(1, paint.washAlpha ?? 0)) : 0;
   // The wash goes on its own canvas under the ink. Each crown replaces the
   // wash under it with the opaque wash colour at the wash's interior
@@ -404,6 +420,10 @@ export function renderForestInkCanvas(
       tint.fillStyle = crownFill;
       if (bodies) tint.fill(bodies);
       else tint.fill();
+    }
+    if (cover) {
+      if (bodies) cover.fill(bodies);
+      else cover.fill();
     }
     ctx.globalCompositeOperation = "destination-out";
     if (bodies) ctx.fill(bodies);
@@ -479,9 +499,11 @@ export function renderForestInkCanvas(
     const line = markLine(mark, true);
     // The body (closed over the stroke's ends) hides what lies behind.
     if (tint) tint.beginPath();
+    if (cover) cover.beginPath();
     ctx.beginPath();
     traceLine(ctx, line, true);
     if (tint) traceLine(tint, line, true);
+    if (cover) traceLine(cover, line, true);
     clearBodies(null);
     // The fine pen inside stands skips often, the outline pen less, and the
     // bold front chain hardly at all.
@@ -489,6 +511,7 @@ export function renderForestInkCanvas(
     strokeCharcoal(ctx, mark, line, lineWidth, charcoal, breaks, geometry.markSize);
   }
   if (!detailed) flushBand();
+  cover?.restore();
   if (charcoal > 0) {
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
