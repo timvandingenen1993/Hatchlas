@@ -25,7 +25,7 @@ import {
   type MountainPatternOverlay,
 } from './mountainPatternRenderer';
 import { SimplexNoise } from '../core/noise';
-import { tintMountainLand, type TintRGB } from './mountainTerrainTint';
+import { isMountainTintBiome, mountainGrassAmount, tintMountainLand, type TintRGB } from './mountainTerrainTint';
 import { sampleCartographicGrain,sampleCartographicWashNoise, sampleCartographicPatchNoise, filterCartographicGradient, filterCartographicSignedGradient } from './cartographicWash';
 import {
   mountainProjectionLift,
@@ -1651,6 +1651,8 @@ function renderMountainIllustrationInternal(
   const washNoise = new SimplexNoise(options.seed + 1403);
   const patchNoise = new SimplexNoise(options.seed + 1801);
   const inkInterior = new Float32Array(width * height);
+  /** Share of each pixel's rock faded out for the tint's grass flats. */
+  const grassFade = new Float32Array(width * height);
   const dark = clamp01(options.washDarkStrength ?? 0.22);
   const lightStrength = clamp01(options.washLightStrength ?? 0.12);
   const rockStops = [
@@ -1756,7 +1758,16 @@ function renderMountainIllustrationInternal(
     const edgeAlpha = clamp01(
       distance / (6 * scale) + (patch - 0.5) * (0.12 + groundBreakup * 0.08),
     );
-    rgba[i * 4 + 3] = Math.round(filterCartographicGradient(rgba[i * 4 + 3] / 255 * edgeAlpha, grain) * 255);
+    // The tint's grass flats are vegetation ground: fade the rock there so
+    // the vegetation wash, flow lines and grass borders below show at full
+    // strength. Snow stays, and the ink passes below keep their own opacity.
+    const grassFlat = landGreen && isMountainTintBiome(dem.biomeType[i])
+      ? mountainGrassAmount(dem.slopeDeg[i], normalizedElevation[i], tpi?.[i] ?? 0) * (1 - snow)
+      : 0;
+    grassFade[i] = grassFlat;
+    rgba[i * 4 + 3] = Math.round(
+      filterCartographicGradient(rgba[i * 4 + 3] / 255 * edgeAlpha, grain) * (1 - grassFlat) * 255,
+    );
   }
   materialShadingStop?.();
 
@@ -2264,9 +2275,12 @@ function renderMountainIllustrationInternal(
   // Mountain ink is a topmost cartographic layer. The material footprint can
   // fade at the lower edge of the raised face, but that fade must not dilute
   // a ridge or hatch that was deliberately painted there.
+  // On grass flats the rock underneath is faded out, so there the ink's own
+  // coverage is its opacity; a solid pixel would leave a rock-coloured rim.
   for (let i = 0; i < lineworkClip.length; i++) {
-    if (Math.max(crestInk[i], verticalHatchInk[i], horizontalHatchInk[i], interiorRidgeInk[i]) > 0) {
-      rgba[i * 4 + 3] = 255;
+    const ink = Math.max(crestInk[i], verticalHatchInk[i], horizontalHatchInk[i], interiorRidgeInk[i]);
+    if (ink > 0) {
+      rgba[i * 4 + 3] = Math.max(rgba[i * 4 + 3], Math.round(255 + (ink - 255) * grassFade[i]));
     }
   }
   finalInkStop?.();

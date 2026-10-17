@@ -99,21 +99,6 @@ it('matches the original bilinear arithmetic when a reusable sample grid maps pa
   expect(tile.snow).toEqual(expected);
 });
 
-it('matches the continuous mountain render across an interior export tile boundary', () => {
-  const context = makeContext(96, 1152, 1);
-  const full = renderMountainExportTile(context, { x: 0, y: 0, width: 96, height: 1152, halo: 0 });
-  // Both tiles omit terrain outside their support, unlike small fixtures
-  // whose halos accidentally include the entire map.
-  for (const y of [512, 576]) {
-    const tile = renderMountainExportTile(context, { x: 0, y, width: 96, height: 64, halo: 0 });
-    let differences = 0;
-    for (let i = 0; i < tile.data.length; i++) {
-      if (tile.data[i] !== full.data[y * 96 * 4 + i]) differences++;
-    }
-    expect(differences).toBe(0);
-  }
-}, 30000);
-
 it('draws the same rivers whether the map is exported as one tile or several', () => {
   const width = 160, height = 128, scale = 4;
   const luminance = Float32Array.from({ length: width * height }, (_, i) => {

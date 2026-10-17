@@ -33,8 +33,12 @@ import {
   type MountainSnowTransportFields,
   type MountainWindFields,
 } from './mountainIllustrationRenderer';
-import { tintMountainLand } from './mountainTerrainTint';
-import { mountainCameraIllustrationTexture } from './mountainCameraLinework';
+import { isMountainTintBiome, tintMountainLand } from './mountainTerrainTint';
+import {
+  mountainCameraIllustrationInkAlpha,
+  mountainCameraIllustrationTexture,
+  mountainIllustrationInkAlpha,
+} from './mountainCameraLinework';
 import {
   normalizeMountainProjectionSettings,
   normalizeMountainLineworkSettings,
@@ -53,11 +57,13 @@ import {
   type FullTerrainCameraTextureSource,
   type FullTerrainCameraType,
 } from './fullTerrainCameraRenderer';
+import { sampleScalarField } from './cartographicStrokeRenderer';
 import type { MountainProfiler } from './mountainProfiler';
 import { rasterizeRoadLayer, roadPropClearanceAt, type RoadLayer } from './roadRenderer';
 import type { StructureRenderOptions } from '../structures/types';
 import type { MountainGpuRenderMode } from './mountainGpuRenderer';
 import { forestRenderSettingsSignature } from './forestCanvasRenderer';
+import { mixPaintChannel } from './forestInkRenderer';
 import {
   getMountainIllustrationFieldDependencySignature,
   isMountainIllustrationPreparedFieldsCompatible,
@@ -308,6 +314,13 @@ export interface MountainRenderOptions {
   mountainIllustrationRGBA?: Uint8ClampedArray;
   /** User roads, already routed, drawn on top of the composited map. */
   structures?: StructureRenderOptions;
+  /** Ink coverage (0..255) of `mountainIllustrationRGBA`; washes stay off it. */
+  mountainIllustrationInkAlpha?: Uint8Array;
+  /**
+   * The rock and snow of `mountainIllustrationRGBA` without its linework,
+   * shown under forest stand crowns.
+   */
+  mountainIllustrationMaterialRGBA?: Uint8ClampedArray;
   /** Local pixels an export tile keeps; offshore waves paint only near it. */
   waterPaintWindow?: WaterPaintWindow;
   /** Internal export crop: intermediate fields retain halos, final pixels do not. */
@@ -417,6 +430,8 @@ export type MountainDetailImageData = ImageData & {
   foregroundPropsRGBA?: Uint8ClampedArray;
   /** Camera mesh used for this frame, so editors can map clicks to the map. */
   cameraProjection?: FullTerrainCameraProjection;
+  /** 0..255 forest stand cover, where the camera's ridge ink gives way. */
+  standCover?: Uint8Array;
 };
 
 
@@ -503,6 +518,9 @@ export function vegetationGeometryStageKey(options: MountainRenderOptions): stri
     vegetation?.wetlandImagePropDrynessBias,
     // Dunes replace sand-desert flow lines, so toggling them changes seeding.
     vegetation?.desertDunes,
+    // Silt edges are inked as grass borders.
+    options.siltReachM,
+    options.siltTopRemoved,
     vegetationMotifAssetSignature(vegetation?.motifAssets),
     vegetationRasterPropAssetSignature(vegetation?.rasterPropAssets),
     // Biome colours only repaint, unless they change which biomes share a stand.
@@ -526,11 +544,18 @@ export function vegetationGeometryStageKey(options: MountainRenderOptions): stri
     // Forest stand placement lives in the geometry; its paint settings only
     // affect the overlay stage.
     vegetation?.forestSettings?.seed,
-    vegetation?.forestSettings?.standMarkSpacing,
-    vegetation?.forestSettings?.standEdgeTrees,
-    vegetation?.forestSettings?.standInteriorTrees,
-    vegetation?.forestSettings?.standMeadowTrees,
     vegetation?.forestSettings?.standAccentTrees,
+    vegetation?.forestSettings?.standJoin,
+    vegetation?.forestSettings?.biomeBlend,
+    vegetation?.forestSettings?.inkFillDensity,
+    vegetation?.forestSettings?.inkEdgeDensity,
+    vegetation?.forestSettings?.inkEdgeRows,
+    vegetation?.forestSettings?.inkEdgeDepth,
+    vegetation?.forestSettings?.inkMeadowTrees,
+    vegetation?.forestSettings?.inkGrass,
+    vegetation?.forestSettings?.inkLight,
+    // The debug view keeps each stand's plants and raw area in the geometry.
+    vegetation?.forestSettings?.showStandDebug,
   ]);
 }
 
@@ -705,6 +730,8 @@ function createForegroundPropRGBA(
   terrainShade?: Float32Array,
   roadLayer?: RoadLayer | null,
   roadShade?: Float32Array,
+  /** Painted water (0..255) per pixel: the stand's trees stay off it. */
+  standWaterCut?: Uint8Array,
 ): Uint8ClampedArray | undefined {
   const rasterPixels = overlay?.rasterPropRGBA;
   const charcoalAlpha = overlay?.rasterPropCharcoalAlpha;
@@ -712,8 +739,15 @@ function createForegroundPropRGBA(
   const total = width * height;
   const foreground = new Uint8ClampedArray(total * 4);
   if (rasterPixels) foreground.set(rasterPixels);
+  const standShare = overlay?.rasterPropStandShare;
+  if (rasterPixels && standShare && standWaterCut?.length === total) {
+    for (let index = 0; index < total; index++) {
+      const water = standWaterCut[index];
+      if (water === 0 || standShare[index] === 0) continue;
+      foreground[index * 4 + 3] *= 1 - (standShare[index] / 255) * (water / 255);
+    }
+  }
   if (rasterPixels && terrainShade) {
-    const standShare = overlay?.rasterPropStandShare;
     for (let index = 0; index < total; index++) {
       // Forest stands are lit per tree already; only the rest is shaded.
       const shade = 1 - (1 - terrainShade[index]) * (1 - (standShare?.[index] ?? 0) / 255);
@@ -2141,18 +2175,51 @@ export function renderMountainDetailDEMWithCache(
         preparedFieldSet,
       )
     : undefined;
+  const mountainCameraStyle = {
+    hatchColor: options.mountainHatchColor ?? options.vegetation?.inkColor,
+    hatchOpacity: mountainHatchOpacity,
+    horizontalHatchOpacity: mountainHatchHorizontalOpacity,
+    verticalHatchOpacity: mountainHatchVerticalOpacity,
+  };
+  const externalMountainIllustration =
+    options.mountainIllustrationRGBA?.length === totalCells * 4;
   const mountainIllustrationRGBA = control?.omitMountainIllustration
     ? undefined
-    : options.mountainIllustrationRGBA?.length === totalCells * 4
+    : externalMountainIllustration
       ? options.mountainIllustrationRGBA
       : mountainIllustration && shouldRenderFullTerrainIllustration
-        ? mountainCameraIllustrationTexture(mountainIllustration, {
-            hatchColor: options.mountainHatchColor ?? options.vegetation?.inkColor,
-            hatchOpacity: mountainHatchOpacity,
-            horizontalHatchOpacity: mountainHatchHorizontalOpacity,
-            verticalHatchOpacity: mountainHatchVerticalOpacity,
-        })
+        ? mountainCameraIllustrationTexture(mountainIllustration, mountainCameraStyle)
         : mountainIllustration?.rgba;
+  // Ink coverage of that texture: the biome transition re-tint below must
+  // not paint over hatches and ridges.
+  const mountainInkAlpha = !mountainIllustrationRGBA
+    ? undefined
+    : externalMountainIllustration
+      ? options.mountainIllustrationInkAlpha?.length === totalCells
+        ? options.mountainIllustrationInkAlpha
+        : undefined
+      : mountainIllustration && shouldRenderFullTerrainIllustration
+        ? mountainCameraIllustrationInkAlpha(mountainIllustration, mountainCameraStyle)
+        : mountainIllustration && mountainIllustrationInkAlpha(mountainIllustration);
+  // The illustration's rock and snow without linework, for the ground under
+  // forest stand crowns. Without it, the ink share is taken off its alpha.
+  const mountainMaterialRGBA = !mountainIllustrationRGBA
+    ? undefined
+    : externalMountainIllustration
+      ? options.mountainIllustrationMaterialRGBA?.length === totalCells * 4
+        ? options.mountainIllustrationMaterialRGBA
+        : undefined
+      : mountainIllustration?.materialRgba?.length === totalCells * 4
+        ? mountainIllustration.materialRgba
+        : undefined;
+  const standWash = vegetationOverlay?.rasterPropStandWash?.length === totalCells * 4
+    ? vegetationOverlay.rasterPropStandWash
+    : undefined;
+  // Painted water per pixel, for the camera's foreground stand trees.
+  const standWaterCut = options.fullTerrainCameraElevationDeg !== undefined
+    && vegetationOverlay?.rasterPropStandShare?.length === totalCells
+    ? new Uint8Array(totalCells)
+    : undefined;
   const vegetationTransitionWashRGB =
     layer === 'vegetation_patterns' && mountainIllustrationRGBA
       ? new Uint8ClampedArray(totalCells * 3)
@@ -2484,7 +2551,7 @@ export function renderMountainDetailDEMWithCache(
         // tinting the flow field by a barely perceptible amount.
         const washShade = 0.55 + 0.45 * effectiveShade;
         const biomeId = dem.biomeType[i];
-        const tinted = biomeId >= 1 && biomeId <= 5 || biomeId === 20
+        const tinted = isMountainTintBiome(biomeId)
           ? tintMountainLand(washColor, {
             slopeDeg: dem.slopeDeg[i],
             normElev,
@@ -2671,10 +2738,14 @@ export function renderMountainDetailDEMWithCache(
       ? waterOverlay.waterAlpha[i] > 0 || wetlandPriorityAlpha > 0
       : isOriginalWater;
 
+    // Painted water at this pixel: forest stands stay off it.
+    let paintedWater = 0;
     if (hasWaterWash && (!isPureHeightmapLayer || options.showHeightmapWater) && layer !== 'slope' && layer !== 'aspect' && layer !== 'wave_patterns') {
       const waterAlpha = waterOverlay
         ? Math.max(waterOverlay.waterAlpha[i], wetlandPriorityAlpha) / 255
         : 1.0;
+      paintedWater = waterAlpha;
+      if (standWaterCut) standWaterCut[i] = Math.round(waterAlpha * 255);
       const toneValue = waterOverlay?.waterTone?.[i] ?? 128;
       const toneNorm = toneValue / 255;
       const [baseWaterR, baseWaterG, baseWaterB] = getWaterWashRGB(
@@ -2818,6 +2889,15 @@ export function renderMountainDetailDEMWithCache(
       g = Math.round(g * (1 - effectiveRainAlpha) + rainG * effectiveRainAlpha);
       b = Math.round(b * (1 - effectiveRainAlpha) + rainB * effectiveRainAlpha);
     }
+
+    // The ground's colours and washes before any linework, shown under
+    // forest stands (see rasterPropStandCover).
+    // Stand areas are cut back from the water cells, but rivers are painted
+    // wider than those on a regional map: keep stands off painted water too.
+    const standCover = (vegetationOverlay?.rasterPropStandCover?.[i] ?? 0) / 255 * (1 - paintedWater);
+    let groundR = r;
+    let groundG = g;
+    let groundB = b;
 
     // Contour Lines Generator
     if (!hasWaterWash && showContours && contourOpacity > 0) {
@@ -2994,21 +3074,54 @@ export function renderMountainDetailDEMWithCache(
 
     // Mountain faces sit above the vegetation wash. Reintroduce a restrained
     // portion of the noisy biome transition over those faces so the regional
-    // color boundary remains legible without flattening their relief.
+    // color boundary remains legible without flattening their relief. Only
+    // the material share is re-tinted: mountain ink stays on top of washes.
+    const mountainMaterialAlpha = Math.max(0,
+      mountainIllustrationAlpha - (mountainInkAlpha?.[i] ?? 0) / 255);
+    if (standCover > 0 && mountainMaterialRGBA) {
+      const materialAlpha = mountainMaterialRGBA[idx4 + 3] / 255;
+      if (materialAlpha > 0) {
+        groundR = blendContourColor(groundR, mountainMaterialRGBA[idx4], materialAlpha);
+        groundG = blendContourColor(groundG, mountainMaterialRGBA[idx4 + 1], materialAlpha);
+        groundB = blendContourColor(groundB, mountainMaterialRGBA[idx4 + 2], materialAlpha);
+      }
+    } else if (standCover > 0 && mountainMaterialAlpha > 0) {
+      groundR = blendContourColor(groundR, mountainIllustrationRGBA![idx4], mountainMaterialAlpha);
+      groundG = blendContourColor(groundG, mountainIllustrationRGBA![idx4 + 1], mountainMaterialAlpha);
+      groundB = blendContourColor(groundB, mountainIllustrationRGBA![idx4 + 2], mountainMaterialAlpha);
+    }
     if (
-      mountainIllustrationAlpha > 0 &&
+      mountainMaterialAlpha > 0 &&
       vegetationTransitionWashRGB &&
       vegetationTransitionStrength
     ) {
       const transitionAlpha =
         (vegetationTransitionStrength[i] / 255) *
-        mountainIllustrationAlpha * Math.min(1, 0.72 * vegetationBiomeTransitionStrength);
+        mountainMaterialAlpha * Math.min(1, 0.72 * vegetationBiomeTransitionStrength);
       if (transitionAlpha > 0) {
         const washOffset = i * 3;
         r = blendContourColor(r, vegetationTransitionWashRGB[washOffset], transitionAlpha);
         g = blendContourColor(g, vegetationTransitionWashRGB[washOffset + 1], transitionAlpha);
         b = blendContourColor(b, vegetationTransitionWashRGB[washOffset + 2], transitionAlpha);
+        groundR = blendContourColor(groundR, vegetationTransitionWashRGB[washOffset], transitionAlpha);
+        groundG = blendContourColor(groundG, vegetationTransitionWashRGB[washOffset + 1], transitionAlpha);
+        groundB = blendContourColor(groundB, vegetationTransitionWashRGB[washOffset + 2], transitionAlpha);
       }
+    }
+
+    // Forest stands hide the linework beneath them, across their whole area.
+    if (standCover > 0) {
+      r = blendContourColor(r, groundR, standCover);
+      g = blendContourColor(g, groundG, standCover);
+      b = blendContourColor(b, groundB, standCover);
+    }
+    // The stand wash mixes its tree colour into the washed ground beneath
+    // as paint mixes, from the ground at 0 to the tree colour at 1.
+    const standWashAmount = (standWash?.[idx4 + 3] ?? 0) / 255 * (1 - paintedWater);
+    if (standWashAmount > 0) {
+      r = mixPaintChannel(r, standWash![idx4], standWashAmount);
+      g = mixPaintChannel(g, standWash![idx4 + 1], standWashAmount);
+      b = mixPaintChannel(b, standWash![idx4 + 2], standWashAmount);
     }
 
     // This preview-only diagnostic colors the placement suitability score
@@ -3055,12 +3168,14 @@ export function renderMountainDetailDEMWithCache(
     }
 
     const rasterPropPixelIndex = i * 4;
+    const standShare = (vegetationOverlay?.rasterPropStandShare?.[i] ?? 0) / 255;
+    // The stand's trees stay off painted water; other props keep their place.
     const rasterPropAlpha =
-      (vegetationOverlay?.rasterPropRGBA?.[rasterPropPixelIndex + 3] ?? 0) / 255 * roadPropKeep;
+      (vegetationOverlay?.rasterPropRGBA?.[rasterPropPixelIndex + 3] ?? 0) / 255 * roadPropKeep
+      * (1 - standShare * paintedWater);
     if (rasterPropAlpha > 0) {
       const rasterPropPixels = vegetationOverlay!.rasterPropRGBA!;
       // Forest stands are lit per tree already; only the rest is shaded.
-      const standShare = (vegetationOverlay?.rasterPropStandShare?.[i] ?? 0) / 255;
       const propShade = 1 - (1 - (propTerrainShade?.[i] ?? 1)) * (1 - standShare);
       r = blendContourColor(
         r,
@@ -3145,11 +3260,17 @@ export function renderMountainDetailDEMWithCache(
     ? new ImageData(pixels, width, height)
     : { width, height, data: pixels } as unknown as ImageData;
   const foregroundPropsRGBA = options.fullTerrainCameraElevationDeg !== undefined
-    ? createForegroundPropRGBA(vegetationOverlay, width, height, propOutlineColor, propTerrainShade, roadLayer, roadShade)
+    ? createForegroundPropRGBA(vegetationOverlay, width, height, propOutlineColor, propTerrainShade, roadLayer, roadShade, standWaterCut)
     : undefined;
   if (foregroundPropsRGBA) {
     (image as MountainDetailImageData).foregroundPropsRGBA = foregroundPropsRGBA;
   }
+  const overlayStandCover = vegetationOverlay?.rasterPropStandCover;
+  const standCover = options.fullTerrainCameraElevationDeg !== undefined
+    && overlayStandCover?.length === totalCells
+    ? overlayStandCover
+    : undefined;
+  if (standCover) (image as MountainDetailImageData).standCover = standCover;
   if (options.fullTerrainCameraElevationDeg === undefined || options.deferFullTerrainCamera) {
     detailStop?.();
     return image as MountainDetailImageData;
@@ -3189,6 +3310,9 @@ export function renderMountainDetailDEMWithCache(
     // Pattern path widths already contain the user's ridge thickness.
     ridgeThicknessScale: 0.75,
     charcoalRidges: true,
+    ridgeCover: standCover
+      ? (x, y) => sampleScalarField(standCover, width, height, x, y) / 255
+      : undefined,
     cameraType: options.fullTerrainCameraType ?? 'orthographic',
     elevationDeg: options.fullTerrainCameraElevationDeg,
     fieldOfViewDeg: 35,

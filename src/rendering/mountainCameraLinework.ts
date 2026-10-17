@@ -54,8 +54,14 @@ export function paintMountainCameraSegment(
   }
 }
 
+interface MountainCameraIllustrationOutput {
+  rgba: Uint8ClampedArray;
+  /** 0..255 ink coverage the texture painted over its material. */
+  inkAlpha: Uint8Array;
+}
+
 const textures = new WeakMap<MountainIllustration | MountainCameraIllustrationLayers,
-  Map<string, Uint8ClampedArray>>();
+  Map<string, MountainCameraIllustrationOutput>>();
 
 function clamp01(value: number): number {
   return Math.max(0, Math.min(1, Number.isFinite(value) ? value : 1));
@@ -92,6 +98,32 @@ export function mountainCameraIllustrationTexture(
   illustration: MountainIllustration | MountainCameraIllustrationLayers,
   style: MountainCameraIllustrationStyle = {},
 ): Uint8ClampedArray {
+  return buildMountainCameraIllustration(illustration, style).rgba;
+}
+
+/** Ink coverage (0..255) of the matching camera texture: the hatches and
+ * interior ribs it painted. The compositor keeps washes off these pixels. */
+export function mountainCameraIllustrationInkAlpha(
+  illustration: MountainIllustration | MountainCameraIllustrationLayers,
+  style: MountainCameraIllustrationStyle = {},
+): Uint8Array {
+  return buildMountainCameraIllustration(illustration, style).inkAlpha;
+}
+
+/** Ink coverage (0..255) of a full illustration's `rgba`: crests, hatches
+ * and interior ribs. */
+export function mountainIllustrationInkAlpha(illustration: MountainIllustration): Uint8Array {
+  const ink = new Uint8Array(illustration.silhouetteAlpha.length);
+  for (let i = 0; i < ink.length; i++) {
+    ink[i] = Math.max(illustration.silhouetteAlpha[i], illustration.charcoalAlpha[i]);
+  }
+  return ink;
+}
+
+function buildMountainCameraIllustration(
+  illustration: MountainIllustration | MountainCameraIllustrationLayers,
+  style: MountainCameraIllustrationStyle,
+): MountainCameraIllustrationOutput {
   const hatchColor = resolveHatchColor(style.hatchColor);
   const legacyHatchOpacity = clamp01(style.hatchOpacity ?? 1);
   // Illustration alpha buffers already include the controls used while the
@@ -114,7 +146,7 @@ export function mountainCameraIllustrationTexture(
   const cacheKey = `${hatchColor.join(',')}:${requestedHorizontalOpacity}:${requestedVerticalOpacity}:${legacyHatchOpacity}`;
   let styleCache = textures.get(illustration);
   if (!styleCache) {
-    styleCache = new Map<string, Uint8ClampedArray>();
+    styleCache = new Map<string, MountainCameraIllustrationOutput>();
     textures.set(illustration, styleCache);
   }
   const cached = styleCache.get(cacheKey);
@@ -125,6 +157,7 @@ export function mountainCameraIllustrationTexture(
   // painted a second hard-coded ink pass over it, which made the camera look
   // grey even when the studio palette and opacity controls changed.
   const output = illustration.materialRgba.slice();
+  const inkAlpha = new Uint8Array(output.length / 4);
   for (let i = 0; i < output.length / 4; i++) {
     const offset = i * 4;
     if (illustration.silhouetteAlpha[i] / 255 > 0.08) {
@@ -153,7 +186,9 @@ export function mountainCameraIllustrationTexture(
         + hatchColor[c] * alpha) / Math.max(1e-6, combinedAlpha));
     }
     output[offset + 3] = Math.round(combinedAlpha * 255);
+    inkAlpha[i] = Math.round(alpha * 255);
   }
-  styleCache.set(cacheKey, output);
-  return output;
+  const built = { rgba: output, inkAlpha };
+  styleCache.set(cacheKey, built);
+  return built;
 }

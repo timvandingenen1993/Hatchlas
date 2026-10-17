@@ -36,8 +36,6 @@ import {
 import {
   VEGETATION_MOTIF_DEFINITIONS,
   VEGETATION_RASTER_PROP_DEFINITIONS,
-  ALPINE_TREE_75_ASSET_URLS,
-  WETLAND_VEGETATION_PROP_DEFINITIONS,
   loadVegetationMotifAssets,
   loadMountainDetailPropAssets,
 } from "../rendering/vegetationMotifs";
@@ -192,6 +190,15 @@ const MOUNTAIN_PROFILE_QUERY =
 // enabled run; `2` is therefore an alias for enabling the same profiler.
 const MOUNTAIN_PROFILE_ENABLED =
   MOUNTAIN_PROFILE_QUERY === "1" || MOUNTAIN_PROFILE_QUERY === "2";
+// Export tile helpers size their memory from the reported RAM; `?exportMemoryGb=`
+// overrides that when the browser under-reports (or to test a tighter budget).
+const EXPORT_HELPER_MEMORY_GB: number | undefined =
+  typeof window !== "undefined"
+    ? (() => {
+        const value = Number(new URLSearchParams(window.location.search).get("exportMemoryGb"));
+        return Number.isFinite(value) && value > 0 ? value : undefined;
+      })()
+    : undefined;
 // Use the fast GPU path by default; URL options can still select CPU or approximate rendering.
 const MOUNTAIN_GPU_RENDER_MODE: MountainRenderOptions["gpuRenderMode"] =
   typeof window !== "undefined"
@@ -743,6 +750,7 @@ export function MountainDetailStudio({
   const [vegetationShowFlowGuides, setVegetationShowFlowGuides] = useState<boolean>(false);
   const [vegetationShowWetlandDrynessOverlay, setVegetationShowWetlandDrynessOverlay] = useState<boolean>(false);
   const [vegetationShowAlpineTreeSuitability, setVegetationShowAlpineTreeSuitability] = useState<boolean>(false);
+  const [vegetationShowStandDiagnostics, setVegetationShowStandDiagnostics] = useState<boolean>(false);
   const [vegetationMotifShadowStrength, setVegetationMotifShadowStrength] = useState<number>(0.2);
   const [vegetationMotifShadowDistance, setVegetationMotifShadowDistance] = useState<number>(2.2);
   const [vegetationMotifShadowSoftness, setVegetationMotifShadowSoftness] = useState<number>(1.1);
@@ -2577,6 +2585,7 @@ export function MountainDetailStudio({
         seed: vegetationSeed,
         sunAzimuthDeg,
         outlineColor: forestOutlineColor,
+        showStandDebug: vegetationShowStandDiagnostics,
       },
         inkColor: vegetationInkColor,
         aridInkColor: vegetationAridInkColor,
@@ -2912,6 +2921,7 @@ export function MountainDetailStudio({
     vegetationShowFlowGuides,
     vegetationShowWetlandDrynessOverlay,
     vegetationShowAlpineTreeSuitability,
+    vegetationShowStandDiagnostics,
     vegetationMotifShadowStrength,
     vegetationMotifShadowDistance,
     vegetationMotifShadowSoftness,
@@ -3577,6 +3587,8 @@ export function MountainDetailStudio({
              seed: vegetationSeed,
              sunAzimuthDeg,
              outlineColor: forestOutlineColor,
+             // Like the other Ink diagnostics, the stand view is preview-only.
+             showStandDebug: false,
            },
           inkColor: vegetationInkColor,
         aridInkColor: vegetationAridInkColor,
@@ -3612,6 +3624,7 @@ export function MountainDetailStudio({
       townStamps: activeLayer === "raw_heightmap" || activeLayer === "eroded_heightmap"
         ? undefined
         : await structuresEditor.buildTownStamps(Math.max(outputSize.width, outputSize.height)),
+      helperMemoryGb: EXPORT_HELPER_MEMORY_GB,
       filename: `mountain_detail_${activeLayer}_${activePalette}_${outputSize.width}x${outputSize.height}.png`,
       ...(regionPixels && {
         ...regionPixels,
@@ -4490,17 +4503,10 @@ export function MountainDetailStudio({
               onTreeScaleChange={setVegetationRasterPropScale}
               standSize={vegetationRasterPropStandSize}
               onStandSizeChange={setVegetationRasterPropStandSize}
-              sourceZoom={forestSourceZoom}
-              onSourceZoomChange={setForestSourceZoom}
-              sourceUrls={[
-                ...ALPINE_TREE_75_ASSET_URLS,
-                ...WETLAND_VEGETATION_PROP_DEFINITIONS.map((definition) => definition.url),
-              ]}
             />
             <InspectorFold title="Colors">
-              <InspectorColor label="Wood" value={forestSettings.wetlandWoodColor}
-                onChange={(color) => setForestSettings((previous) => ({ ...previous, wetlandWoodColor: color }))} />
-              <InspectorColor label="Outline" value={forestOutlineColor} onChange={setForestOutlineColor} />
+              <InspectorColor label="Outline" value={forestOutlineColor} onChange={setForestOutlineColor}
+                title="Ink colour of the stands, lone trees and grass, and of the other props' outlines." />
             </InspectorFold>
           </InspectorSection>
 
@@ -4543,6 +4549,8 @@ export function MountainDetailStudio({
             <InspectorToggle label="Flow lines" checked={vegetationShowFlowGuides} onChange={setVegetationShowFlowGuides} />
             <InspectorToggle label="Wetland dryness" checked={vegetationShowWetlandDrynessOverlay} onChange={setVegetationShowWetlandDrynessOverlay} />
             <InspectorToggle label="Tree suitability" checked={vegetationShowAlpineTreeSuitability} onChange={setVegetationShowAlpineTreeSuitability} />
+            <InspectorToggle label="Forest stands" checked={vegetationShowStandDiagnostics} onChange={setVegetationShowStandDiagnostics}
+              title="Shows how stands form, in black and white: light grey is the area the placed plants form, darker grey what is left after rounding (the drawn stand), black dots plants in a stand, hollow circles lone plants. One line per stand sums it up." />
             {vegetationShowAlpineTreeSuitability && <div>
               <div aria-hidden="true" className="h-1.5 rounded" style={{ background: "linear-gradient(90deg, #a50026 0%, #f46d43 25%, #fee08b 50%, #a6d96a 75%, #1a9850 100%)" }} />
               <div className="mt-0.5 flex justify-between text-[10px] text-slate-500"><span>Less suitable</span><span>More suitable</span></div>

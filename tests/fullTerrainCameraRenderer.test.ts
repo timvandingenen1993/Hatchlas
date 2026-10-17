@@ -198,6 +198,58 @@ describe('full terrain orthographic camera', () => {
     expect(plan.finish(source).data).toEqual(projected.data);
   });
 
+  it('hides the camera ridge ink under forest stand cover', () => {
+    const dem = makeDem(12, 8);
+    const source = sourceImage(46, 64);
+    const settings = {
+      cameraType: 'orthographic' as const,
+      elevationDeg: 65,
+      heightExaggeration: 1,
+      outputWidth: source.width,
+      outputHeight: source.height,
+      ridgeColor: '#2b3842',
+      ridgeThicknessScale: 0.75,
+      charcoalRidges: true,
+    };
+    const ridgePaths = [{
+      kind: 'ridge' as const,
+      key: 17,
+      width: 1.4,
+      opacity: 0.8,
+      primary: true,
+      points: [{ x: 0, y: 0 }, { x: 5, y: 2.5 }, { x: 11, y: 7 }],
+    }];
+    const bare = renderFullTerrainCamera(dem, source, settings);
+    const inked = renderFullTerrainCamera(dem, source, { ...settings, ridgePaths });
+    expect(inked.data).not.toEqual(bare.data);
+
+    const covered = renderFullTerrainCamera(dem, source, { ...settings, ridgePaths, ridgeCover: () => 1 });
+    expect(covered.data).toEqual(bare.data);
+    const open = renderFullTerrainCamera(dem, source, { ...settings, ridgePaths, ridgeCover: () => 0 });
+    expect(open.data).toEqual(inked.data);
+
+    // Cover over the texture's left half only: the ridge stays on the right.
+    const half = (x: number) => (x < source.width / 2 ? 1 : 0);
+    const projection = prepareFullTerrainCameraProjection(dem, settings);
+    const plan = prepareFullTerrainCameraBand(dem, 0, source.height, {
+      ...settings, ridgePaths, projection, ridgeCover: half,
+    });
+    const halfCovered = plan.finish(source);
+    let inkedLeft = 0;
+    let inkedRight = 0;
+    for (let index = 0; index < plan.sampleMask.length; index++) {
+      if (!plan.sampleMask[index]) continue;
+      const offset = index * 4;
+      if (halfCovered.data[offset] === bare.data[offset]
+        && halfCovered.data[offset + 1] === bare.data[offset + 1]
+        && halfCovered.data[offset + 2] === bare.data[offset + 2]) continue;
+      if (plan.sourceX[index] < source.width / 2) inkedLeft++;
+      else inkedRight++;
+    }
+    expect(inkedLeft).toBe(0);
+    expect(inkedRight).toBeGreaterThan(0);
+  });
+
   it('finishes prepared orthographic and perspective bands from only the visible texture tiles', () => {
     const dem = makeDem(24, 24);
     const source = sourceImage(64, 128);
@@ -333,6 +385,51 @@ describe('full terrain orthographic camera', () => {
     expect(regions[0].rowStart).toBe(0);
     expect(regions.at(-1)?.rowEnd).toBe(source.height);
     expect(assembled).toEqual(direct.data);
+  });
+
+  it('sizes camera band working sets by the bytes the texture cache holds per pixel', async () => {
+    const dem = makeDem(24, 24);
+    const source = sourceImage(256, 128);
+    const tileSize = 16;
+    const budget = 80 * 1024;
+    const settings = {
+      cameraType: 'orthographic' as const,
+      elevationDeg: 58,
+      heightExaggeration: 1,
+      outputWidth: source.width,
+      outputHeight: source.height,
+      projection: undefined as ReturnType<typeof prepareFullTerrainCameraProjection> | undefined,
+    };
+    settings.projection = prepareFullTerrainCameraProjection(dem, settings);
+    const run = async (bytesPerPixel: number) => {
+      const regions: Array<{ keys: readonly string[]; workingSetBytes: number }> = [];
+      const count = await processFullTerrainCameraBandWithinTextureBudget(
+        dem,
+        0,
+        source.height,
+        settings,
+        tileSize,
+        budget,
+        async (_plan, tileKeys, workingSetBytes) => {
+          regions.push({ keys: tileKeys, workingSetBytes });
+        },
+        undefined,
+        bytesPerPixel,
+      );
+      return { count, regions };
+    };
+    const rgba = await run(4);
+    const withForeground = await run(8);
+    // A cache that also holds a foreground layer per tile needs smaller regions.
+    expect(withForeground.count).toBeGreaterThan(rgba.count);
+    for (const region of withForeground.regions) {
+      const cached = region.keys.reduce((bytes, key) => {
+        const [x, y] = key.split(',').map(Number);
+        return bytes + Math.min(tileSize, source.width - x) * Math.min(tileSize, source.height - y) * 8;
+      }, 0);
+      expect(region.workingSetBytes).toBe(cached);
+      expect(cached).toBeLessThanOrEqual(budget);
+    }
   });
 
   it('reprojects the complete raster with finite pixels and preserves the source', () => {

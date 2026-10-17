@@ -45,7 +45,12 @@ import {
   mountainProjectionSupportPixels,
   normalizeMountainSnowfallSettings,
 } from "./mountainProjection";
-import { mountainCameraIllustrationTexture } from './mountainCameraLinework';
+import {
+  mountainCameraIllustrationInkAlpha,
+  mountainCameraIllustrationTexture,
+  mountainIllustrationInkAlpha,
+  type MountainCameraIllustrationStyle,
+} from './mountainCameraLinework';
 import {
   createMountainPathSpatialIndex,
   queryMountainPathSpatialIndex,
@@ -199,7 +204,12 @@ export function getMountainExportTileDimensions(
       + Math.ceil(2 * Math.max(1, context.render.waterOutlineThickness ?? 1) * waterScale)
       + 4
     : 0;
-  const mountainHalo = Math.max(detailHalo, mountainSupport);
+  // Illustrated tiles composite on a smaller frame than the ocean-wave reach;
+  // the wave frame then gets its own water-only terrain (see
+  // planMountainExportTileSampling), so the full terrain arrays only need to
+  // cover the compositor and the illustration.
+  const separateWaveFrame = illustrated && compositeHalo < detailHalo;
+  const mountainHalo = Math.max(separateWaveFrame ? compositeHalo : detailHalo, mountainSupport);
   const x = illustrated ? Math.max(0, tile.x - mountainHalo) : tile.x - mountainHalo;
   const y = illustrated ? Math.max(0, tile.y - mountainHalo) : tile.y - mountainHalo;
   const width = illustrated
@@ -389,14 +399,23 @@ function getMaximumForestRadius(context: MountainExportGlobalContext): number {
   return maximumRadius;
 }
 
+/**
+ * The global mountain drawing for an export. It needs only the DEM and render
+ * options, so the export can build it while vegetation is still being placed
+ * and hand it to the context as `mountainPattern`.
+ */
+export function buildMountainExportPattern(
+  dem: MountainDEMData,
+  render: MountainRenderOptions,
+  profiler?: MountainProfiler,
+): MountainPatternOverlay {
+  return renderMountainPatternOverlay(dem, getMountainPatternOptions(dem, render), profiler);
+}
+
 function ensureMountainExportPattern(context: MountainExportGlobalContext): MountainPatternOverlay {
   let pattern = context.mountainPattern;
   if (!pattern) {
-    pattern = renderMountainPatternOverlay(
-      context.dem,
-      getMountainPatternOptions(context.dem, context.render),
-      context.profiler,
-    );
+    pattern = buildMountainExportPattern(context.dem, context.render, context.profiler);
     context.mountainPattern = pattern;
   }
   return pattern;
@@ -573,6 +592,37 @@ function createMappedRiverSplines(
   return mapped;
 }
 
+/** `deriveLocalTerrain`'s slope alone, with identical arithmetic, for water-only terrain. */
+function deriveLocalSlope(
+  elevation: Float32Array,
+  width: number,
+  height: number,
+  dxMeters: number,
+  dyMeters: number,
+): Float32Array {
+  const slopeDeg = new Float32Array(elevation.length);
+  for (let y = 0; y < height; y++) {
+    const yPrev = Math.max(0, y - 1);
+    const yNext = Math.min(height - 1, y + 1);
+    for (let x = 0; x < width; x++) {
+      const xPrev = Math.max(0, x - 1);
+      const xNext = Math.min(width - 1, x + 1);
+      const zNW = elevation[yPrev * width + xPrev];
+      const zN = elevation[yPrev * width + x];
+      const zNE = elevation[yPrev * width + xNext];
+      const zW = elevation[y * width + xPrev];
+      const zE = elevation[y * width + xNext];
+      const zSW = elevation[yNext * width + xPrev];
+      const zS = elevation[yNext * width + x];
+      const zSE = elevation[yNext * width + xNext];
+      const dzdx = (zNE + 2 * zE + zSE - zNW - 2 * zW - zSW) / (8 * dxMeters);
+      const dzdy = (zSW + 2 * zS + zSE - zNW - 2 * zN - zNE) / (8 * dyMeters);
+      slopeDeg[y * width + x] = Math.atan(Math.sqrt(dzdx * dzdx + dzdy * dzdy)) * (180 / Math.PI);
+    }
+  }
+  return slopeDeg;
+}
+
 function deriveLocalTerrain(
   elevation: Float32Array,
   width: number,
@@ -746,8 +796,9 @@ function cropWaterOverlay(
 
 /** Copy the illustration into the detail frame; pixels it doesn't cover stay
  * transparent (they lie in the halo, which is cropped after compositing). */
-function placeMountainIllustrationRGBA(
-  rgba: Uint8ClampedArray,
+function placeMountainIllustrationPixels<T extends Uint8Array | Uint8ClampedArray>(
+  pixels: T,
+  channels: number,
   sourceX: number,
   sourceY: number,
   sourceWidth: number,
@@ -756,42 +807,21 @@ function placeMountainIllustrationRGBA(
   targetY: number,
   targetWidth: number,
   targetHeight: number,
-): Uint8ClampedArray {
-  const result = new Uint8ClampedArray(targetWidth * targetHeight * 4);
+): T {
+  const result = new (pixels.constructor as new (length: number) => T)(
+    targetWidth * targetHeight * channels,
+  );
   const x0 = Math.max(sourceX, targetX);
   const x1 = Math.min(sourceX + sourceWidth, targetX + targetWidth);
   if (x1 <= x0) return result;
   for (let y = Math.max(sourceY, targetY); y < Math.min(sourceY + sourceHeight, targetY + targetHeight); y++) {
-    const sourceOffset = ((y - sourceY) * sourceWidth + (x0 - sourceX)) * 4;
+    const sourceOffset = ((y - sourceY) * sourceWidth + (x0 - sourceX)) * channels;
     result.set(
-      rgba.subarray(sourceOffset, sourceOffset + (x1 - x0) * 4),
-      ((y - targetY) * targetWidth + (x0 - targetX)) * 4,
+      pixels.subarray(sourceOffset, sourceOffset + (x1 - x0) * channels),
+      ((y - targetY) * targetWidth + (x0 - targetX)) * channels,
     );
   }
   return result;
-}
-
-function mapFloatFieldToTile(
-  field: Float32Array,
-  globalWidth: number,
-  globalHeight: number,
-  outputWidth: number,
-  outputHeight: number,
-  tileX: number,
-  tileY: number,
-  width: number,
-  height: number,
-  samplePlan = createTileSamplePlan(
-    tileX, tileY, width, height, outputWidth, outputHeight, globalWidth, globalHeight,
-  ),
-): Float32Array {
-  const mapped = new Float32Array(width * height);
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      mapped[y * width + x] = samplePlannedBilinear(field, globalWidth, samplePlan, x, y);
-    }
-  }
-  return mapped;
 }
 
 /** Hooks the render half of a tile reports through. */
@@ -804,6 +834,16 @@ export interface MountainExportTileHooks {
 export interface PreparedDetailFrame {
   waterOnly: boolean;
   frame: { x: number; y: number; width: number; height: number; offsetX: number; offsetY: number };
+  /**
+   * Water-only frames wider than the tile terrain: just the fields the water
+   * overlay reads, sampled over the whole frame, with its ocean overrides.
+   */
+  water?: {
+    dem: MountainDEMData;
+    oceanMaskCoverage: Float32Array;
+    openOceanMask?: Float32Array;
+    oceanDistanceToCoast?: Float32Array;
+  };
   vegetationWaterDistance?: Float32Array;
   riverSplines: ReturnType<typeof createMappedRiverSplines>;
   vegetationGeometry?: ReturnType<typeof mapVegetationGeometryToTile>;
@@ -837,15 +877,174 @@ export interface PreparedMountainExportTile {
   };
 }
 
-/**
- * First half of rendering a tile: samples the global export context into
- * tile-sized terrain, vector and pattern inputs.
- */
-export function prepareMountainExportTile(
+/** One global raster resampled onto an output-space rectangle of a tile. */
+export interface ExportFieldSampleRequest {
+  source: ArrayLike<number>;
+  sourceWidth: number;
+  sourceHeight: number;
+  /** Output-pixel rectangle the samples cover. */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** Nearest-cell lookup for categorical fields; bilinear otherwise. */
+  nearest?: boolean;
+  /** Multiplies bilinear samples (e.g. distances into output pixels). */
+  scale?: number;
+  /**
+   * Keep full precision on the CPU: these samples feed thresholds and sums,
+   * so storing them as float32 first would change the tile.
+   */
+  precise?: boolean;
+  output?: "f32" | "u8" | "i8";
+}
+
+export type ExportFieldSample = Float32Array | Float64Array | Uint8Array | Int8Array;
+
+/** Samples tile requests, on the CPU or on the GPU; results follow request order. */
+export type ExportFieldSampler = (
+  requests: readonly ExportFieldSampleRequest[],
+  outputWidth: number,
+  outputHeight: number,
+) => Promise<ExportFieldSample[]>;
+
+/** The output-to-source sample positions of one axis, shared with the GPU sampler. */
+export function createExportAxisSamplePlan(
+  start: number,
+  length: number,
+  outputSize: number,
+  sourceSize: number,
+): AxisSamplePlan {
+  return createAxisSamplePlan(start, length, outputSize, sourceSize);
+}
+
+/** Reference sampler: the same plan and arithmetic tile preparation always used. */
+export function sampleExportFieldsCpu(
+  requests: readonly ExportFieldSampleRequest[],
+  outputWidth: number,
+  outputHeight: number,
+): ExportFieldSample[] {
+  const plans = new Map<string, TileSamplePlan>();
+  return requests.map((request) => {
+    const planKey = `${request.x},${request.y},${request.width},${request.height},${request.sourceWidth},${request.sourceHeight}`;
+    let plan = plans.get(planKey);
+    if (!plan) {
+      plan = createTileSamplePlan(
+        request.x, request.y, request.width, request.height,
+        outputWidth, outputHeight, request.sourceWidth, request.sourceHeight,
+      );
+      plans.set(planKey, plan);
+    }
+    const total = request.width * request.height;
+    const output = request.precise
+      ? new Float64Array(total)
+      : request.output === "u8"
+        ? new Uint8Array(total)
+        : request.output === "i8"
+          ? new Int8Array(total)
+          : new Float32Array(total);
+    const scale = request.scale ?? 1;
+    for (let y = 0; y < request.height; y++) {
+      for (let x = 0; x < request.width; x++) {
+        output[y * request.width + x] = request.nearest
+          ? samplePlannedNearest(request.source, request.sourceWidth, plan, x, y)
+          : samplePlannedBilinear(request.source, request.sourceWidth, plan, x, y) * scale;
+      }
+    }
+    return output;
+  });
+}
+
+/** Fallback rasters for optional river fields, one per global DEM so GPU uploads are reused. */
+const exportZeroFields = new WeakMap<MountainDEMData, { u8: Uint8Array; f32: Float32Array }>();
+
+function zeroFieldsFor(dem: MountainDEMData): { u8: Uint8Array; f32: Float32Array } {
+  let fields = exportZeroFields.get(dem);
+  if (!fields) {
+    fields = {
+      u8: new Uint8Array(dem.elevation.length),
+      f32: new Float32Array(dem.elevation.length),
+    };
+    exportZeroFields.set(dem, fields);
+  }
+  return fields;
+}
+
+type SampleRect = { x: number; y: number; width: number; height: number };
+
+/** Every global field a tile samples, with the request index of each. */
+interface MountainExportTileSamplingPlan {
+  dimensions: MountainExportTileDimensions;
+  requests: ExportFieldSampleRequest[];
+  terrain: {
+    oceanCoverage: number;
+    openOcean?: number;
+    oceanDistance?: number;
+    sourceNorm: number;
+    erosion: number;
+    globalElevation: number;
+    float: Record<
+      "precipitationMmYr" | "rainfallWeightedAreaKm2" | "runoffDepthMmYr" | "dischargeM3s"
+      | "flowAccumulation" | "drainageAreaKm2" | "waterDepthM" | "solarInsolation" | "temperatureC"
+      | "riverMouthAreaKm2",
+      number
+    >;
+    byte: Record<
+      "biomeType" | "strahlerOrder" | "riverCenterlineMask" | "isRiverChannel"
+      | "riverChannelRadius" | "riverMouthMask",
+      number
+    >;
+    flowDirection: number;
+    wetlandCoverage?: number;
+    visualCoverage?: number;
+    siltDepth?: number;
+    siltCreaseDepth?: number;
+    lakeDepthM?: number;
+  };
+  /** Non-illustrated tiles: wetland water distance over the whole tile. */
+  vegetationWaterDistance?: number;
+  /** Illustrated tiles: the mountain region and the compositor frames. */
+  illustration?: {
+    mountain: SampleRect;
+    snow?: { roughness: number; windShelter: number; windLoading: number; slopeBreak: number };
+    slopeDeg: number;
+    frames: Array<{
+      waterOnly: boolean;
+      frame: SampleRect & { offsetX: number; offsetY: number };
+      vegetationWaterDistance?: number;
+      water?: WaterTerrainSlots;
+    }>;
+  };
+}
+
+/** Samples that compose a terrain surface: elevation, ocean and water coverage. */
+interface SurfaceSlots {
+  oceanCoverage: number;
+  sourceNorm: number;
+  erosion: number;
+  globalElevation: number;
+  wetlandCoverage?: number;
+  visualCoverage?: number;
+}
+
+/** The fields the water overlay reads (renderWaterOverlay), for a water-only frame. */
+interface WaterTerrainSlots extends SurfaceSlots {
+  openOcean?: number;
+  oceanDistance?: number;
+  float: Record<"rainfallWeightedAreaKm2" | "drainageAreaKm2" | "riverMouthAreaKm2", number>;
+  byte: Record<
+    "biomeType" | "strahlerOrder" | "riverCenterlineMask" | "isRiverChannel"
+    | "riverChannelRadius" | "riverMouthMask",
+    number
+  >;
+  flowDirection: number;
+  lakeDepthM?: number;
+}
+
+function planMountainExportTileSampling(
   context: MountainExportGlobalContext,
   tile: MountainExportTile,
-): PreparedMountainExportTile {
-  const preparationStop = context.profiler?.begin("export tile preparation");
+): MountainExportTileSamplingPlan {
   const global = context.dem;
   const source = context.source;
   const outputWidth = context.outputWidth;
@@ -853,7 +1052,6 @@ export function prepareMountainExportTile(
   const dimensions = getMountainExportTileDimensions(context, tile);
   const {
     presentationScale,
-    waterScale,
     illustrated,
     detailHalo,
     compositeHalo,
@@ -863,6 +1061,227 @@ export function prepareMountainExportTile(
     width,
     height,
   } = dimensions;
+  const requests: ExportFieldSampleRequest[] = [];
+  const add = (
+    field: ArrayLike<number>,
+    rect: SampleRect,
+    options: Partial<ExportFieldSampleRequest> = {},
+  ): number => requests.push({
+    source: field,
+    sourceWidth: global.width,
+    sourceHeight: global.height,
+    x: rect.x,
+    y: rect.y,
+    width: rect.width,
+    height: rect.height,
+    ...options,
+  }) - 1;
+  const tileRect = { x: tileX, y: tileY, width, height };
+  const zeros = zeroFieldsFor(global);
+  const globalWetlandPoolCoverage =
+    global.wetlandPoolCoverage?.length === global.elevation.length
+      ? global.wetlandPoolCoverage
+      : global.wetlandPoolMask;
+  const globalVisualWaterCoverage =
+    global.visualWaterCoverage?.length === global.elevation.length
+      ? global.visualWaterCoverage
+      : global.visualWaterMask;
+  // The samples a terrain surface is composed from (composeTileSurface).
+  const addSurface = (rect: SampleRect): SurfaceSlots => ({
+    oceanCoverage: add(context.oceanMaskCoverage ?? global.isOcean, rect, { precise: true }),
+    sourceNorm: add(source.luminance, rect, {
+      sourceWidth: source.width,
+      sourceHeight: source.height,
+      precise: true,
+    }),
+    erosion: add(global.erosionDepthM, rect, { precise: true }),
+    globalElevation: add(global.elevation, rect, { precise: true }),
+    wetlandCoverage: global.wetlandPoolMask && globalWetlandPoolCoverage
+      ? add(globalWetlandPoolCoverage, rect, { precise: true })
+      : undefined,
+    visualCoverage: global.visualWaterMask && globalVisualWaterCoverage
+      ? add(globalVisualWaterCoverage, rect, { precise: true })
+      : undefined,
+  });
+  const terrain: MountainExportTileSamplingPlan["terrain"] = {
+    ...addSurface(tileRect),
+    openOcean: context.openOceanMask ? add(context.openOceanMask, tileRect) : undefined,
+    oceanDistance: context.oceanDistanceToCoast
+      ? add(context.oceanDistanceToCoast, tileRect, { scale: presentationScale })
+      : undefined,
+    float: {
+      precipitationMmYr: add(global.precipitationMmYr, tileRect),
+      rainfallWeightedAreaKm2: add(global.rainfallWeightedAreaKm2, tileRect),
+      runoffDepthMmYr: add(global.runoffDepthMmYr, tileRect),
+      dischargeM3s: add(global.dischargeM3s, tileRect),
+      flowAccumulation: add(global.flowAccumulation, tileRect),
+      drainageAreaKm2: add(global.drainageAreaKm2, tileRect),
+      waterDepthM: add(global.waterDepthM, tileRect),
+      solarInsolation: add(global.solarInsolation, tileRect),
+      temperatureC: add(global.temperatureC, tileRect),
+      riverMouthAreaKm2: add(global.riverMouthAreaKm2 ?? zeros.f32, tileRect),
+    },
+    byte: {
+      biomeType: add(global.biomeType, tileRect, { nearest: true, output: "u8" }),
+      strahlerOrder: add(global.strahlerOrder, tileRect, { nearest: true, output: "u8" }),
+      riverCenterlineMask: add(global.riverCenterlineMask, tileRect, { nearest: true, output: "u8" }),
+      isRiverChannel: add(global.isRiverChannel, tileRect, { nearest: true, output: "u8" }),
+      riverChannelRadius: add(global.riverChannelRadius ?? zeros.u8, tileRect, { nearest: true, output: "u8" }),
+      riverMouthMask: add(global.riverMouthMask ?? zeros.u8, tileRect, { nearest: true, output: "u8" }),
+    },
+    flowDirection: add(global.flowDirection, tileRect, { nearest: true, output: "i8" }),
+    // Silt depth is smooth, so bilinear upsampling keeps the layer edges
+    // crisp at the tile's resolution.
+    siltDepth: global.siltDepth ? add(global.siltDepth, tileRect) : undefined,
+    siltCreaseDepth: global.siltCreaseDepth ? add(global.siltCreaseDepth, tileRect) : undefined,
+    lakeDepthM: global.lakeDepthM ? add(global.lakeDepthM, tileRect) : undefined,
+  };
+  const plan: MountainExportTileSamplingPlan = { dimensions, requests, terrain };
+  if (!illustrated) {
+    if (context.vegetationWaterDistance) {
+      plan.vegetationWaterDistance = add(context.vegetationWaterDistance, tileRect);
+    }
+    return plan;
+  }
+  // The illustration only has to be correct on the core; the compositor
+  // uses it per pixel and the detail halo is cropped away. Build it on the
+  // core plus its own support rather than on the (often much wider, e.g.
+  // ocean-wave) detail region, reusing the already-sampled terrain arrays.
+  const mountainX = Math.max(tileX, tile.x - mountainSupport);
+  const mountainY = Math.max(tileY, tile.y - mountainSupport);
+  const mountain = {
+    x: mountainX,
+    y: mountainY,
+    width: Math.min(tileX + width, tile.x + tile.width + mountainSupport) - mountainX,
+    height: Math.min(tileY + height, tile.y + tile.height + mountainSupport) - mountainY,
+  };
+  // The compositor frame: the core plus `halo` pixels, clipped to the output.
+  const detailFrame = (halo: number) => {
+    const x = Math.max(0, tile.x - halo);
+    const y = Math.max(0, tile.y - halo);
+    return {
+      x,
+      y,
+      width: Math.min(outputWidth, tile.x + tile.width + halo) - x,
+      height: Math.min(outputHeight, tile.y + tile.height + halo) - y,
+      offsetX: x - tileX,
+      offsetY: y - tileY,
+    };
+  };
+  // Ocean waves reach far beyond every other halo, so the compositor runs on
+  // a smaller frame and takes the overlay computed on the wave-sized frame.
+  const splitWaveFrame = compositeHalo < detailHalo;
+  const frameHalos = splitWaveFrame
+    ? [{ halo: compositeHalo, waterOnly: false }, { halo: detailHalo, waterOnly: true }]
+    : [{ halo: detailHalo, waterOnly: false }];
+  plan.illustration = {
+    mountain,
+    snow: context.snowTransport
+      ? {
+          roughness: add(context.snowTransport.roughness, mountain),
+          windShelter: add(context.snowTransport.windShelter, mountain),
+          windLoading: add(context.snowTransport.windLoading, mountain),
+          slopeBreak: add(context.snowTransport.slopeBreak, mountain),
+        }
+      : undefined,
+    slopeDeg: add(global.slopeDeg, mountain),
+    frames: frameHalos.map(({ halo, waterOnly }) => {
+      const frame = detailFrame(halo);
+      // A wave frame reaching past the tile terrain samples the water
+      // overlay's own fields over its full extent instead.
+      const beyondTerrain = frame.x < tileX || frame.y < tileY
+        || frame.x + frame.width > tileX + width || frame.y + frame.height > tileY + height;
+      return {
+        waterOnly,
+        frame,
+        vegetationWaterDistance: context.vegetationWaterDistance && !waterOnly
+          ? add(context.vegetationWaterDistance, frame)
+          : undefined,
+        water: waterOnly && beyondTerrain
+          ? {
+              ...addSurface(frame),
+              openOcean: context.openOceanMask ? add(context.openOceanMask, frame) : undefined,
+              oceanDistance: context.oceanDistanceToCoast
+                ? add(context.oceanDistanceToCoast, frame, { scale: presentationScale })
+                : undefined,
+              float: {
+                rainfallWeightedAreaKm2: add(global.rainfallWeightedAreaKm2, frame),
+                drainageAreaKm2: add(global.drainageAreaKm2, frame),
+                riverMouthAreaKm2: add(global.riverMouthAreaKm2 ?? zeros.f32, frame),
+              },
+              byte: {
+                biomeType: add(global.biomeType, frame, { nearest: true, output: "u8" }),
+                strahlerOrder: add(global.strahlerOrder, frame, { nearest: true, output: "u8" }),
+                riverCenterlineMask: add(global.riverCenterlineMask, frame, { nearest: true, output: "u8" }),
+                isRiverChannel: add(global.isRiverChannel, frame, { nearest: true, output: "u8" }),
+                riverChannelRadius: add(global.riverChannelRadius ?? zeros.u8, frame, { nearest: true, output: "u8" }),
+                riverMouthMask: add(global.riverMouthMask ?? zeros.u8, frame, { nearest: true, output: "u8" }),
+              },
+              flowDirection: add(global.flowDirection, frame, { nearest: true, output: "i8" }),
+              lakeDepthM: global.lakeDepthM ? add(global.lakeDepthM, frame) : undefined,
+            }
+          : undefined,
+      };
+    }),
+  };
+  return plan;
+}
+
+/**
+ * First half of rendering a tile: samples the global export context into
+ * tile-sized terrain, vector and pattern inputs.
+ */
+export function prepareMountainExportTile(
+  context: MountainExportGlobalContext,
+  tile: MountainExportTile,
+): PreparedMountainExportTile {
+  const preparationStop = context.profiler?.begin("export tile preparation");
+  const plan = planMountainExportTileSampling(context, tile);
+  logMountainExportTile(context, tile, plan.dimensions);
+  context.onTileStage?.("Preparing tile terrain arrays");
+  const samplingStop = context.profiler?.begin("export tile field sampling");
+  const samples = sampleExportFieldsCpu(plan.requests, context.outputWidth, context.outputHeight);
+  samplingStop?.();
+  const prepared = finishMountainExportTile(context, tile, plan, samples);
+  preparationStop?.();
+  return prepared;
+}
+
+/**
+ * `prepareMountainExportTile` with the field sampling done by `sampler`
+ * (the GPU sampler in exports). Everything after sampling is shared.
+ */
+export async function prepareMountainExportTileWithSampler(
+  context: MountainExportGlobalContext,
+  tile: MountainExportTile,
+  sampler: ExportFieldSampler,
+): Promise<PreparedMountainExportTile> {
+  const plan = planMountainExportTileSampling(context, tile);
+  logMountainExportTile(context, tile, plan.dimensions);
+  context.onTileStage?.("Sampling tile terrain on the GPU");
+  const samplingStarted = performance.now();
+  const samples = await sampler(plan.requests, context.outputWidth, context.outputHeight);
+  context.profiler?.recordExternalStage("export tile GPU field sampling", performance.now() - samplingStarted);
+  const preparationStop = context.profiler?.begin("export tile preparation");
+  const prepared = finishMountainExportTile(context, tile, plan, samples);
+  preparationStop?.();
+  return prepared;
+}
+
+/** The request list a tile samples, for checking a sampler against the CPU. */
+export function getMountainExportTileSampleRequests(
+  context: MountainExportGlobalContext,
+  tile: MountainExportTile,
+): ExportFieldSampleRequest[] {
+  return planMountainExportTileSampling(context, tile).requests;
+}
+
+function logMountainExportTile(
+  context: MountainExportGlobalContext,
+  tile: MountainExportTile,
+  dimensions: MountainExportTileDimensions,
+): void {
+  const { presentationScale, detailHalo, mountainSupport, width, height } = dimensions;
   const total = width * height;
   // Printed immediately (not in the end-of-export report) so a crash still
   // leaves the size of the tile that was being built.
@@ -880,156 +1299,206 @@ export function prepareMountainExportTile(
   context.profiler?.recordMetric('tile interior pixels', tile.width * tile.height, 'pixels');
   context.profiler?.recordMetric('tile expanded pixels', width * height, 'pixels');
   context.profiler?.recordMetric('tile halo pixels', Math.max(0, width * height - tile.width * tile.height), 'pixels');
-  context.onTileStage?.("Preparing tile terrain arrays");
-  const terrainPreparationStop = context.profiler?.begin('export tile terrain preparation');
+}
+
+/**
+ * Elevation, ocean and water coverage of a tile region from its surface
+ * samples. Thresholds and the elevation sum use the samples as given, so the
+ * CPU path keeps its double-precision results.
+ */
+function composeTileSurface(
+  global: MountainDEMData,
+  total: number,
+  samples: readonly ExportFieldSample[],
+  slots: SurfaceSlots,
+) {
   const elevation = new Float32Array(total);
   const normalizedElevation = new Float32Array(total);
   const isOcean = new Uint8Array(total);
   const oceanMaskCoverage = new Float32Array(total);
-  const globalOceanMaskCoverage = context.oceanMaskCoverage ?? global.isOcean;
-  const globalOceanDistanceToCoast = context.oceanDistanceToCoast;
-  const oceanDistanceToCoast = globalOceanDistanceToCoast
-    ? new Float32Array(total)
-    : undefined;
-  const openOceanMask = context.openOceanMask
-    ? new Float32Array(total)
-    : undefined;
-  const wetlandPoolMask = global.wetlandPoolMask
-    ? new Uint8Array(total)
-    : undefined;
-  const visualWaterMask = global.visualWaterMask
-    ? new Uint8Array(total)
-    : undefined;
-  const wetlandPoolCoverage = global.wetlandPoolMask
-    ? new Float32Array(total)
-    : undefined;
-  const visualWaterCoverage = global.visualWaterMask
-    ? new Float32Array(total)
-    : undefined;
-  const globalWetlandPoolCoverage =
-    global.wetlandPoolCoverage?.length === global.elevation.length
-      ? global.wetlandPoolCoverage
-      : global.wetlandPoolMask;
-  const globalVisualWaterCoverage =
-    global.visualWaterCoverage?.length === global.elevation.length
-      ? global.visualWaterCoverage
-      : global.visualWaterMask;
-  const arrays = {
-    precipitationMmYr: new Float32Array(total),
-    rainfallWeightedAreaKm2: new Float32Array(total),
-    runoffDepthMmYr: new Float32Array(total),
-    dischargeM3s: new Float32Array(total),
-    flowAccumulation: new Float32Array(total),
-    drainageAreaKm2: new Float32Array(total),
-    waterDepthM: new Float32Array(total),
-    erosionDepthM: new Float32Array(total),
-    solarInsolation: new Float32Array(total),
-    temperatureC: new Float32Array(total),
-    biomeType: new Uint8Array(total),
-    strahlerOrder: new Uint8Array(total),
-    riverCenterlineMask: new Uint8Array(total),
-    isRiverChannel: new Uint8Array(total),
-    riverChannelRadius: new Uint8Array(total),
-    riverMouthMask: new Uint8Array(total),
-    riverMouthAreaKm2: new Float32Array(total),
-    flowDirection: new Int8Array(total),
-  };
-  const globalRiverRadius = global.riverChannelRadius ?? new Uint8Array(global.elevation.length);
-  const globalRiverMouthMask = global.riverMouthMask ?? new Uint8Array(global.elevation.length);
-  const globalRiverMouthArea = global.riverMouthAreaKm2 ?? new Float32Array(global.elevation.length);
-  const elevationRange = Math.max(1, global.maxElevationM - global.minElevationM);
-  const dxMeters = (global.domainWidthKm * 1000) / outputWidth;
-  const dyMeters = (global.domainHeightKm * 1000) / outputHeight;
-  const globalSamplePlan = createTileSamplePlan(
-    tileX, tileY, width, height, outputWidth, outputHeight, global.width, global.height,
-  );
-  const sourceSamplePlan = createTileSamplePlan(
-    tileX, tileY, width, height, outputWidth, outputHeight, source.width, source.height,
-  );
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const index = y * width + x;
-      const ocean =
-        samplePlannedBilinear(globalOceanMaskCoverage, global.width, globalSamplePlan, x, y) >=
-        0.5;
-      oceanMaskCoverage[index] = samplePlannedBilinear(
-        globalOceanMaskCoverage, global.width, globalSamplePlan, x, y,
-      );
-      isOcean[index] = ocean ? 1 : 0;
-      if (openOceanMask && context.openOceanMask) {
-        openOceanMask[index] = samplePlannedBilinear(
-          context.openOceanMask, global.width, globalSamplePlan, x, y,
-        );
-      }
-      if (oceanDistanceToCoast && globalOceanDistanceToCoast) {
-        oceanDistanceToCoast[index] = samplePlannedBilinear(
-          globalOceanDistanceToCoast, global.width, globalSamplePlan, x, y,
-        ) * presentationScale;
-      }
-      const sourceNorm = samplePlannedBilinear(source.luminance, source.width, sourceSamplePlan, x, y);
-      const baseElevation = global.minElevationM + clamp01(sourceNorm) * elevationRange;
-      const erosion = samplePlannedBilinear(global.erosionDepthM, global.width, globalSamplePlan, x, y);
-      elevation[index] = ocean
-        ? samplePlannedBilinear(global.elevation, global.width, globalSamplePlan, x, y)
-        : Math.max(global.minElevationM, baseElevation - erosion);
-      normalizedElevation[index] = clamp01((elevation[index] - global.minElevationM) / elevationRange);
-      arrays.precipitationMmYr[index] = samplePlannedBilinear(global.precipitationMmYr, global.width, globalSamplePlan, x, y);
-      arrays.rainfallWeightedAreaKm2[index] = samplePlannedBilinear(global.rainfallWeightedAreaKm2, global.width, globalSamplePlan, x, y);
-      arrays.runoffDepthMmYr[index] = samplePlannedBilinear(global.runoffDepthMmYr, global.width, globalSamplePlan, x, y);
-      arrays.dischargeM3s[index] = samplePlannedBilinear(global.dischargeM3s, global.width, globalSamplePlan, x, y);
-      arrays.flowAccumulation[index] = samplePlannedBilinear(global.flowAccumulation, global.width, globalSamplePlan, x, y);
-      arrays.drainageAreaKm2[index] = samplePlannedBilinear(global.drainageAreaKm2, global.width, globalSamplePlan, x, y);
-      arrays.waterDepthM[index] = samplePlannedBilinear(global.waterDepthM, global.width, globalSamplePlan, x, y);
-      arrays.erosionDepthM[index] = erosion;
-      arrays.solarInsolation[index] = samplePlannedBilinear(global.solarInsolation, global.width, globalSamplePlan, x, y);
-      arrays.temperatureC[index] = samplePlannedBilinear(global.temperatureC, global.width, globalSamplePlan, x, y);
-      arrays.biomeType[index] = samplePlannedNearest(global.biomeType, global.width, globalSamplePlan, x, y);
-      arrays.strahlerOrder[index] = samplePlannedNearest(global.strahlerOrder, global.width, globalSamplePlan, x, y);
-      arrays.riverCenterlineMask[index] = samplePlannedNearest(global.riverCenterlineMask, global.width, globalSamplePlan, x, y);
-      arrays.isRiverChannel[index] = samplePlannedNearest(global.isRiverChannel, global.width, globalSamplePlan, x, y);
-      arrays.riverChannelRadius[index] = samplePlannedNearest(globalRiverRadius, global.width, globalSamplePlan, x, y);
-      arrays.riverMouthMask[index] = samplePlannedNearest(globalRiverMouthMask, global.width, globalSamplePlan, x, y);
-      arrays.riverMouthAreaKm2[index] = samplePlannedBilinear(globalRiverMouthArea, global.width, globalSamplePlan, x, y);
-      arrays.flowDirection[index] = samplePlannedNearest(global.flowDirection, global.width, globalSamplePlan, x, y);
-      if (
-        wetlandPoolMask &&
-        wetlandPoolCoverage &&
-        globalWetlandPoolCoverage
-      ) {
-        const coverage = samplePlannedBilinear(
-          globalWetlandPoolCoverage, global.width, globalSamplePlan, x, y,
-        );
-        wetlandPoolCoverage[index] = coverage;
-        wetlandPoolMask[index] = coverage >= 0.5 ? 1 : 0;
-      }
-      if (
-        visualWaterMask &&
-        visualWaterCoverage &&
-        globalVisualWaterCoverage
-      ) {
-        const coverage = samplePlannedBilinear(
-          globalVisualWaterCoverage, global.width, globalSamplePlan, x, y,
-        );
-        visualWaterCoverage[index] = coverage;
-        visualWaterMask[index] = coverage >= 0.5 ? 1 : 0;
-      }
+  const erosionDepthM = new Float32Array(total);
+  const wetlandPoolMask = global.wetlandPoolMask ? new Uint8Array(total) : undefined;
+  const wetlandPoolCoverage = global.wetlandPoolMask ? new Float32Array(total) : undefined;
+  const visualWaterMask = global.visualWaterMask ? new Uint8Array(total) : undefined;
+  const visualWaterCoverage = global.visualWaterMask ? new Float32Array(total) : undefined;
+  const oceanCoverageSamples = samples[slots.oceanCoverage];
+  const sourceNormSamples = samples[slots.sourceNorm];
+  const erosionSamples = samples[slots.erosion];
+  const globalElevationSamples = samples[slots.globalElevation];
+  const wetlandSamples = slots.wetlandCoverage !== undefined ? samples[slots.wetlandCoverage] : undefined;
+  const visualSamples = slots.visualCoverage !== undefined ? samples[slots.visualCoverage] : undefined;
+  const minElevationM = global.minElevationM;
+  const elevationRange = Math.max(1, global.maxElevationM - minElevationM);
+  for (let index = 0; index < total; index++) {
+    const coverage = oceanCoverageSamples[index];
+    const ocean = coverage >= 0.5;
+    oceanMaskCoverage[index] = coverage;
+    isOcean[index] = ocean ? 1 : 0;
+    const baseElevation = minElevationM + clamp01(sourceNormSamples[index]) * elevationRange;
+    const erosion = erosionSamples[index];
+    elevation[index] = ocean
+      ? globalElevationSamples[index]
+      : Math.max(minElevationM, baseElevation - erosion);
+    normalizedElevation[index] = clamp01((elevation[index] - minElevationM) / elevationRange);
+    erosionDepthM[index] = erosion;
+    if (wetlandPoolMask && wetlandPoolCoverage && wetlandSamples) {
+      const wetland = wetlandSamples[index];
+      wetlandPoolCoverage[index] = wetland;
+      wetlandPoolMask[index] = wetland >= 0.5 ? 1 : 0;
+    }
+    if (visualWaterMask && visualWaterCoverage && visualSamples) {
+      const visual = visualSamples[index];
+      visualWaterCoverage[index] = visual;
+      visualWaterMask[index] = visual >= 0.5 ? 1 : 0;
     }
   }
-  // Silt depth is smooth, so bilinear upsampling keeps the layer edges crisp
-  // at the tile's resolution.
-  const upsampleSilt = (source: Float32Array | undefined) => {
-    if (!source) return undefined;
-    const out = new Float32Array(total);
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        out[y * width + x] = samplePlannedBilinear(source, global.width, globalSamplePlan, x, y);
-      }
-    }
-    return out;
+  return {
+    elevation,
+    normalizedElevation,
+    isOcean,
+    oceanMaskCoverage,
+    erosionDepthM,
+    wetlandPoolMask,
+    wetlandPoolCoverage,
+    visualWaterMask,
+    visualWaterCoverage,
   };
-  const siltDepth = upsampleSilt(global.siltDepth);
-  const siltCreaseDepth = upsampleSilt(global.siltCreaseDepth);
-  const lakeDepthM = upsampleSilt(global.lakeDepthM);
+}
+
+/**
+ * The water overlay's terrain for a wave frame wider than the tile terrain:
+ * only the fields renderWaterOverlay reads, the rest left empty.
+ */
+function composeWaterFrameTerrain(
+  global: MountainDEMData,
+  samples: readonly ExportFieldSample[],
+  slots: WaterTerrainSlots,
+  width: number,
+  height: number,
+  dxMeters: number,
+  dyMeters: number,
+): NonNullable<PreparedDetailFrame["water"]> {
+  const surface = composeTileSurface(global, width * height, samples, slots);
+  const float = (index: number): Float32Array => samples[index] as Float32Array;
+  const empty = () => new Float32Array(0);
+  const dem: MountainDEMData = {
+    width,
+    height,
+    domainWidthKm: (width * dxMeters) / 1000,
+    domainHeightKm: (height * dyMeters) / 1000,
+    dxMeters,
+    dyMeters,
+    biomeRegionScaleKm: global.biomeRegionScaleKm,
+    biomeEdgeNoiseScaleM: global.biomeEdgeNoiseScaleM,
+    biomeEdgeStrength: global.biomeEdgeStrength,
+    minElevationM: global.minElevationM,
+    maxElevationM: global.maxElevationM,
+    oceanSurfaceElevationM: global.oceanSurfaceElevationM,
+    elevation: surface.elevation,
+    normalizedElevation: surface.normalizedElevation,
+    slopeDeg: deriveLocalSlope(surface.elevation, width, height, dxMeters, dyMeters),
+    aspectDeg: empty(),
+    normals: empty(),
+    hillshade: empty(),
+    ambientOcclusion: empty(),
+    curvature: empty(),
+    tpi: empty(),
+    flowAccumulation: empty(),
+    drainageAreaKm2: float(slots.float.drainageAreaKm2),
+    rainfallWeightedAreaKm2: float(slots.float.rainfallWeightedAreaKm2),
+    runoffDepthMmYr: empty(),
+    dischargeM3s: empty(),
+    strahlerOrder: samples[slots.byte.strahlerOrder] as Uint8Array,
+    riverCenterlineMask: samples[slots.byte.riverCenterlineMask] as Uint8Array,
+    isRiverChannel: samples[slots.byte.isRiverChannel] as Uint8Array,
+    riverChannelRadius: samples[slots.byte.riverChannelRadius] as Uint8Array,
+    riverMouthMask: samples[slots.byte.riverMouthMask] as Uint8Array,
+    riverMouthAreaKm2: float(slots.float.riverMouthAreaKm2),
+    waterDepthM: empty(),
+    flowDirection: samples[slots.flowDirection] as Int8Array,
+    erosionDepthM: surface.erosionDepthM,
+    precipitationMmYr: empty(),
+    solarInsolation: empty(),
+    temperatureC: empty(),
+    biomeType: samples[slots.byte.biomeType] as Uint8Array,
+    isOcean: surface.isOcean,
+    ...(surface.wetlandPoolMask && surface.wetlandPoolCoverage
+      ? { wetlandPoolMask: surface.wetlandPoolMask, wetlandPoolCoverage: surface.wetlandPoolCoverage }
+      : {}),
+    ...(surface.visualWaterMask && surface.visualWaterCoverage
+      ? { visualWaterMask: surface.visualWaterMask, visualWaterCoverage: surface.visualWaterCoverage }
+      : {}),
+    lakeDepthM: slots.lakeDepthM !== undefined ? float(slots.lakeDepthM) : undefined,
+  };
+  return {
+    dem,
+    oceanMaskCoverage: surface.oceanMaskCoverage,
+    openOceanMask: slots.openOcean !== undefined ? float(slots.openOcean) : undefined,
+    oceanDistanceToCoast: slots.oceanDistance !== undefined ? float(slots.oceanDistance) : undefined,
+  };
+}
+
+/** Second step of tile preparation: builds the tile DEM and maps vectors from the samples. */
+function finishMountainExportTile(
+  context: MountainExportGlobalContext,
+  tile: MountainExportTile,
+  plan: MountainExportTileSamplingPlan,
+  samples: readonly ExportFieldSample[],
+): PreparedMountainExportTile {
+  const global = context.dem;
+  const outputWidth = context.outputWidth;
+  const outputHeight = context.outputHeight;
+  const { dimensions, terrain } = plan;
+  const {
+    presentationScale,
+    waterScale,
+    illustrated,
+    x: tileX,
+    y: tileY,
+    width,
+    height,
+  } = dimensions;
+  const total = width * height;
+  const terrainPreparationStop = context.profiler?.begin('export tile terrain preparation');
+  const float = (index: number): Float32Array => samples[index] as Float32Array;
+  const {
+    elevation,
+    normalizedElevation,
+    isOcean,
+    oceanMaskCoverage,
+    erosionDepthM,
+    wetlandPoolMask,
+    wetlandPoolCoverage,
+    visualWaterMask,
+    visualWaterCoverage,
+  } = composeTileSurface(global, total, samples, terrain);
+  const oceanDistanceToCoast = terrain.oceanDistance !== undefined ? float(terrain.oceanDistance) : undefined;
+  const openOceanMask = terrain.openOcean !== undefined ? float(terrain.openOcean) : undefined;
+  const arrays = {
+    precipitationMmYr: float(terrain.float.precipitationMmYr),
+    rainfallWeightedAreaKm2: float(terrain.float.rainfallWeightedAreaKm2),
+    runoffDepthMmYr: float(terrain.float.runoffDepthMmYr),
+    dischargeM3s: float(terrain.float.dischargeM3s),
+    flowAccumulation: float(terrain.float.flowAccumulation),
+    drainageAreaKm2: float(terrain.float.drainageAreaKm2),
+    waterDepthM: float(terrain.float.waterDepthM),
+    erosionDepthM,
+    solarInsolation: float(terrain.float.solarInsolation),
+    temperatureC: float(terrain.float.temperatureC),
+    biomeType: samples[terrain.byte.biomeType] as Uint8Array,
+    strahlerOrder: samples[terrain.byte.strahlerOrder] as Uint8Array,
+    riverCenterlineMask: samples[terrain.byte.riverCenterlineMask] as Uint8Array,
+    isRiverChannel: samples[terrain.byte.isRiverChannel] as Uint8Array,
+    riverChannelRadius: samples[terrain.byte.riverChannelRadius] as Uint8Array,
+    riverMouthMask: samples[terrain.byte.riverMouthMask] as Uint8Array,
+    riverMouthAreaKm2: float(terrain.float.riverMouthAreaKm2),
+    flowDirection: samples[terrain.flowDirection] as Int8Array,
+  };
+  const dxMeters = (global.domainWidthKm * 1000) / outputWidth;
+  const dyMeters = (global.domainHeightKm * 1000) / outputHeight;
+  const siltDepth = terrain.siltDepth !== undefined ? float(terrain.siltDepth) : undefined;
+  const siltCreaseDepth = terrain.siltCreaseDepth !== undefined ? float(terrain.siltCreaseDepth) : undefined;
+  const lakeDepthM = terrain.lakeDepthM !== undefined ? float(terrain.lakeDepthM) : undefined;
   const localTerrain = deriveLocalTerrain(elevation, width, height, dxMeters, dyMeters, context.render);
   let tileDem: MountainDEMData | undefined = {
     width,
@@ -1087,18 +1556,8 @@ export function prepareMountainExportTile(
         context.render.vegetation?.rasterPropAssets,
       )
     : undefined;
-  const mappedVegetationWaterDistance = !illustrated && context.vegetationWaterDistance
-    ? mapFloatFieldToTile(
-        context.vegetationWaterDistance,
-        global.width,
-        global.height,
-        outputWidth,
-        outputHeight,
-        tileX,
-        tileY,
-        width,
-        height,
-      )
+  const mappedVegetationWaterDistance = plan.vegetationWaterDistance !== undefined
+    ? float(plan.vegetationWaterDistance)
     : undefined;
   tileMappingStop?.();
   // Presentation controls are authored in preview pixels. Scale physical
@@ -1155,82 +1614,19 @@ export function prepareMountainExportTile(
     wetlandPuddleCoordinateDomainHeight: outputHeight,
   };
   let illustration: PreparedMountainExportTile["illustration"];
-  if (illustrated) {
-    // The compositor frame: the core plus `halo` pixels, clipped to the output.
-    const detailFrame = (halo: number) => {
-      const x = Math.max(0, tile.x - halo);
-      const y = Math.max(0, tile.y - halo);
-      return {
-        x,
-        y,
-        width: Math.min(outputWidth, tile.x + tile.width + halo) - x,
-        height: Math.min(outputHeight, tile.y + tile.height + halo) - y,
-        offsetX: x - tileX,
-        offsetY: y - tileY,
-      };
-    };
-    // The illustration only has to be correct on the core; the compositor
-    // uses it per pixel and the detail halo is cropped away. Build it on the
-    // core plus its own support rather than on the (often much wider, e.g.
-    // ocean-wave) detail region, reusing the already-sampled terrain arrays.
-    const mountainX = Math.max(tileX, tile.x - mountainSupport);
-    const mountainY = Math.max(tileY, tile.y - mountainSupport);
-    const mountainWidth = Math.min(tileX + width, tile.x + tile.width + mountainSupport) - mountainX;
-    const mountainHeight = Math.min(tileY + height, tile.y + tile.height + mountainSupport) - mountainY;
+  if (plan.illustration) {
+    const { mountain, snow } = plan.illustration;
+    const { x: mountainX, y: mountainY, width: mountainWidth, height: mountainHeight } = mountain;
     const expandedSamplePlan = createTileSamplePlan(
       mountainX, mountainY, mountainWidth, mountainHeight,
       outputWidth, outputHeight, global.width, global.height,
     );
-    const mappedSnowTransport = context.snowTransport
+    const mappedSnowTransport = snow
       ? {
-          roughness: mapFloatFieldToTile(
-            context.snowTransport.roughness,
-            global.width,
-            global.height,
-            outputWidth,
-            outputHeight,
-            mountainX,
-            mountainY,
-            mountainWidth,
-            mountainHeight,
-            expandedSamplePlan,
-          ),
-          windShelter: mapFloatFieldToTile(
-            context.snowTransport.windShelter,
-            global.width,
-            global.height,
-            outputWidth,
-            outputHeight,
-            mountainX,
-            mountainY,
-            mountainWidth,
-            mountainHeight,
-            expandedSamplePlan,
-          ),
-          windLoading: mapFloatFieldToTile(
-            context.snowTransport.windLoading,
-            global.width,
-            global.height,
-            outputWidth,
-            outputHeight,
-            mountainX,
-            mountainY,
-            mountainWidth,
-            mountainHeight,
-            expandedSamplePlan,
-          ),
-          slopeBreak: mapFloatFieldToTile(
-            context.snowTransport.slopeBreak,
-            global.width,
-            global.height,
-            outputWidth,
-            outputHeight,
-            mountainX,
-            mountainY,
-            mountainWidth,
-            mountainHeight,
-            expandedSamplePlan,
-          ),
+          roughness: float(snow.roughness),
+          windShelter: float(snow.windShelter),
+          windLoading: float(snow.windLoading),
+          slopeBreak: float(snow.slopeBreak),
         }
       : undefined;
     // Preserve ridge topology, charcoal seeds, and snow accumulation from
@@ -1268,32 +1664,18 @@ export function prepareMountainExportTile(
         : undefined,
     );
 
-    const mappedSlopeDeg = mapFloatFieldToTile(global.slopeDeg, global.width, global.height,
-      outputWidth, outputHeight, mountainX, mountainY, mountainWidth, mountainHeight,
-      expandedSamplePlan);
+    const mappedSlopeDeg = float(plan.illustration.slopeDeg);
     // The global fields each compositor frame maps for itself.
-    const prepareDetailFrame = (halo: number, waterOnly: boolean): PreparedDetailFrame => {
-      const frame = detailFrame(halo);
+    const frames = plan.illustration.frames.map(({ waterOnly, frame, vegetationWaterDistance, water }): PreparedDetailFrame => {
       const { x: detailTileX, y: detailTileY, width: detailWidth, height: detailHeight } = frame;
       return {
         waterOnly,
         frame,
-        vegetationWaterDistance: context.vegetationWaterDistance && !waterOnly
-          ? mapFloatFieldToTile(
-              context.vegetationWaterDistance,
-              global.width,
-              global.height,
-              outputWidth,
-              outputHeight,
-              detailTileX,
-              detailTileY,
-              detailWidth,
-              detailHeight,
-              createTileSamplePlan(
-                detailTileX, detailTileY, detailWidth, detailHeight,
-                outputWidth, outputHeight, global.width, global.height,
-              ),
-            )
+        water: water
+          ? composeWaterFrameTerrain(global, samples, water, detailWidth, detailHeight, dxMeters, dyMeters)
+          : undefined,
+        vegetationWaterDistance: vegetationWaterDistance !== undefined
+          ? float(vegetationWaterDistance)
           : undefined,
         riverSplines: createMappedRiverSplines(
           context.riverSplines,
@@ -1319,12 +1701,7 @@ export function prepareMountainExportTile(
             )
           : undefined,
       };
-    };
-    // Ocean waves reach far beyond every other halo, so the compositor runs on
-    // a smaller frame and takes the overlay computed on the wave-sized frame.
-    const splitWaveFrame = compositeHalo < detailHalo;
-    const frames = [prepareDetailFrame(splitWaveFrame ? compositeHalo : detailHalo, false)];
-    if (splitWaveFrame) frames.push(prepareDetailFrame(detailHalo, true));
+    });
     illustration = {
       mountainX,
       mountainY,
@@ -1337,7 +1714,6 @@ export function prepareMountainExportTile(
       frames,
     };
   }
-  preparationStop?.();
   return {
     tile,
     dimensions,
@@ -1404,6 +1780,10 @@ export function renderPreparedMountainExportTile(
     const foregroundCore = foreground && foreground.length === renderedWidth * renderedHeight * 4
       ? new Uint8ClampedArray(tile.width * tile.height * 4)
       : undefined;
+    const cover = rendered.standCover;
+    const coverCore = cover && cover.length === renderedWidth * renderedHeight
+      ? new Uint8Array(tile.width * tile.height)
+      : undefined;
     for (let y = 0; y < tile.height; y++) {
       const sourceOffset = ((y + sourceY) * renderedWidth + sourceX) * 4;
       core.set(rendered.data.subarray(sourceOffset, sourceOffset + tile.width * 4), y * tile.width * 4);
@@ -1413,6 +1793,10 @@ export function renderPreparedMountainExportTile(
           y * tile.width * 4,
         );
       }
+      if (coverCore && cover) {
+        const coverOffset = (y + sourceY) * renderedWidth + sourceX;
+        coverCore.set(cover.subarray(coverOffset, coverOffset + tile.width), y * tile.width);
+      }
     }
     assemblyStop?.();
     tileStop?.();
@@ -1420,6 +1804,7 @@ export function renderPreparedMountainExportTile(
       ? new ImageData(core, tile.width, tile.height)
       : { width: tile.width, height: tile.height, data: core } as unknown as ImageData) as MountainDetailImageData;
     if (foregroundCore) result.foregroundPropsRGBA = foregroundCore;
+    if (coverCore) result.standCover = coverCore;
     return result;
   };
   if (illustrated) {
@@ -1427,13 +1812,21 @@ export function renderPreparedMountainExportTile(
     const illustrationPreparationStop = hooks.profiler?.begin('export tile illustration preparation');
     const expandedTileDem = tileDem!;
     const expandedRenderOptions = renderOptions!;
+    // Over the tile terrain and any wider wave-frame terrain together, which
+    // is the region a single terrain covered before the wave frame split off.
     let heightmapLowerLimitM = -10;
-    for (const elevationValue of expandedTileDem.elevation) {
-      heightmapLowerLimitM = Math.min(heightmapLowerLimitM, elevationValue);
-    }
     let maxErosionDepthM = 0;
-    for (const erosionDepth of expandedTileDem.erosionDepthM) {
-      maxErosionDepthM = Math.max(maxErosionDepthM, erosionDepth);
+    const extentDems = [
+      expandedTileDem,
+      ...prepared.illustration!.frames.flatMap(frame => (frame.water ? [frame.water.dem] : [])),
+    ];
+    for (const extentDem of extentDems) {
+      for (const elevationValue of extentDem.elevation) {
+        heightmapLowerLimitM = Math.min(heightmapLowerLimitM, elevationValue);
+      }
+      for (const erosionDepth of extentDem.erosionDepthM) {
+        maxErosionDepthM = Math.max(maxErosionDepthM, erosionDepth);
+      }
     }
     const {
       mountainX,
@@ -1488,30 +1881,37 @@ export function renderPreparedMountainExportTile(
       mountainStage: MountainIllustration | MountainCameraIllustrationLayers | undefined,
     ): ImageData => {
     hooks.onTileStage?.(cameraTile ? "Composing camera illustration texture" : "Preparing mountain illustration texture");
+    const cameraStyle: MountainCameraIllustrationStyle = {
+      hatchColor: expandedRenderOptions.mountainHatchColor ?? expandedRenderOptions.vegetation?.inkColor,
+      hatchOpacity:
+        expandedRenderOptions.mountainHatchOpacity ??
+        expandedRenderOptions.mountainLineworkOpacity ??
+        expandedRenderOptions.vegetation?.strokeOpacity ??
+        expandedRenderOptions.waterOutlineOpacity ??
+        0.8,
+      horizontalHatchOpacity:
+        expandedRenderOptions.mountainHatchHorizontalOpacity ??
+        expandedRenderOptions.mountainHatchOpacity ??
+        expandedRenderOptions.mountainLineworkOpacity ??
+        expandedRenderOptions.vegetation?.strokeOpacity ??
+        expandedRenderOptions.waterOutlineOpacity ??
+        0.8,
+      verticalHatchOpacity:
+        expandedRenderOptions.mountainHatchVerticalOpacity ??
+        expandedRenderOptions.mountainHatchOpacity ??
+        expandedRenderOptions.mountainLineworkOpacity ??
+        expandedRenderOptions.vegetation?.strokeOpacity ??
+        expandedRenderOptions.waterOutlineOpacity ??
+        0.8,
+    };
     const cameraTexture = mountainStage && cameraTile
-      ? mountainCameraIllustrationTexture(mountainStage as MountainCameraIllustrationLayers, {
-                hatchColor: expandedRenderOptions.mountainHatchColor ?? expandedRenderOptions.vegetation?.inkColor,
-                hatchOpacity:
-                  expandedRenderOptions.mountainHatchOpacity ??
-                  expandedRenderOptions.mountainLineworkOpacity ??
-                  expandedRenderOptions.vegetation?.strokeOpacity ??
-                  expandedRenderOptions.waterOutlineOpacity ??
-                  0.8,
-                horizontalHatchOpacity:
-                  expandedRenderOptions.mountainHatchHorizontalOpacity ??
-                  expandedRenderOptions.mountainHatchOpacity ??
-                  expandedRenderOptions.mountainLineworkOpacity ??
-                  expandedRenderOptions.vegetation?.strokeOpacity ??
-                  expandedRenderOptions.waterOutlineOpacity ??
-                  0.8,
-                verticalHatchOpacity:
-                  expandedRenderOptions.mountainHatchVerticalOpacity ??
-                  expandedRenderOptions.mountainHatchOpacity ??
-                  expandedRenderOptions.mountainLineworkOpacity ??
-                  expandedRenderOptions.vegetation?.strokeOpacity ??
-                  expandedRenderOptions.waterOutlineOpacity ??
-                  0.8,
-              })
+      ? mountainCameraIllustrationTexture(mountainStage as MountainCameraIllustrationLayers, cameraStyle)
+      : undefined;
+    // Ink coverage of the same texture keeps the compositor's washes off it.
+    const mountainInkAlpha = mountainStage
+      ? cameraTile
+        ? mountainCameraIllustrationInkAlpha(mountainStage as MountainCameraIllustrationLayers, cameraStyle)
+        : mountainIllustrationInkAlpha(mountainStage as MountainIllustration)
       : undefined;
     // `waterOnly` frames feed just the ocean-wave water overlay, so they skip
     // the illustration and vegetation inputs that the compositor frame needs.
@@ -1526,50 +1926,77 @@ export function renderPreparedMountainExportTile(
       offsetX: detailOffsetX,
       offsetY: detailOffsetY,
     } = frame;
-    const detailDem = cropMountainDEM(
-      expandedTileDem,
-      detailOffsetX,
-      detailOffsetY,
-      detailWidth,
-      detailHeight,
-    );
+    const water = preparedFrame.water;
+    const detailDem = water
+      ? water.dem
+      : cropMountainDEM(
+          expandedTileDem,
+          detailOffsetX,
+          detailOffsetY,
+          detailWidth,
+          detailHeight,
+        );
     const mountainIllustrationRGBA = mountainStage && !waterOnly
-      ? placeMountainIllustrationRGBA(
+      ? placeMountainIllustrationPixels(
           cameraTile
             ? cameraTexture!
             : (mountainStage as MountainIllustration).rgba,
+          4,
           mountainX, mountainY, mountainWidth, mountainHeight,
           detailTileX, detailTileY, detailWidth, detailHeight,
         )
       : undefined;
-    const detailOceanMaskCoverage = cropNumericTileField(
-      oceanMaskCoverage,
-      width,
-      detailOffsetX,
-      detailOffsetY,
-      detailWidth,
-      detailHeight,
-    );
-    const detailOpenOceanMask = openOceanMask
-      ? cropNumericTileField(
-          openOceanMask,
+    const mountainIllustrationInkAlpha = mountainInkAlpha && !waterOnly
+      ? placeMountainIllustrationPixels(
+          mountainInkAlpha,
+          1,
+          mountainX, mountainY, mountainWidth, mountainHeight,
+          detailTileX, detailTileY, detailWidth, detailHeight,
+        )
+      : undefined;
+    // The rock and snow without linework, for the ground under forest stands.
+    const mountainIllustrationMaterialRGBA = mountainStage && !waterOnly
+      ? placeMountainIllustrationPixels(
+          mountainStage.materialRgba,
+          4,
+          mountainX, mountainY, mountainWidth, mountainHeight,
+          detailTileX, detailTileY, detailWidth, detailHeight,
+        )
+      : undefined;
+    const detailOceanMaskCoverage = water
+      ? water.oceanMaskCoverage
+      : cropNumericTileField(
+          oceanMaskCoverage,
           width,
           detailOffsetX,
           detailOffsetY,
           detailWidth,
           detailHeight,
-        )
-      : undefined;
-    const detailOceanDistanceToCoast = oceanDistanceToCoast
-      ? cropNumericTileField(
-          oceanDistanceToCoast,
-          width,
-          detailOffsetX,
-          detailOffsetY,
-          detailWidth,
-          detailHeight,
-        )
-      : undefined;
+        );
+    const detailOpenOceanMask = water
+      ? water.openOceanMask
+      : openOceanMask
+        ? cropNumericTileField(
+            openOceanMask,
+            width,
+            detailOffsetX,
+            detailOffsetY,
+            detailWidth,
+            detailHeight,
+          )
+        : undefined;
+    const detailOceanDistanceToCoast = water
+      ? water.oceanDistanceToCoast
+      : oceanDistanceToCoast
+        ? cropNumericTileField(
+            oceanDistanceToCoast,
+            width,
+            detailOffsetX,
+            detailOffsetY,
+            detailWidth,
+            detailHeight,
+          )
+        : undefined;
     const detailVegetationWaterDistance = preparedFrame.vegetationWaterDistance;
     const detailRiverSplines = preparedFrame.riverSplines;
     const detailVegetationGeometry = preparedFrame.vegetationGeometry;
@@ -1611,6 +2038,8 @@ export function renderPreparedMountainExportTile(
       heightmapLowerLimitMOverride: heightmapLowerLimitM,
       maxErosionDepthMOverride: maxErosionDepthM,
       mountainIllustrationRGBA,
+      mountainIllustrationInkAlpha,
+      mountainIllustrationMaterialRGBA,
     };
     return { frame, dem: detailDem, options: detailOptions };
     };

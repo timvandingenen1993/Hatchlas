@@ -58,6 +58,11 @@ export interface MountainExportRequest extends MountainExportSettings {
   colEnd?: number;
   /** Enable console timing for this export request. */
   profile?: boolean;
+  /**
+   * Optional camera-tile helper memory budget in GB. Without it the worker
+   * derives the budget from the machine's reported RAM.
+   */
+  helperMemoryGb?: number;
   /** Internal diagnostic switch used to compare camera export scheduling. */
   debugForceSerialCameraTiles?: boolean;
   /** Towns pre-rendered at export scale, drawn upright over the final image. */

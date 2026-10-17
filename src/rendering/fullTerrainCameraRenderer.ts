@@ -24,6 +24,12 @@ export interface FullTerrainCameraSettings {
   ridgeThicknessScale?: number;
   /** Temporary test switch for charcoal primary crest strokes. */
   charcoalRidges?: boolean;
+  /**
+   * Source-space 0..1 cover (forest stands) at a texture position. The
+   * primary ridge ink gives way to the texture there in proportion, as the
+   * map's own linework does inside the stands.
+   */
+  ridgeCover?: (x: number, y: number) => number;
   /** Projection used by the full-terrain camera. */
   cameraType?: FullTerrainCameraType;
   /** Camera elevation above the terrain plane, in degrees. */
@@ -470,9 +476,13 @@ function renderFullTerrainCameraInternal(
   const background = requested.background ?? DEFAULT_BACKGROUND;
   const perspective = cameraType === 'perspective';
   const foregroundSource = requested.foregroundSource;
-  const foregroundSourceX = foregroundSource ? new Float64Array(total) : undefined;
-  const foregroundSourceY = foregroundSource ? new Float64Array(total) : undefined;
-  const foregroundSampleMask = foregroundSource ? new Uint8Array(total) : undefined;
+  const ridgeCover = requested.ridgeCover;
+  // Source position of the visible surface per output pixel, for the passes
+  // after texturing (foreground props, ridge cover).
+  const tracksSurface = foregroundSource !== undefined || ridgeCover !== undefined;
+  const surfaceSourceX = tracksSurface ? new Float64Array(total) : undefined;
+  const surfaceSourceY = tracksSurface ? new Float64Array(total) : undefined;
+  const surfaceSampleMask = tracksSurface ? new Uint8Array(total) : undefined;
   const output = new Uint8ClampedArray(total * 4);
   for (let index = 0; index < total; index++) {
     const offset = index * 4;
@@ -572,10 +582,10 @@ function renderFullTerrainCameraInternal(
             }
             if (depth >= depthBuffer[index]) {
               depthBuffer[index] = depth;
-              if (foregroundSourceX && foregroundSourceY && foregroundSampleMask) {
-                foregroundSampleMask[index] = 1;
-                foregroundSourceX[index] = sourceX;
-                foregroundSourceY[index] = sourceY;
+              if (surfaceSourceX && surfaceSourceY && surfaceSampleMask) {
+                surfaceSampleMask[index] = 1;
+                surfaceSourceX[index] = sourceX;
+                surfaceSourceY[index] = sourceY;
               }
               if (sourceXBuffer && sourceYBuffer && sampleMask) {
                 sampleMask[index] = 1;
@@ -618,10 +628,10 @@ function renderFullTerrainCameraInternal(
             const index = (y - rowStart) * width + x;
             if (affineDepth >= depthBuffer[index]) {
               depthBuffer[index] = affineDepth;
-              if (foregroundSourceX && foregroundSourceY && foregroundSampleMask) {
-                foregroundSampleMask[index] = 1;
-                foregroundSourceX[index] = affineSourceX;
-                foregroundSourceY[index] = affineSourceY;
+              if (surfaceSourceX && surfaceSourceY && surfaceSampleMask) {
+                surfaceSampleMask[index] = 1;
+                surfaceSourceX[index] = affineSourceX;
+                surfaceSourceY[index] = affineSourceY;
               }
               if (sourceXBuffer && sourceYBuffer && sampleMask) {
                 sampleMask[index] = 1;
@@ -831,6 +841,24 @@ function renderFullTerrainCameraInternal(
     }
     ridgeSegments = [...uniqueSegments.values()].sort((a, b) => a.order - b.order);
   }
+  // Ridge ink inside forest stands gives way to the texture in proportion to
+  // the cover, so the textured pixels are kept to blend back to: only the
+  // rows the ridge strokes reach, not the whole band.
+  let ridgeFirstRow = height;
+  let ridgeLastRow = -1;
+  if (ridgeCover) {
+    for (const { a, b, radius } of ridgeSegments) {
+      ridgeFirstRow = Math.min(ridgeFirstRow, Math.floor(Math.min(a.y, b.y) - radius - 1) - rowStart);
+      ridgeLastRow = Math.max(ridgeLastRow, Math.ceil(Math.max(a.y, b.y) + radius + 1) - rowStart);
+    }
+    ridgeFirstRow = Math.max(0, ridgeFirstRow);
+    ridgeLastRow = Math.min(height - 1, ridgeLastRow);
+  }
+  const ridgeStart = ridgeFirstRow * width;
+  const ridgeEnd = (ridgeLastRow + 1) * width;
+  const beforeRidges = ridgeCover && ridgeLastRow >= ridgeFirstRow
+    ? output.slice(ridgeStart * 4, ridgeEnd * 4)
+    : undefined;
   for (const segment of ridgeSegments) {
     const { a, b } = segment;
     paintMountainCameraSegment(output, width, height, a, b, segment.radius,
@@ -841,14 +869,32 @@ function renderFullTerrainCameraInternal(
         return Number.isFinite(depthBuffer[index]) && depth >= depthBuffer[index] - depthTolerance;
       }, rowStart);
   }
-  if (foregroundSource && foregroundSourceX && foregroundSourceY && foregroundSampleMask) {
+  if (ridgeCover && beforeRidges && surfaceSourceX && surfaceSourceY && surfaceSampleMask) {
+    for (let index = ridgeStart; index < ridgeEnd; index++) {
+      if (!surfaceSampleMask[index]) continue;
+      const offset = index * 4;
+      const before = offset - ridgeStart * 4;
+      if (output[offset] === beforeRidges[before]
+        && output[offset + 1] === beforeRidges[before + 1]
+        && output[offset + 2] === beforeRidges[before + 2]) continue;
+      const cover = Math.max(0, Math.min(1,
+        ridgeCover(surfaceSourceX[index], surfaceSourceY[index])));
+      if (cover <= 0) continue;
+      for (let channel = 0; channel < 3; channel++) {
+        output[offset + channel] = Math.round(
+          output[offset + channel] * (1 - cover) + beforeRidges[before + channel] * cover,
+        );
+      }
+    }
+  }
+  if (foregroundSource && surfaceSourceX && surfaceSourceY && surfaceSampleMask) {
     const foregroundPixels = new Uint8ClampedArray(total * 4);
     for (let index = 0; index < total; index++) {
-      if (!foregroundSampleMask[index]) continue;
+      if (!surfaceSampleMask[index]) continue;
       sampleRGBAInto(
         foregroundSource,
-        foregroundSourceX[index],
-        foregroundSourceY[index],
+        surfaceSourceX[index],
+        surfaceSourceY[index],
         foregroundPixels,
         index * 4,
       );
@@ -978,7 +1024,10 @@ export function getCameraBandTextureTileKeys(
 
 /** Processes only row regions whose complete bilinear texture footprint fits
  * the caller's cache budget. Oversized regions are rasterized as two smaller
- * regions, releasing the parent plan before either child is prepared. */
+ * regions, releasing the parent plan before either child is prepared.
+ * `bytesPerPixel` must match what the caller's cache holds per source pixel
+ * (8 when every tile also carries a foreground layer), or a region that
+ * "fits" overflows the cache once its tiles are pinned. */
 export async function processFullTerrainCameraBandWithinTextureBudget(
   dem: MountainDEMData,
   rowStart: number,
@@ -997,6 +1046,7 @@ export async function processFullTerrainCameraBandWithinTextureBudget(
     settings: FullTerrainCameraSettings,
   ) => FullTerrainCameraBandPlan = (start, end, settings) =>
     prepareFullTerrainCameraBand(dem, start, end, settings),
+  bytesPerPixel = 4,
 ): Promise<number> {
   const sourceWidth = Math.max(2, Math.floor(
     requested.outputWidth ?? requested.projection?.width ?? dem.width,
@@ -1009,7 +1059,7 @@ export async function processFullTerrainCameraBandWithinTextureBudget(
     for (const key of keys) {
       const [tileX, tileY] = key.split(',').map(Number);
       bytes += Math.min(tileSize, sourceWidth - tileX)
-        * Math.min(tileSize, sourceHeight - tileY) * 4;
+        * Math.min(tileSize, sourceHeight - tileY) * bytesPerPixel;
     }
     return bytes;
   };

@@ -793,7 +793,7 @@ function traceStandEdges(mask: Float32Array, width: number, height: number, minL
  */
 const SHADOW_MARGIN = 0.1;
 
-function clusterLight(mask: Float32Array, light: Float32Array, width: number, height: number, size: number, seed: number): Float32Array {
+export function clusterLight(mask: Float32Array, light: Float32Array, width: number, height: number, size: number, seed: number): Float32Array {
   const result = new Float32Array(width * height).fill(0.5);
   const rng = mulberry(seed ^ 0x1c1a57e2);
   const spacing = size * (3.5 + rng());

@@ -121,6 +121,8 @@ export interface MountainFieldGpuSession {
     control?: MountainFieldGpuPrepareControl,
   ): Promise<{
     data: Uint8ClampedArray;
+    /** The layer's rock and snow without its linework. */
+    materialData?: Uint8ClampedArray;
     uploadMs: number;
     computeMs: number;
     readbackMs: number;
@@ -227,6 +229,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  * one independent invocation per output cell. The exact CPU painter remains
  * available for cpuExact and for any request that cannot use this pass.
  */
+const LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+
 const MOUNTAIN_RASTER_SHADER = /* wgsl */ `
 struct Params {
   width: u32,
@@ -242,10 +246,13 @@ struct Params {
 @group(0) @binding(0) var<storage, read> baseElevation: array<f32>;
 // Two vec4 values per cell pack the seven support fields into one storage
 // binding. This keeps the pass below the WebGPU minimum of eight storage
-// buffers per compute stage (base + support + destination = three).
+// buffers per compute stage (base + support + both destinations = four).
 @group(0) @binding(1) var<storage, read> supportFields: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> destination: array<u32>;
 @group(0) @binding(3) var<uniform> params: Params;
+// The rock and snow alone, without ridge, rib or crease lines: the ground
+// the compositor shows under forest stands.
+@group(0) @binding(4) var<storage, read_write> materialDestination: array<u32>;
 
 fn clamp01(value: f32) -> f32 { return clamp(value, 0.0, 1.0); }
 
@@ -289,6 +296,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   rock = rock * (0.72 + localLight * 0.48);
   var color = mix3(rock, params.snowShadow.xyz, snowBand * 0.48);
   color = mix3(color, params.snow.xyz, snowBand * 0.72);
+  materialDestination[index] = pack(color.x, color.y, color.z, broadCoverage);
   color = mix3(color, params.ridge.xyz, ridge * 0.18 + line * 0.10);
   color = mix3(color, params.ink.xyz, crease * 0.24);
   let alpha = clamp01(max(broadCoverage, max(ridge * 0.78, line * 0.42)));
@@ -1253,6 +1261,7 @@ class WebGpuMountainFieldSession implements MountainFieldGpuSession {
     control: MountainFieldGpuPrepareControl = {},
   ): Promise<{
     data: Uint8ClampedArray;
+    materialData: Uint8ClampedArray;
     uploadMs: number;
     computeMs: number;
     readbackMs: number;
@@ -1295,6 +1304,8 @@ class WebGpuMountainFieldSession implements MountainFieldGpuSession {
     const supportFields = upload(packedSupportFields);
     const destination = createTemporary(total * Uint32Array.BYTES_PER_ELEMENT, STORAGE | COPY_SRC);
     const readback = createTemporary(total * Uint32Array.BYTES_PER_ELEMENT, MAP_READ | COPY_DST);
+    const materialDestination = createTemporary(total * Uint32Array.BYTES_PER_ELEMENT, STORAGE | COPY_SRC);
+    const materialReadback = createTemporary(total * Uint32Array.BYTES_PER_ELEMENT, MAP_READ | COPY_DST);
     const params = createTemporary(96, UNIFORM | COPY_DST);
     const ink = colorToUnit(options.inkColor ?? [43, 56, 66]);
     const ridge = colorToUnit(options.ridgeColor ?? [43, 56, 66]);
@@ -1327,6 +1338,7 @@ class WebGpuMountainFieldSession implements MountainFieldGpuSession {
         { binding: 1, resource: { buffer: supportFields } },
         { binding: 2, resource: { buffer: destination } },
         { binding: 3, resource: { buffer: params } },
+        { binding: 4, resource: { buffer: materialDestination } },
       ],
     }));
     pass.dispatchWorkgroups(Math.ceil(sources.width / 8), Math.ceil(sources.height / 8));
@@ -1335,6 +1347,13 @@ class WebGpuMountainFieldSession implements MountainFieldGpuSession {
       destination,
       0,
       readback,
+      0,
+      total * Uint32Array.BYTES_PER_ELEMENT,
+    );
+    encoder.copyBufferToBuffer(
+      materialDestination,
+      0,
+      materialReadback,
       0,
       total * Uint32Array.BYTES_PER_ELEMENT,
     );
@@ -1350,13 +1369,13 @@ class WebGpuMountainFieldSession implements MountainFieldGpuSession {
     if (control.checkpoint) await control.checkpoint();
     throwIfCancelled();
     const readbackStarted = now();
-    let mapped = false;
-    try {
-      await readback.mapAsync(MAP_READ_MODE, 0, total * Uint32Array.BYTES_PER_ELEMENT);
-      mapped = true;
-      const packed = new Uint32Array(
-        readback.getMappedRange(0, total * Uint32Array.BYTES_PER_ELEMENT).slice(0),
-      );
+    const mapped: GPUBuffer[] = [];
+    const unpack = (buffer: GPUBuffer): Uint8ClampedArray => {
+      const bytes = buffer.getMappedRange(0, total * Uint32Array.BYTES_PER_ELEMENT).slice(0);
+      // Packed r | g << 8 | b << 16 | a << 24 is already RGBA in memory on a
+      // little-endian machine.
+      if (LITTLE_ENDIAN) return new Uint8ClampedArray(bytes);
+      const packed = new Uint32Array(bytes);
       const data = new Uint8ClampedArray(total * 4);
       for (let index = 0; index < packed.length; index++) {
         const value = packed[index];
@@ -1366,8 +1385,16 @@ class WebGpuMountainFieldSession implements MountainFieldGpuSession {
         data[offset + 2] = (value >>> 16) & 255;
         data[offset + 3] = value >>> 24;
       }
+      return data;
+    };
+    try {
+      await Promise.all([readback, materialReadback].map(async buffer => {
+        await buffer.mapAsync(MAP_READ_MODE, 0, total * Uint32Array.BYTES_PER_ELEMENT);
+        mapped.push(buffer);
+      }));
       return {
-        data,
+        data: unpack(readback),
+        materialData: unpack(materialReadback),
         uploadMs,
         computeMs,
         readbackMs: now() - readbackStarted,
@@ -1376,7 +1403,7 @@ class WebGpuMountainFieldSession implements MountainFieldGpuSession {
         peakGpuBytes: this.peakWorkingBytes,
       };
     } finally {
-      if (mapped) readback.unmap();
+      for (const buffer of mapped) buffer.unmap();
       for (const buffer of temporary) buffer.destroy();
     }
   }

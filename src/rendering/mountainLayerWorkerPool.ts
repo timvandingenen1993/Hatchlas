@@ -88,7 +88,10 @@ export interface MountainLayerWorkerControl {
  * so it can run beside a "water" job on a second worker. "vegetationFlow" and
  * "vegetationProps" are its two independent halves for a third worker. */
 export type MountainLayerPreparationMode =
-  | "all" | "water" | "vegetationGeometry" | "vegetation" | "vegetationFlow" | "vegetationProps";
+  | "all" | "water" | "vegetationGeometry" | "vegetation" | "vegetationFlow" | "vegetationProps"
+  // Geometry-only halves of "vegetationGeometry" for exports: no water pass
+  // and no overlay, merged with mergeVegetationGeometry.
+  | "vegetationGeometryFlow" | "vegetationGeometryProps";
 
 export interface MountainLayerTimingMarks {
   queuedAt: number;
@@ -205,7 +208,7 @@ function estimateBytes(value: unknown, seen = new Set<ArrayBuffer>()): number {
   return Object.values(value).reduce((total, child) => total + estimateBytes(child, seen), 0);
 }
 
-function estimateLayerSnapshotBytes(dem: MountainDEMData): number {
+function estimateLayerSnapshotBytes(dem: MountainDEMData, fullFidelity = false): number {
   return estimateBytes([
     dem.elevation,
     dem.normalizedElevation,
@@ -231,18 +234,31 @@ function estimateLayerSnapshotBytes(dem: MountainDEMData): number {
     dem.visualWaterMask,
     dem.wetlandPoolCoverage,
     dem.visualWaterCoverage,
+    ...(fullFidelity ? [dem.hillshade, dem.runoffDepthMmYr] : []),
   ]);
+}
+
+/** Export geometry halves must match a local build exactly. */
+function needsFullFidelitySnapshot(mode: MountainLayerPreparationMode): boolean {
+  return mode === "vegetationGeometryFlow" || mode === "vegetationGeometryProps";
 }
 
 function cloneArray<T extends ArrayBufferView>(value: T): T {
   return (value as unknown as { slice(): unknown }).slice() as T;
 }
 
-/** Copy only fields consumed by water/vegetation stages. The authoritative
- * DEM stays owned by the coordinator and is never transferred. */
-function cloneLayerDEM(
+/**
+ * Copy only fields consumed by water/vegetation stages. The authoritative
+ * DEM stays owned by the coordinator and is never transferred.
+ *
+ * Prop stands also read hillshade (stand light) and runoff (forest habitat).
+ * The default snapshot leaves them empty, as the preview always has; a full
+ * fidelity snapshot includes them so an export half equals a local build.
+ */
+export function cloneLayerDEM(
   dem: MountainDEMData,
   waterCoverageOverride?: Float32Array,
+  fullFidelity = false,
 ): MountainDEMData {
   const emptyFloat = () => new Float32Array(0);
   return {
@@ -260,14 +276,14 @@ function cloneLayerDEM(
     slopeDeg: cloneArray(dem.slopeDeg),
     aspectDeg: emptyFloat(),
     normals: emptyFloat(),
-    hillshade: emptyFloat(),
+    hillshade: fullFidelity && dem.hillshade ? cloneArray(dem.hillshade) : emptyFloat(),
     ambientOcclusion: emptyFloat(),
     curvature: cloneArray(dem.curvature),
     tpi: cloneArray(dem.tpi),
     flowAccumulation: cloneArray(dem.flowAccumulation),
     drainageAreaKm2: cloneArray(dem.drainageAreaKm2),
     rainfallWeightedAreaKm2: cloneArray(dem.rainfallWeightedAreaKm2),
-    runoffDepthMmYr: emptyFloat(),
+    runoffDepthMmYr: fullFidelity && dem.runoffDepthMmYr ? cloneArray(dem.runoffDepthMmYr) : emptyFloat(),
     dischargeM3s: emptyFloat(),
     strahlerOrder: cloneArray(dem.strahlerOrder),
     riverCenterlineMask: cloneArray(dem.riverCenterlineMask),
@@ -436,7 +452,8 @@ export class MountainLayerWorkerPool {
       this.skipReason = "cancelled";
       return Promise.reject(new MountainLayerWorkerCancelledError());
     }
-    const sourceBytes = estimateLayerSnapshotBytes(dem);
+    const fullFidelity = needsFullFidelitySnapshot(mode);
+    const sourceBytes = estimateLayerSnapshotBytes(dem, fullFidelity);
     const optionBytes = estimateBytes(options);
     // Reserve a source snapshot and a conservative output allowance before
     // dispatch. If the cap would be exceeded, the caller deliberately stays
@@ -454,7 +471,7 @@ export class MountainLayerWorkerPool {
       return Promise.resolve(null);
     }
     const snapshotStarted = performance.now();
-    const snapshot = cloneLayerDEM(dem, control.waterCoverageOverride);
+    const snapshot = cloneLayerDEM(dem, control.waterCoverageOverride, fullFidelity);
     const inputCopyMs = performance.now() - snapshotStarted;
     if (control.isCancelled?.()) return Promise.reject(new MountainLayerWorkerCancelledError());
     const id = this.nextId++;
@@ -556,6 +573,8 @@ export class MountainLayerWorkerPool {
       case "water": return this.workers[0];
       case "vegetationFlow": return this.workers[Math.min(1, last)];
       case "vegetationProps": return this.workers[Math.min(2, last)];
+      // Export halves run without a water job, so two workers suffice.
+      case "vegetationGeometryFlow": return this.workers[0];
       default: return this.workers[last];
     }
   }
