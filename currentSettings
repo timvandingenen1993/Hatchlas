@@ -33,55 +33,44 @@
     "vegetationRasterPropBiomeSettings": {
         "2": {
             "density": 1.6,
-            "clustering": 0.55
+            "treeDensity": 1.65,
+            "clustering": 0.5,
+            "treeColor": "#468b52"
         },
         "3": {
             "density": 1.8,
-            "clustering": 0.7
+            "clustering": 0.5
         },
         "4": {
             "density": 2,
-            "clustering": 0.8
+            "clustering": 0.25,
+            "treeColor": "#4e9753"
         },
         "5": {
-            "shrubDensity": 1.15,
-            "shrubTreeShare": 0.05
+            "clustering": 0.6
         },
         "7": {
             "density": 2,
-            "clustering": 0.95
+            "clustering": 0.4,
+            "treeColor": "#83bb5d",
+            "shrubColor": "#7ea95b"
         },
-        "17": {
-            "density": 0.4,
-            "treeDensity": 0,
-            "clustering": 0.55,
-            "shrubColor": "#d1d595"
-        },
-        "18": {
-            "shrubDensity": 0.55,
-            "shrubTreeShare": 0
-        },
-        "19": {
-            "shrubDensity": 1.45,
-            "shrubTreeShare": 0.07
-        },
-        "20": {
-            "shrubDensity": 1.45,
-            "shrubTreeShare": 0.07
+        "9": {
+            "clustering": 0.6
         }
     },
     "vegetationRasterPropDensity": 1.55,
     "vegetationMountainBoulderDensity": 0,
     "vegetationMountainBoulderSize": 0.6,
     "vegetationWetlandShrubDensity": 2,
-    "vegetationRasterPropScale": 0.2,
+    "vegetationRasterPropScale": 0.05,
     "vegetationRasterPropClustering": 1,
-    "vegetationRasterPropStandSize": 0.9,
-    "vegetationRasterPropPlacementNoiseScale": 0.45,
+    "vegetationRasterPropStandSize": 0.25,
+    "vegetationRasterPropPlacementNoiseScale": 1.5,
     "forestSettings": {
         "seed": 23817,
-        "density": 0,
-        "clustering": 0.55,
+        "density": 1.65,
+        "clustering": 0.4,
         "canopyMerging": 35,
         "canopyEdgeNoiseSize": 1.1,
         "canopyWashNoiseSize": 1.7,
@@ -115,27 +104,29 @@
         "centerSegmentRemoval": 0.5,
         "showCenterDebug": false,
         "showFootprints": false,
+        "showStandDebug": false,
         "overlapLowerInterruptionMultiplier": 2,
         "charcoalInterruptionLength": 1,
         "standAccentTrees": 0.09,
         "standJoin": 2.5,
+        "biomeBlend": 24,
         "inkFillDensity": 0.75,
-        "inkEdgeDensity": 0.7,
+        "inkEdgeDensity": 0.9,
         "inkEdgeRows": 0.5,
         "inkEdgeDepth": 1.95,
         "inkMeadowTrees": 0.2,
         "inkGrass": 0.4,
         "inkLight": 0.2,
-        "inkWeight": 0.55,
-        "inkTint": 0.5,
-        "inkWashVariation": 0.5,
+        "inkWeight": 0.3,
+        "inkTint": 0.6,
+        "inkWashVariation": 0.3,
         "inkWashSoftness": 0.35,
         "inkCharcoal": 0.7,
         "inkInterruptions": 0.55
     },
     "forestSourceZoom": 1,
     "vegetationInkColor": "#000000",
-    "vegetationAridInkColor": "#000000",
+    "vegetationAridInkColor": "#3a2b1e",
     "forestOutlineColor": "#000000",
     "mountainHatchColor": "#000000",
     "mountainRidgeColor": "#000000",
@@ -155,12 +146,12 @@
         "12": "#d0b784",
         "13": "#918673",
         "14": "#5d5d52",
-        "15": "#e9d9a9",
+        "15": "#f4e2c2",
         "16": "#b09a78",
-        "17": "#bbb286",
+        "17": "#aaa46a",
         "18": "#8fa35a",
         "19": "#4f7a3a",
-        "20": "#779452"
+        "20": "#6a974e"
     },
     "vegetationBiomeTransitionStrength": 3,
     "biomeEdgeNoiseScaleM": 800,
@@ -197,15 +188,15 @@
     "mountainLineworkScale": 3,
     "mountainLineworkOpacity": 0.9,
     "mountainHatchOpacity": 1,
-    "mountainHatchHorizontalOpacity": 0.6,
-    "mountainHatchVerticalOpacity": 0.8,
-    "mountainHatchDensity": 0.3,
+    "mountainHatchHorizontalOpacity": 0.9,
+    "mountainHatchVerticalOpacity": 0.9,
+    "mountainHatchDensity": 0.4,
     "mountainLocalDetailDensityMax": 3,
     "mountainFoothillDetailMultiplier": 2.5,
     "mountainBiomeDetailMultiplier": 2,
-    "mountainHatchThickness": 0.6,
+    "mountainHatchThickness": 0.35,
     "mountainRidgeDensity": 0.5,
-    "mountainRidgeThickness": 0.65,
+    "mountainRidgeThickness": 0.45,
     "fullTerrainCameraEnabled": true,
     "fullTerrainCameraElevationDeg": 75,
     "fullTerrainCameraHeightExaggeration": 1.05,
@@ -216,7 +207,7 @@
     "hillshadeStrength": 1,
     "showHeightmapWater": false,
     "showRivers": true,
-    "riverThresholdKm2": 16,
+    "riverThresholdKm2": 10.02,
     "showWaterDetails": true,
     "showOceanDetails": true,
     "siltReachM": 2500,
@@ -246,7 +237,7 @@
     "waterOutlineLength": 3,
     "waterOutlineSmoothing": 4,
     "waterOutlineOpacity": 1,
-    "waterFlowDensity": 1.65,
+    "waterFlowDensity": 2,
     "waterFlowLength": 0.8,
     "waterFlowThickness": 0.45,
     "waterFlowSmoothing": 4,
@@ -255,8 +246,9 @@
     "waterFlowColor": "#000000",
     "wetlandElevationThresholdM": 454,
     "biomeRegionScaleKm": 0.01,
-    "waterStageScale": 0.8,
+    "waterStageScale": 0.3,
     "flowRateScale": 0.9,
+    "lakeEvaporationScale": 0,
     "waterLandscapeImpact": 1,
     "waterEvolutionStep": 0,
     "rainOverlayOpacity": 0,
@@ -275,9 +267,9 @@
     "contourColor": "#3c3c3c",
     "contourIndexColor": "#282828",
     "animateWater": false,
-    "zoom": 0.8183335451502665,
+    "zoom": 1,
     "pan": {
-        "x": 116,
-        "y": 66
+        "x": 0,
+        "y": 0
     }
 }
