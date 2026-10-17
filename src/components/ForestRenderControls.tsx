@@ -5,7 +5,7 @@
 import { INSPECTOR_BOUNDS } from "../config/inspectorBounds";
 import { FOREST_SETTING_LIMITS, type ForestRenderSettings } from "../rendering/forestCanvasRenderer";
 import { NumericControl } from "./NumericControl";
-import { InspectorColor, InspectorFold, InspectorNote, InspectorSelect, InspectorToggle } from "./InspectorParts";
+import { InspectorColor, InspectorFold, InspectorNote, InspectorSelect } from "./InspectorParts";
 
 interface ForestRenderControlsProps {
   settings: ForestRenderSettings;
@@ -157,9 +157,6 @@ export function ForestRenderControls({
       <InspectorFold title="Forest stands">
         {standControls.map(({ key, label, min, max, step, tip }) => slider(label, settings[key], min, max, step,
           (value) => update(key, value), defaults?.[key], tip, "×", FOREST_SETTING_LIMITS[key]))}
-        <InspectorToggle label="Stand debug view" checked={settings.showStandDebug} disabled={disabled}
-          onChange={(checked) => update("showStandDebug", checked)}
-          title="Shows how stands form, in black and white: light grey is the area the placed plants form, darker grey what is left after rounding (the drawn stand), black dots plants in a stand, hollow circles lone plants. One line per stand sums it up." />
       </InspectorFold>
       {slider("Terrain shade on props", settings.terrainShadeStrength, 0, 1, 0.01,
         (value) => update("terrainShadeStrength", value), defaults?.terrainShadeStrength,

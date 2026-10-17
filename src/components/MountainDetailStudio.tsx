@@ -741,6 +741,7 @@ export function MountainDetailStudio({
   const [vegetationShowFlowGuides, setVegetationShowFlowGuides] = useState<boolean>(false);
   const [vegetationShowWetlandDrynessOverlay, setVegetationShowWetlandDrynessOverlay] = useState<boolean>(false);
   const [vegetationShowAlpineTreeSuitability, setVegetationShowAlpineTreeSuitability] = useState<boolean>(false);
+  const [vegetationShowStandDiagnostics, setVegetationShowStandDiagnostics] = useState<boolean>(false);
   const [vegetationMotifShadowStrength, setVegetationMotifShadowStrength] = useState<number>(0.2);
   const [vegetationMotifShadowDistance, setVegetationMotifShadowDistance] = useState<number>(2.2);
   const [vegetationMotifShadowSoftness, setVegetationMotifShadowSoftness] = useState<number>(1.1);
@@ -2528,6 +2529,7 @@ export function MountainDetailStudio({
         seed: vegetationSeed,
         sunAzimuthDeg,
         outlineColor: forestOutlineColor,
+        showStandDebug: vegetationShowStandDiagnostics,
       },
         inkColor: vegetationInkColor,
         aridInkColor: vegetationAridInkColor,
@@ -2863,6 +2865,7 @@ export function MountainDetailStudio({
     vegetationShowFlowGuides,
     vegetationShowWetlandDrynessOverlay,
     vegetationShowAlpineTreeSuitability,
+    vegetationShowStandDiagnostics,
     vegetationMotifShadowStrength,
     vegetationMotifShadowDistance,
     vegetationMotifShadowSoftness,
@@ -3475,6 +3478,8 @@ export function MountainDetailStudio({
              seed: vegetationSeed,
              sunAzimuthDeg,
              outlineColor: forestOutlineColor,
+             // Like the other Ink diagnostics, the stand view is preview-only.
+             showStandDebug: false,
            },
           inkColor: vegetationInkColor,
         aridInkColor: vegetationAridInkColor,
@@ -4422,6 +4427,8 @@ export function MountainDetailStudio({
             <InspectorToggle label="Flow lines" checked={vegetationShowFlowGuides} onChange={setVegetationShowFlowGuides} />
             <InspectorToggle label="Wetland dryness" checked={vegetationShowWetlandDrynessOverlay} onChange={setVegetationShowWetlandDrynessOverlay} />
             <InspectorToggle label="Tree suitability" checked={vegetationShowAlpineTreeSuitability} onChange={setVegetationShowAlpineTreeSuitability} />
+            <InspectorToggle label="Forest stands" checked={vegetationShowStandDiagnostics} onChange={setVegetationShowStandDiagnostics}
+              title="Shows how stands form, in black and white: light grey is the area the placed plants form, darker grey what is left after rounding (the drawn stand), black dots plants in a stand, hollow circles lone plants. One line per stand sums it up." />
             {vegetationShowAlpineTreeSuitability && <div>
               <div aria-hidden="true" className="h-1.5 rounded" style={{ background: "linear-gradient(90deg, #a50026 0%, #f46d43 25%, #fee08b 50%, #a6d96a 75%, #1a9850 100%)" }} />
               <div className="mt-0.5 flex justify-between text-[10px] text-slate-500"><span>Less suitable</span><span>More suitable</span></div>
