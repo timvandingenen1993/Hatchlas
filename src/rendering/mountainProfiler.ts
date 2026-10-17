@@ -257,6 +257,38 @@ export function logMountainProfileReport(report: MountainProfileReport): void {
     })));
   }
   (console.groupEnd ?? (() => undefined)).call(console);
+  // The same report as one small text block, easy to copy out of a long log.
+  console.log(formatMountainProfileSummary(report));
+}
+
+/** Total plus the most expensive stages by self time, as plain text. */
+export function formatMountainProfileSummary(report: MountainProfileReport, limit = 30): string {
+  const { quality, failure } = report as { quality?: unknown; failure?: unknown };
+  const changed = report.changedSettings ?? [];
+  const lines = [
+    `[profile summary] #${report.requestId ?? "?"} ${report.layer ?? ""}`
+      + `${typeof quality === "string" ? ` ${quality}` : ""} ${report.width ?? "?"}x${report.height ?? "?"} `
+      + `${report.status} total ${(report.totalMs / 1000).toFixed(1)} s`,
+    ...(typeof failure === "string" ? [`  failure: ${failure}`] : []),
+    // A first render lists every setting; a change lists just what moved.
+    `  changed: ${changed.length === 0 ? "none" : changed.length > 12
+      ? `${changed.length} settings (first render)` : changed.join(", ")}`,
+    "   self s    total s  calls  stage",
+  ];
+  const stages = [...report.stages].sort((a, b) => b.selfMs - a.selfMs).slice(0, limit);
+  for (const stage of stages) {
+    lines.push(
+      `${(stage.selfMs / 1000).toFixed(1).padStart(9)} ${(stage.durationMs / 1000).toFixed(1).padStart(10)} `
+        + `${String(stage.calls).padStart(6)}  ${stage.stage}`,
+    );
+  }
+  // Scheduling and memory events explain wall time the stages alone do not.
+  const keyMetrics = report.metrics.filter(metric =>
+    /helper count|memory budget|memory pressure|helper failed|budget recoveries|tile sampling/i.test(metric.metric));
+  for (const metric of keyMetrics) {
+    lines.push(`  ${metric.metric}: total ${Number(metric.total.toFixed(2))} ${metric.unit} (${metric.samples}x)`);
+  }
+  return lines.join("\n");
 }
 
 /** Return the keys whose serialized value changed between two snapshots. */

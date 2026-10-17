@@ -3480,6 +3480,7 @@ export function processMountainBaseDEM(
     biomeCellSizeM > 0
       ? Math.max(0, Math.round((biomeRegionScaleKm * 1000.0) / biomeCellSizeM))
       : 0;
+  let biomeStepStop = profiler?.begin("DEM biomes · regional fields");
   const regionalElevation = smoothBiomeField(
     analysisElevation,
     width,
@@ -3509,6 +3510,8 @@ export function processMountainBaseDEM(
   );
   const elevationRangeM = Math.max(1, maxElevM - minElevM);
 
+  biomeStepStop?.();
+  biomeStepStop = profiler?.begin("DEM biomes · height above drainage");
   // Perennial drainage: routed river channels and lakes, not the sea.
   const drainageMask = new Uint8Array(totalCells);
   for (let index = 0; index < totalCells; index++) {
@@ -3524,6 +3527,8 @@ export function processMountainBaseDEM(
     drainageMask,
     d8Offsets,
   );
+  biomeStepStop?.();
+  biomeStepStop = profiler?.begin("DEM biomes · life-zone classification");
 
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
@@ -3603,6 +3608,8 @@ export function processMountainBaseDEM(
     }
   }
 
+  biomeStepStop?.();
+  biomeStepStop = profiler?.begin("DEM biomes · zone stabilizing");
   stabilizeWetlandBiomes(width, height, biomeType, wetlandCandidates);
   if (biomeRegionRadius > 0) {
     stabilizeBiomeZones(
@@ -3613,6 +3620,8 @@ export function processMountainBaseDEM(
       biomeRegionRadius >= 16 ? 2 : 1,
     );
   }
+  biomeStepStop?.();
+  biomeStepStop = profiler?.begin("DEM biomes · boundary warping");
   warpBiomeBoundaries(
     width,
     height,
@@ -3625,6 +3634,8 @@ export function processMountainBaseDEM(
     Math.max(0, options.biomeEdgeStrength ?? 1),
   );
 
+  biomeStepStop?.();
+  biomeStepStop = profiler?.begin("DEM biomes · desert, banks and riparian");
   separateDesertFromWetland(
     width,
     height,
@@ -3644,6 +3655,8 @@ export function processMountainBaseDEM(
     Math.max(1, options.biomeEdgeNoiseScaleM ?? DEFAULT_BIOME_EDGE_NOISE_SCALE_M),
   );
 
+  biomeStepStop?.();
+  biomeStepStop = profiler?.begin("DEM biomes · coasts");
   // Add shoreline materials after regional smoothing, preserving routed water.
   classifyCoastalBiomes(
     width,
@@ -3661,6 +3674,7 @@ export function processMountainBaseDEM(
     Math.max(1, options.biomeEdgeNoiseScaleM ?? DEFAULT_BIOME_EDGE_NOISE_SCALE_M),
     Math.max(0, options.biomeEdgeStrength ?? 1),
   );
+  biomeStepStop?.();
   biomeStop?.();
 
   return {

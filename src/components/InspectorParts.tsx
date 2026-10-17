@@ -67,10 +67,10 @@ export function InspectorToggle({ label, checked, onChange, disabled, title }: {
   </label>;
 }
 
-export function InspectorColor({ label, value, onChange, disabled }: {
-  label: string; value: string; onChange: (value: string) => void; disabled?: boolean;
+export function InspectorColor({ label, value, onChange, disabled, title }: {
+  label: string; value: string; onChange: (value: string) => void; disabled?: boolean; title?: string;
 }) {
-  return <label className={`flex items-center justify-between gap-2 py-0.5 text-[12px] text-slate-300 ${disabled ? "opacity-40" : ""}`}>
+  return <label className={`flex items-center justify-between gap-2 py-0.5 text-[12px] text-slate-300 ${disabled ? "opacity-40" : ""}`} title={title}>
     {label}
     <span className="flex items-center gap-2">
       <span className="font-mono text-[11px] uppercase text-slate-500">{value}</span>
@@ -80,12 +80,12 @@ export function InspectorColor({ label, value, onChange, disabled }: {
   </label>;
 }
 
-export function InspectorSelect<T extends string | number>({ label, value, options, onChange, disabled }: {
-  label: string; value: T; options: readonly (readonly [T, string])[]; onChange: (value: T) => void; disabled?: boolean;
+export function InspectorSelect<T extends string | number>({ label, value, options, onChange, disabled, title }: {
+  label: string; value: T; options: readonly (readonly [T, string])[]; onChange: (value: T) => void; disabled?: boolean; title?: string;
 }) {
   const [open, setOpen] = useState(false);
   const current = options.find(([option]) => option === value)?.[1] ?? String(value);
-  return <div className={`flex items-center justify-between gap-2 py-0.5 text-[12px] text-slate-300 ${disabled ? "opacity-40" : ""}`}>
+  return <div className={`flex items-center justify-between gap-2 py-0.5 text-[12px] text-slate-300 ${disabled ? "opacity-40" : ""}`} title={title}>
     <span className="shrink-0">{label}</span>
     <div className="relative min-w-0 max-w-[62%]" onKeyDown={(event) => { if (event.key === "Escape") setOpen(false); }}>
       <button type="button" aria-label={label} aria-haspopup="listbox" aria-expanded={open} disabled={disabled} onClick={() => setOpen(!open)}

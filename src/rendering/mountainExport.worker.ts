@@ -25,7 +25,11 @@ import {
   getMountainExportCameraElevation,
   getMountainExportCameraRidges,
   prepareMountainExportTile,
+  prepareMountainExportTileWithSampler,
+  sampleExportFieldsCpu,
+  buildMountainExportPattern,
 } from "./mountainExportRenderer";
+import { compareExportSamples, ExportTileGpuSampler } from "./exportTileGpuSampler";
 import type { MountainDetailImageData } from "./mountainDetailRenderer";
 import {
   prepareFullTerrainCameraProjection,
@@ -37,7 +41,10 @@ import {
 import {
   buildVegetationGeometry,
   buildWetlandImageWaterDistance,
+  mergeVegetationGeometry,
+  type VegetationGeometry,
 } from "./vegetationRenderer";
+import type { MountainPatternOverlay } from "./mountainPatternRenderer";
 import {
   buildMountainRoughnessField,
   buildMountainSnowTransportFields,
@@ -45,6 +52,9 @@ import {
 } from "./mountainIllustrationRenderer";
 import { encodeRgbaPngRows } from "../utils/pngEncoding";
 import type { PreparedMountainExportTile } from "./mountainExportRenderer";
+import { CameraTileScheduler } from "./cameraTileScheduler";
+import { getExportHelperMemoryBudget, readDeviceMemoryGb } from "./exportMemoryBudget";
+import { collectArrayBuffers, transferableBuffers } from "./transferables";
 import type {
   MountainExportGlobalContext,
   MountainExportRequest,
@@ -86,6 +96,9 @@ let mountainGpuSessionGeneration = 0;
 let mountainGpuSessionPromise: Promise<MountainGpuSession | null> | undefined;
 let mountainGpuFallbackReason: string | undefined;
 let layerWorkerPool: MountainLayerWorkerPool | null = null;
+// One worker per vegetation half. Each job holds a copy of the layer fields
+// (~80 bytes per analysis cell, ~450 MB at 2400²), so both fit side by side.
+const EXPORT_LAYER_POOL_OPTIONS = { maxWorkers: 2, maxCpuBytes: 2 * 1024 * 1024 * 1024 };
 const activeCameraTileWorkerCancels = new Map<number, () => void>();
 
 function usesMountainGpu(mode: MountainGpuRenderMode): boolean {
@@ -183,6 +196,13 @@ function recordParallelLayerProfile(
   }
 }
 
+/** Bytes a camera tile image holds: RGBA, foreground props and stand cover. */
+function cameraTileImageBytes(image: MountainDetailImageData): number {
+  return image.data.byteLength
+    + (image.foregroundPropsRGBA?.byteLength ?? 0)
+    + (image.standCover?.byteLength ?? 0);
+}
+
 interface CameraTileWorkerResult {
   image: MountainDetailImageData;
   foregroundPropsRGBA?: Uint8ClampedArray;
@@ -199,7 +219,7 @@ interface PendingCameraTile {
 }
 
 interface CameraTileWorkerClient {
-  render(prepared: PreparedMountainExportTile): Promise<CameraTileWorkerResult>;
+  render(prepared: PreparedMountainExportTile, transfer: Transferable[]): Promise<CameraTileWorkerResult>;
   dispose(): void;
 }
 
@@ -242,7 +262,7 @@ async function createCameraTileWorker(
     resolveReady?.(undefined);
   });
   const client: CameraTileWorkerClient = {
-    render(prepared): Promise<CameraTileWorkerResult> {
+    render(prepared, transfer): Promise<CameraTileWorkerResult> {
       if (failed || !initialized) {
         return Promise.reject(makeError("Camera tile worker is unavailable"));
       }
@@ -252,7 +272,9 @@ async function createCameraTileWorker(
         pending.set(id, { resolve, reject, startedAt });
         const postStartedAt = performance.now();
         try {
-          worker.postMessage({ type: "tile", id, prepared, profileEnabled });
+          // Transferring the tile-sized buffers avoids copying several hundred
+          // MB per tile and holding the copy next to the original.
+          worker.postMessage({ type: "tile", id, prepared, profileEnabled }, transfer);
           profiler?.recordMetric(
             "camera tile worker input dispatch",
             performance.now() - postStartedAt,
@@ -281,6 +303,7 @@ async function createCameraTileWorker(
       height?: number;
       data?: ArrayBuffer;
       foregroundData?: ArrayBuffer;
+      coverData?: ArrayBuffer;
       computeMs?: number;
       externalStages?: CameraTileWorkerResult["externalStages"];
       message?: string;
@@ -316,12 +339,13 @@ async function createCameraTileWorker(
       if (response.foregroundData) {
         image.foregroundPropsRGBA = new Uint8ClampedArray(response.foregroundData);
       }
+      if (response.coverData) image.standCover = new Uint8Array(response.coverData);
       job.resolve({
         image,
         foregroundPropsRGBA: image.foregroundPropsRGBA,
         computeMs: response.computeMs ?? 0,
         roundTripMs: performance.now() - job.startedAt,
-        outputBytes: image.data.byteLength + (image.foregroundPropsRGBA?.byteLength ?? 0),
+        outputBytes: cameraTileImageBytes(image),
         externalStages: response.externalStages ?? [],
       });
     };
@@ -338,20 +362,36 @@ async function createCameraTileWorker(
 }
 
 const CAMERA_TILE_CACHE_BUDGET_BYTES = 256 * 1024 * 1024;
-// Each helper holds one cloned prepared tile plus the renderer scratch, so its
-// memory depends on the tile size only, never on the size of the export.
-const CAMERA_HELPER_MEMORY_BUDGET_BYTES = 6 * 1024 * 1024 * 1024;
-const CAMERA_HELPER_MAX_COUNT = 4;
+// A cached camera tile holds RGBA, the foreground-prop RGBA layer and the
+// one-byte stand cover.
+const CAMERA_TILE_CACHE_BYTES_PER_PIXEL = 9;
+// Each helper holds one prepared tile plus the renderer scratch, so its memory
+// depends on the tile size only, never on the size of the export. Tiles are
+// admitted one by one against a budget that scales with the machine's RAM
+// (see exportMemoryBudget.ts).
+const CAMERA_HELPER_MAX_COUNT = 8;
 // Camera tile construction retains dozens of full-tile numeric fields across
 // terrain mapping, pattern mapping, and illustration painting. This estimate
 // deliberately rounds above the known live buffers.
 const CAMERA_TILE_SCRATCH_ESTIMATE_BYTES_PER_PIXEL = 320;
 // The prepared tile the helper receives: sampled terrain and vector inputs.
 const CAMERA_PREPARED_TILE_ESTIMATE_BYTES_PER_PIXEL = 200;
+// A wave frame: ~13 float and ~8 byte water fields plus the water overlay's
+// scratch, rounded up like the estimates above.
+const CAMERA_WAVE_FRAME_ESTIMATE_BYTES_PER_PIXEL = 200;
 
 // A helper that gets no result within this time is given up on, and its tile
 // is rendered here instead, so a dead or starved helper cannot hang the export.
 const CAMERA_HELPER_TILE_TIMEOUT_MS = 4 * 60 * 1000;
+
+/**
+ * A failed typed-array/ArrayBuffer allocation: memory ran short, not a bug.
+ * Helpers report errors as plain messages, so match on the text, not the type.
+ */
+function isOutOfMemoryError(error: unknown): boolean {
+  return error instanceof Error
+    && /allocation failed|out of memory|invalid (typed )?array length/i.test(error.message);
+}
 
 function withHelperTimeout<T>(promise: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -365,35 +405,28 @@ function withHelperTimeout<T>(promise: Promise<T>): Promise<T> {
 }
 
 /**
- * Memory a helper needs for each tile of the export, largest first. Edge tiles
- * can expand far beyond interior ones (wave halos), but only a few exist, so
- * the pool is sized by the sum of the largest N, which is the worst case that
- * N helpers can hold at once.
+ * Memory a helper needs while it renders one tile. Edge tiles can expand far
+ * beyond interior ones (wave halos), so each tile is admitted by its own size.
  */
-function estimateCameraTileBytesDescending(
+function estimateCameraTileHelperBytes(
   context: MountainExportGlobalContext,
-  tileSize: number,
-  halo: number,
-): number[] {
-  const tileBytes: number[] = [];
-  for (let y = 0; y < context.outputHeight; y += tileSize) {
-    for (let x = 0; x < context.outputWidth; x += tileSize) {
-      const tile: MountainExportTile = {
-        x,
-        y,
-        width: Math.min(tileSize, context.outputWidth - x),
-        height: Math.min(tileSize, context.outputHeight - y),
-        halo,
-      };
-      const dimensions = getMountainExportTileDimensions(context, tile);
-      tileBytes.push(
-        dimensions.width * dimensions.height
-          * (CAMERA_TILE_SCRATCH_ESTIMATE_BYTES_PER_PIXEL + CAMERA_PREPARED_TILE_ESTIMATE_BYTES_PER_PIXEL)
-          + tile.width * tile.height * 4,
-      );
-    }
-  }
-  return tileBytes.sort((a, b) => b - a);
+  tile: MountainExportTile,
+): number {
+  const dimensions = getMountainExportTileDimensions(context, tile);
+  // A coastal tile's wave frame reaches past its terrain and carries a
+  // water-only terrain plus the water overlay's own scratch.
+  const waveHalo = dimensions.illustrated && dimensions.compositeHalo < dimensions.detailHalo
+    ? dimensions.detailHalo
+    : 0;
+  const waveWidth = Math.min(context.outputWidth, tile.x + tile.width + waveHalo) - Math.max(0, tile.x - waveHalo);
+  const waveHeight = Math.min(context.outputHeight, tile.y + tile.height + waveHalo) - Math.max(0, tile.y - waveHalo);
+  const wavePixels = waveWidth * waveHeight > dimensions.width * dimensions.height
+    ? waveWidth * waveHeight
+    : 0;
+  return dimensions.width * dimensions.height
+    * (CAMERA_TILE_SCRATCH_ESTIMATE_BYTES_PER_PIXEL + CAMERA_PREPARED_TILE_ESTIMATE_BYTES_PER_PIXEL)
+    + wavePixels * CAMERA_WAVE_FRAME_ESTIMATE_BYTES_PER_PIXEL
+    + tile.width * tile.height * 4;
 }
 
 function post(message: MountainExportWorkerResponse): void {
@@ -575,6 +608,10 @@ async function runExport(request: MountainExportRequest): Promise<void> {
     () => cancelled.has(request.id),
   );
   let completedTiles = 0;
+  // GPU field sampling for camera tiles, created on the first tile.
+  let tileGpuSamplerPromise: Promise<ExportTileGpuSampler | null> | undefined;
+  let tileGpuSamplerDisabled = false;
+  let tileGpuSamplerFallback: string | undefined;
   let exportGpuFallback = false;
   let cpuFieldBackend: MountainIllustrationFieldBackend | null = null;
   const profileSettings = request.profile === true ? {
@@ -841,20 +878,25 @@ async function runExport(request: MountainExportRequest): Promise<void> {
     ? ensureMountainGpuSession(gpuMode)
     : undefined;
   void gpuSessionPromise?.catch(() => undefined);
-  let parallelVegetationPromise: ReturnType<MountainLayerWorkerPool["prepare"]> | undefined;
-  if (render.layer === "vegetation_patterns" && !cameraEnabled && render.vegetation) {
-    if (!layerWorkerPool) layerWorkerPool = new MountainLayerWorkerPool();
+  // Vegetation is the longest global stage. Its flow and prop halves are
+  // independent, so two layer workers build them side by side while this
+  // worker traces rivers and coastlines and prepares snow and the mountain
+  // drawing. A half the pool skips (memory budget) is built here instead.
+  let parallelVegetationPromise: Promise<
+    [MountainLayerPreparationResult | null, MountainLayerPreparationResult | null]
+  > | undefined;
+  if (render.layer === "vegetation_patterns" && render.vegetation) {
+    if (!layerWorkerPool) layerWorkerPool = new MountainLayerWorkerPool(EXPORT_LAYER_POOL_OPTIONS);
     if (layerWorkerPool.available) {
-      parallelVegetationPromise = layerWorkerPool.prepare(
-        dem,
-        render,
-        {
-          isCancelled: execution.cancelled,
-          checkpoint: () => execution.checkpoint(true),
-          profile: Boolean(profiler),
-        },
-        "vegetationGeometry",
-      );
+      const control = {
+        isCancelled: execution.cancelled,
+        checkpoint: () => execution.checkpoint(true),
+        profile: Boolean(profiler),
+      };
+      parallelVegetationPromise = Promise.all([
+        layerWorkerPool.prepare(dem, render, control, "vegetationGeometryFlow"),
+        layerWorkerPool.prepare(dem, render, control, "vegetationGeometryProps"),
+      ]);
       void parallelVegetationPromise.catch(() => undefined);
     }
   }
@@ -909,64 +951,6 @@ async function runExport(request: MountainExportRequest): Promise<void> {
     }
   }
   vectorPreparationStop?.();
-  const vegetationPreparationStop = profiler?.begin("export global vegetation preparation");
-  if (render.layer === "vegetation_patterns") beginStage("Preparing vegetation geometry");
-  let vegetationGeometry: ReturnType<typeof buildVegetationGeometry> | undefined;
-  if (parallelVegetationPromise) {
-    try {
-      const prepared = await parallelVegetationPromise;
-      if (prepared?.vegetationGeometry) {
-        vegetationGeometry = prepared.vegetationGeometry;
-        profiler?.setMetadata({ parallelLayerBackend: "worker" });
-        recordParallelLayerProfile(profiler, prepared.profile);
-        profiler?.recordMetric("parallel vegetation geometry", prepared.timings.vegetationGeometryMs, "ms");
-        profiler?.recordMetric(
-          "parallel vegetation worker total",
-          prepared.timings.wallMs ?? prepared.timings.totalMs,
-          "ms",
-        );
-        profiler?.recordMetric("parallel vegetation worker compute", prepared.timings.totalMs, "ms");
-        profiler?.recordMetric("parallel vegetation bootstrap", prepared.timings.bootstrapMs ?? 0, "ms");
-        profiler?.recordMetric("parallel vegetation input copy", prepared.timings.inputCopyMs ?? 0, "ms");
-        profiler?.recordMetric("parallel vegetation input transfer", prepared.timings.inputTransferMs ?? 0, "ms");
-        profiler?.recordMetric("parallel vegetation worker scheduling", prepared.timings.workerSchedulingMs ?? 0, "ms");
-        profiler?.recordMetric("parallel vegetation output transfer", prepared.timings.outputTransferMs ?? 0, "ms");
-        profiler?.recordMetric("parallel vegetation result handling", prepared.timings.resultHandlingMs ?? 0, "ms");
-        profiler?.recordMetric("parallel vegetation worker computation", prepared.timings.workerComputationMs ?? prepared.timings.totalMs, "ms");
-        profiler?.recordMetric("parallel vegetation queue and transfer", prepared.timings.queueMs ?? 0, "ms");
-        profiler?.recordMetric("parallel layer peak CPU", layerWorkerPool?.peakTrackedBytes ?? 0, "bytes");
-      }
-    } catch (error) {
-      if (execution.cancelled()) {
-        vegetationPreparationStop?.();
-        finishProfile("cancelled");
-        return;
-      }
-      profiler?.setMetadata({
-        parallelLayerBackend: "cpu-fallback",
-        parallelLayerFallback: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-  if (!vegetationGeometry && render.layer === "vegetation_patterns") {
-    vegetationGeometry = buildVegetationGeometry(
-      dem,
-      render.vegetation,
-      profiler,
-      (label, completed, total) => {
-        if (label !== stage) beginStage(label);
-        reportProgress("analysis", label, undefined, undefined, completed, total);
-      },
-    );
-  }
-  const vegetationWaterDistance = render.layer === "vegetation_patterns"
-    ? profiler
-      ? profiler.measure("vegetation wetland image distance", () =>
-          buildWetlandImageWaterDistance(dem, profiler),
-        )
-      : buildWetlandImageWaterDistance(dem, profiler)
-    : undefined;
-  vegetationPreparationStop?.();
   let globalSnowTransport: MountainSnowTransportFields | undefined;
   if (render.layer === "vegetation_patterns" || render.fullTerrainCameraElevationDeg !== undefined) {
     beginStage("Preparing wind and snow fields");
@@ -1029,6 +1013,82 @@ async function runExport(request: MountainExportRequest): Promise<void> {
         : buildMountainSnowTransportFields(dem, windAzimuthDeg);
     }
   }
+  // The mountain drawing needs only the DEM, so it is built here while the
+  // vegetation halves are still running on the layer workers.
+  let mountainPattern: MountainPatternOverlay | undefined;
+  if (render.layer === "vegetation_patterns" || cameraEnabled) {
+    beginStage("Drawing mountain ridges");
+    mountainPattern = profiler
+      ? profiler.measure("export mountain pattern", () => buildMountainExportPattern(dem, render, profiler))
+      : buildMountainExportPattern(dem, render);
+  }
+  const vegetationPreparationStop = profiler?.begin("export global vegetation preparation");
+  if (render.layer === "vegetation_patterns") beginStage("Preparing vegetation geometry");
+  let vegetationGeometry: VegetationGeometry | undefined;
+  if (render.layer === "vegetation_patterns") {
+    let flow: VegetationGeometry | undefined;
+    let props: VegetationGeometry | undefined;
+    if (parallelVegetationPromise) {
+      try {
+        const results = await parallelVegetationPromise;
+        flow = results[0]?.vegetationGeometry ?? undefined;
+        props = results[1]?.vegetationGeometry ?? undefined;
+        for (const prepared of results) {
+          if (!prepared) continue;
+          recordParallelLayerProfile(profiler, prepared.profile);
+          profiler?.recordMetric("parallel vegetation geometry", prepared.timings.vegetationGeometryMs, "ms");
+          profiler?.recordMetric(
+            "parallel vegetation worker total",
+            prepared.timings.wallMs ?? prepared.timings.totalMs,
+            "ms",
+          );
+          profiler?.recordMetric("parallel vegetation bootstrap", prepared.timings.bootstrapMs ?? 0, "ms");
+          profiler?.recordMetric("parallel vegetation input copy", prepared.timings.inputCopyMs ?? 0, "ms");
+          profiler?.recordMetric("parallel vegetation output transfer", prepared.timings.outputTransferMs ?? 0, "ms");
+          profiler?.recordMetric("parallel vegetation queue and transfer", prepared.timings.queueMs ?? 0, "ms");
+        }
+        profiler?.recordMetric("parallel layer peak CPU", layerWorkerPool?.peakTrackedBytes ?? 0, "bytes");
+        profiler?.setMetadata({
+          parallelLayerBackend: flow && props ? "worker" : flow || props ? "partial worker" : "cpu-fallback",
+        });
+      } catch (error) {
+        if (execution.cancelled()) {
+          vegetationPreparationStop?.();
+          finishProfile("cancelled");
+          return;
+        }
+        profiler?.setMetadata({
+          parallelLayerBackend: "cpu-fallback",
+          parallelLayerFallback: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    const buildHere = (part: "all" | "flow" | "props"): VegetationGeometry => buildVegetationGeometry(
+      dem,
+      render.vegetation,
+      profiler,
+      (label, completed, total) => {
+        if (label !== stage) beginStage(label);
+        reportProgress("analysis", label, undefined, undefined, completed, total);
+      },
+      part,
+    );
+    vegetationGeometry = !flow && !props
+      ? buildHere("all")
+      : mergeVegetationGeometry(flow ?? buildHere("flow"), props ?? buildHere("props"));
+  }
+  // The layer workers are done; their module caches would otherwise hold
+  // memory the tile helpers need.
+  layerWorkerPool?.dispose();
+  layerWorkerPool = null;
+  const vegetationWaterDistance = render.layer === "vegetation_patterns"
+    ? profiler
+      ? profiler.measure("vegetation wetland image distance", () =>
+          buildWetlandImageWaterDistance(dem, profiler),
+        )
+      : buildWetlandImageWaterDistance(dem, profiler)
+    : undefined;
+  vegetationPreparationStop?.();
   let currentCameraBandNumber = 0;
   let currentCameraBandStartRow = 0;
   let currentCameraBandCount = 0;
@@ -1044,6 +1104,7 @@ async function runExport(request: MountainExportRequest): Promise<void> {
     openOceanMask,
     oceanMaskCoverage,
     snowTransport: globalSnowTransport,
+    mountainPattern,
     outputWidth: request.outputWidth,
     outputHeight: request.outputHeight,
     profiler,
@@ -1061,6 +1122,12 @@ async function runExport(request: MountainExportRequest): Promise<void> {
       : undefined,
   };
   let cameraHelperPromise: Promise<CameraTileWorkerClient[]> = Promise.resolve([]);
+  /** Starts one more helper with the pool's settings (to replace a restarted one). */
+  let startCameraTileHelper: (() => Promise<CameraTileWorkerClient | undefined>) | undefined;
+  const helperMemoryBudget = getExportHelperMemoryBudget(
+    readDeviceMemoryGb(),
+    request.helperMemoryGb,
+  );
   /**
    * Starts the tile helper pool. Helpers receive only prepared tiles, so they
    * start before the global mountain pattern exists and their memory does not
@@ -1071,29 +1138,40 @@ async function runExport(request: MountainExportRequest): Promise<void> {
       profiler?.setMetadata({ cameraTileMode: "serial", cameraTileModeReason: "diagnostic override" });
       return;
     }
-    const tileBytes = estimateCameraTileBytesDescending(context, sourceTileSize, halo);
     const hardwareThreads = typeof navigator !== "undefined" ? navigator.hardwareConcurrency || 1 : 1;
-    // This worker prepares every tile, so helpers only do the rendering.
-    let helperCount = Math.max(0, Math.min(
+    // This worker prepares every tile, so helpers only do the rendering. The
+    // scheduler admits tiles by memory, but an idle helper still holds the
+    // caches and pooled buffers of its last tile, which the budget does not
+    // count. So start only as many helpers as the budget can run with
+    // typical interior tiles (corner tiles are smaller and would overcount).
+    const interiorX = request.outputWidth > sourceTileSize * 2 ? sourceTileSize : 0;
+    const interiorY = request.outputHeight > sourceTileSize * 2 ? sourceTileSize : 0;
+    const typicalTileBytes = estimateCameraTileHelperBytes(context, {
+      x: interiorX,
+      y: interiorY,
+      width: Math.min(sourceTileSize, request.outputWidth - interiorX),
+      height: Math.min(sourceTileSize, request.outputHeight - interiorY),
+      halo,
+    });
+    const helperCount = Math.max(0, Math.min(
       CAMERA_HELPER_MAX_COUNT,
-      Math.floor(hardwareThreads / 4),
+      Math.floor(hardwareThreads / 2) - 1,
       totalTiles - 1,
+      Math.max(1, Math.floor(helperMemoryBudget.bytes / Math.max(1, typicalTileBytes))),
     ));
-    // N helpers can at worst hold the N largest tiles at the same time.
-    let worstCaseBytes = 0;
-    for (let n = 0; n < helperCount; n++) worstCaseBytes += tileBytes[n] ?? 0;
-    while (helperCount > 0 && worstCaseBytes > CAMERA_HELPER_MEMORY_BUDGET_BYTES) {
-      helperCount--;
-      worstCaseBytes -= tileBytes[helperCount] ?? 0;
-    }
-    profiler?.recordMetric("camera export helper memory estimate", worstCaseBytes, "bytes");
     profiler?.recordMetric("camera export helper count", helperCount, "helpers");
+    profiler?.recordMetric("camera export helper memory budget", helperMemoryBudget.bytes, "bytes");
     if (request.profile === true) {
       console.log("[mountain export] camera helpers: " + helperCount + " (threads " + hardwareThreads
-        + ", worst-case " + Math.round(worstCaseBytes / 1048576) + " MiB)");
+        + ", memory budget " + Math.round(helperMemoryBudget.bytes / 1048576) + " MiB from "
+        + helperMemoryBudget.source
+        + (helperMemoryBudget.deviceMemoryGb !== undefined
+          ? ", device memory " + helperMemoryBudget.deviceMemoryGb + " GB"
+          : "")
+        + ")");
     }
     if (helperCount < 1) {
-      const reason = "thread count, memory budget or tile count leaves no helper";
+      const reason = "thread count or tile count leaves no helper";
       profiler?.setMetadata({ cameraTileMode: "serial", cameraTileModeReason: reason });
       console.warn("[mountain export] camera tiles render serially:", reason);
       return;
@@ -1103,13 +1181,15 @@ async function runExport(request: MountainExportRequest): Promise<void> {
     activeCameraTileWorkerCancels.set(request.id, () => {
       for (const cancel of cancels) cancel();
     });
+    startCameraTileHelper = () => createCameraTileWorker(
+      profiler,
+      request.profile === true,
+      cancel => cancels.push(cancel),
+      message => console.warn("[mountain export] camera tile helper could not start:", message),
+    );
+    const startHelper = startCameraTileHelper;
     cameraHelperPromise = Promise.all(
-      Array.from({ length: helperCount }, () => createCameraTileWorker(
-        profiler,
-        request.profile === true,
-        cancel => cancels.push(cancel),
-        message => console.warn("[mountain export] camera tile helper could not start:", message),
-      )),
+      Array.from({ length: helperCount }, () => startHelper()),
     ).then(helpers => {
       const started = helpers.filter((helper): helper is CameraTileWorkerClient => helper !== undefined);
       if (started.length < helperCount) {
@@ -1136,6 +1216,10 @@ async function runExport(request: MountainExportRequest): Promise<void> {
     helpers: CameraTileWorkerClient[],
   ): FullTerrainCameraTextureSource & {
     ensureTiles(keys: readonly string[]): Promise<void>;
+    /** Renders tiles ahead of need, in order, within the cache budget. */
+    prefetch(keys: readonly string[]): void;
+    /** Drops cached tiles that no later band samples. */
+    retire(keys: readonly string[]): void;
     pin(keys: readonly string[]): void;
     unpin(keys: readonly string[]): void;
     sampleField(
@@ -1151,11 +1235,11 @@ async function runExport(request: MountainExportRequest): Promise<void> {
       output: Uint8ClampedArray,
       offset: number,
     ): void;
+    sampleStandCover(x: number, y: number): number;
   } {
     const cache = new Map<string, MountainDetailImageData>();
     const renderedSourceTiles = new Set<string>();
     const pinnedKeys = new Set<string>();
-    const activeHelpers = [...helpers];
     let cachedBytes = 0;
     let cacheHits = 0;
     let cacheMisses = 0;
@@ -1188,11 +1272,22 @@ async function runExport(request: MountainExportRequest): Promise<void> {
         halo,
       };
     };
+    const dropTile = (key: string): void => {
+      const image = cache.get(key);
+      if (!image) return;
+      cache.delete(key);
+      cachedBytes -= cameraTileImageBytes(image);
+      if (key === `${mostRecentTileX},${mostRecentTileY}`) {
+        mostRecentTileX = -1;
+        mostRecentTileY = -1;
+        mostRecentImage = undefined;
+      }
+    };
     const storeTile = (tile: MountainExportTile, image: MountainDetailImageData): void => {
       const key = `${tile.x},${tile.y}`;
       if (cache.has(key)) return;
       cache.set(key, image);
-      cachedBytes += image.data.byteLength + (image.foregroundPropsRGBA?.byteLength ?? 0);
+      cachedBytes += cameraTileImageBytes(image);
       actualRenderCount++;
       if (!renderedSourceTiles.has(key)) {
         renderedSourceTiles.add(key);
@@ -1212,19 +1307,11 @@ async function runExport(request: MountainExportRequest): Promise<void> {
         }
         if (oldestKey === undefined) {
           cache.delete(key);
-          cachedBytes -= image.data.byteLength + (image.foregroundPropsRGBA?.byteLength ?? 0);
+          cachedBytes -= cameraTileImageBytes(image);
           throw new Error("Pinned camera texture tiles exceeded the 256 MiB cache budget");
         }
-        const oldest = cache.get(oldestKey);
-        cache.delete(oldestKey);
-        cachedBytes -= oldest?.data.byteLength ?? 0;
-        cachedBytes -= oldest?.foregroundPropsRGBA?.byteLength ?? 0;
+        dropTile(oldestKey);
         cacheEvictions++;
-        if (oldestKey === `${mostRecentTileX},${mostRecentTileY}`) {
-          mostRecentTileX = -1;
-          mostRecentTileY = -1;
-          mostRecentImage = undefined;
-        }
       }
       mostRecentTileX = tile.x;
       mostRecentTileY = tile.y;
@@ -1284,15 +1371,180 @@ async function runExport(request: MountainExportRequest): Promise<void> {
       profiler?.recordMetric("camera tile unprefetched fallback renders", 1, "tiles");
       return renderTileLocally(tileFromKey(key)).image;
     };
+    // Context buffers stay with this worker; only tile-sized buffers move.
+    const retainedBuffers = collectArrayBuffers(context);
+    /**
+     * Samples a tile's global fields on the GPU. The first tile is checked
+     * against the CPU sampler; a mismatch, an error or no WebGPU switches the
+     * rest of the export to CPU sampling. Returns undefined to use the CPU.
+     */
+    let gpuSamplingVerified = false;
+    let gpuUploadRecorded = false;
+    const prepareTileOnGpu = async (tile: MountainExportTile): Promise<PreparedMountainExportTile | undefined> => {
+      if (!usesMountainGpu(gpuMode) || tileGpuSamplerDisabled) return undefined;
+      tileGpuSamplerPromise ??= ExportTileGpuSampler.create().catch((error: unknown) => {
+        tileGpuSamplerFallback = error instanceof Error ? error.message : String(error);
+        return null;
+      });
+      const sampler = await tileGpuSamplerPromise;
+      if (!sampler) {
+        tileGpuSamplerDisabled = true;
+        profiler?.setMetadata({ tileSamplingBackend: "cpu", tileSamplingFallback: tileGpuSamplerFallback ?? "WebGPU is unavailable" });
+        return undefined;
+      }
+      try {
+        const prepared = await prepareMountainExportTileWithSampler(context, tile, async (requests, outputWidth, outputHeight) => {
+          const samples = await sampler.sample(requests, outputWidth, outputHeight);
+          if (!gpuSamplingVerified) {
+            const comparison = compareExportSamples(
+              requests,
+              sampleExportFieldsCpu(requests, outputWidth, outputHeight),
+              samples,
+            );
+            profiler?.recordMetric("gpu tile sampling max relative error", comparison.maxRelativeError, "ratio");
+            if (request.profile === true) {
+              console.log("[mountain export] GPU tile sampling check: max relative error "
+                + comparison.maxRelativeError.toExponential(2) + ", categorical mismatches "
+                + comparison.nearestMismatches);
+            }
+            if (comparison.nearestMismatches > 0 || !(comparison.maxRelativeError <= 1e-4)) {
+              throw new Error("GPU tile samples differ from the CPU reference");
+            }
+            gpuSamplingVerified = true;
+          }
+          return samples;
+        });
+        profiler?.setMetadata({ tileSamplingBackend: "webgpu" });
+        // The global rasters upload once, with the first tile.
+        if (!gpuUploadRecorded) {
+          gpuUploadRecorded = true;
+          profiler?.recordMetric("gpu tile sampling uploaded", sampler.uploadedBytes, "bytes");
+        }
+        return prepared;
+      } catch (error) {
+        // Running out of memory is not a GPU fault: the scheduler retries
+        // the tile once helpers free memory, still sampling on the GPU.
+        if (execution.cancelled() || isOutOfMemoryError(error)) throw error;
+        tileGpuSamplerDisabled = true;
+        tileGpuSamplerFallback = error instanceof Error ? error.message : String(error);
+        console.warn("[mountain export] GPU tile sampling disabled:", tileGpuSamplerFallback);
+        profiler?.setMetadata({ tileSamplingBackend: "cpu", tileSamplingFallback: tileGpuSamplerFallback });
+        return undefined;
+      }
+    };
+    const tileOutputBytes = (key: string): number => {
+      const tile = tileFromKey(key);
+      return tile.width * tile.height * CAMERA_TILE_CACHE_BYTES_PER_PIXEL;
+    };
+    const scheduler = new CameraTileScheduler<PreparedMountainExportTile, CameraTileWorkerResult>({
+      helpers: helpers.map(initial => {
+        let helper = initial;
+        return {
+          render: (prepared, transfer) => withHelperTimeout(helper.render(prepared, transfer)),
+          dispose: () => helper.dispose(),
+          restart: async () => {
+            if (!startCameraTileHelper) return false;
+            // Terminating the worker releases its whole heap at once.
+            helper.dispose();
+            const next = await startCameraTileHelper();
+            if (!next) return false;
+            helper = next;
+            return true;
+          },
+        };
+      }),
+      prepare: async (key) => {
+        const prepareStarted = performance.now();
+        const tile = tileFromKey(key);
+        const prepared = (await prepareTileOnGpu(tile)) ?? prepareMountainExportTile(context, tile);
+        profiler?.recordMetric("camera tile prepare on coordinator", performance.now() - prepareStarted, "ms");
+        const transfer = transferableBuffers(prepared, retainedBuffers);
+        let transferBytes = 0;
+        for (const buffer of transfer) transferBytes += buffer.byteLength;
+        profiler?.recordMetric("camera tile transferred input", transferBytes, "bytes");
+        return { prepared, transfer };
+      },
+      renderLocally: (key) => {
+        renderTileLocally(tileFromKey(key));
+      },
+      store: (key, result) => {
+        profiler?.recordMetric("camera tile helper compute", result.computeMs, "ms");
+        profiler?.recordMetric("camera tile helper output bytes", result.outputBytes, "bytes");
+        profiler?.recordMetric("camera tile helper response wait", result.roundTripMs, "ms");
+        for (const externalStage of result.externalStages) {
+          profiler?.recordExternalStage(
+            "parallel " + externalStage.stage,
+            externalStage.durationMs,
+            externalStage.calls,
+          );
+        }
+        storeTile(tileFromKey(key), result.image);
+      },
+      isAvailable: (key) => cache.has(key),
+      helperBytes: (key) => estimateCameraTileHelperBytes(context, tileFromKey(key)),
+      outputBytes: tileOutputBytes,
+      cachedBytes: () => cachedBytes,
+      helperBudgetBytes: helperMemoryBudget.bytes,
+      // Headroom for the tiles a band requires, so storing them never evicts
+      // a tile rendered ahead for the next bands.
+      lookaheadBudgetBytes: cacheBudget * 0.75,
+      cancelled: () => execution.cancelled(),
+      yieldToEvents: () => execution.checkpoint(true),
+      onDispatch: (key, running, queued) => {
+        if (request.profile === true) {
+          console.log("[mountain export] tile " + key + " sent to helper ("
+            + running + " running, " + queued + " queued)");
+        }
+      },
+      onComplete: (key, _result, elapsedMs) => {
+        if (request.profile === true) {
+          console.log("[mountain export] tile " + key + " rendered by helper in " + Math.round(elapsedMs) + "ms");
+        }
+      },
+      isOutOfMemory: isOutOfMemoryError,
+      onBudgetRecovered: (budgetBytes) => {
+        if (request.profile === true) {
+          console.log("[mountain export] helper memory budget back to " + Math.round(budgetBytes / 1048576) + " MiB");
+        }
+        profiler?.recordMetric("camera tile memory budget recoveries", 1, "times");
+      },
+      onMemoryPressure: (key, error, reducedBudgetBytes) => {
+        console.warn(
+          "[mountain export] tile " + key + " ran out of memory ("
+            + (error instanceof Error ? error.message : String(error))
+            + "); retrying when helpers finish, helper memory budget now "
+            + Math.round(reducedBudgetBytes / 1048576) + " MiB",
+        );
+        profiler?.recordMetric("camera tile memory pressure retries", 1, "tiles");
+      },
+      onHelperRestart: (key, error, reducedBudgetBytes) => {
+        console.warn(
+          "[mountain export] tile " + key + " ran out of memory with every helper idle ("
+            + (error instanceof Error ? error.message : String(error))
+            + "); restarting the helpers to free their memory and retrying, helper memory budget now "
+            + Math.round(reducedBudgetBytes / 1048576) + " MiB",
+        );
+        profiler?.recordMetric("camera tile memory pressure helper restarts", 1, "times");
+      },
+      onHelperFailure: (_key, error, reducedBudgetBytes) => {
+        profiler?.recordMetric("camera tile helper failed", 1, "helpers");
+        console.warn(
+          "[mountain export] camera tile helper failed:",
+          error instanceof Error ? error.message : error,
+          "- helper memory budget now " + Math.round(reducedBudgetBytes / 1048576) + " MiB",
+        );
+        profiler?.setMetadata({
+          cameraTileMode: "degraded",
+          cameraTileModeReason: error instanceof Error ? error.message : String(error),
+        });
+      },
+    });
     const ensureTiles = async (requestedKeys: readonly string[]): Promise<void> => {
       const missing = [...new Set(requestedKeys)].filter(key => !cache.has(key));
+      if (missing.length === 0) return;
       cacheMisses += missing.length;
-      const queue = missing.slice();
-      const idle = [...activeHelpers];
-      const running = new Set<Promise<void>>();
       // The stage label otherwise still names the last tile prepared here.
-      const showWaitingForHelpers = (): void => {
-        if (currentCameraBandNumber <= 0) return;
+      if (currentCameraBandNumber > 0) {
         beginStage(
           "Rendering camera tiles on helpers · camera tile "
             + Math.min(totalTiles, completedTiles + 1) + "/" + totalTiles,
@@ -1301,75 +1553,22 @@ async function runExport(request: MountainExportRequest): Promise<void> {
           request.outputHeight,
           "Camera tiles on helpers",
         );
-      };
-      // This worker is the producer: preparing a tile needs the export
-      // context, so it prepares one tile at a time and hands each to an idle
-      // helper, which does the long rendering.
-      while (queue.length > 0 && (idle.length > 0 || running.size > 0)) {
-        if (execution.cancelled()) throw new Error("Export cancelled");
-        if (idle.length === 0) {
-          showWaitingForHelpers();
-          await Promise.race(running);
-          continue;
-        }
-        const key = queue.shift()!;
-        const tile = tileFromKey(key);
-        const helper = idle.pop()!;
-        const prepareStarted = performance.now();
-        const prepared = prepareMountainExportTile(context, tile);
-        profiler?.recordMetric("camera tile prepare on coordinator", performance.now() - prepareStarted, "ms");
-        const dispatchedAt = performance.now();
-        if (request.profile === true) {
-          console.log("[mountain export] tile " + tile.x + "," + tile.y + " sent to helper ("
-            + running.size + " running, " + queue.length + " queued)");
-        }
-        const job: Promise<void> = withHelperTimeout(helper.render(prepared)).then(result => {
-          if (request.profile === true) {
-            console.log("[mountain export] tile " + tile.x + "," + tile.y + " rendered by helper in "
-              + Math.round(performance.now() - dispatchedAt) + "ms");
-          }
-          profiler?.recordMetric("camera tile helper compute", result.computeMs, "ms");
-          profiler?.recordMetric("camera tile helper output bytes", result.outputBytes, "bytes");
-          profiler?.recordMetric("camera tile helper response wait", result.roundTripMs, "ms");
-          for (const externalStage of result.externalStages) {
-            profiler?.recordExternalStage(
-              "parallel " + externalStage.stage,
-              externalStage.durationMs,
-              externalStage.calls,
-            );
-          }
-          storeTile(tile, result.image);
-          idle.push(helper);
-        }, error => {
-          if (execution.cancelled()) throw new Error("Export cancelled");
-          // A failed helper hands its tile back to be rendered here, so a
-          // helper fault never fails the export.
-          queue.push(key);
-          console.warn("[mountain export] camera tile helper failed:", error instanceof Error ? error.message : error);
-          helper.dispose();
-          const index = activeHelpers.indexOf(helper);
-          if (index >= 0) activeHelpers.splice(index, 1);
-          profiler?.setMetadata({
-            cameraTileMode: "degraded",
-            cameraTileModeReason: error instanceof Error ? error.message : String(error),
-          });
-        }).finally(() => { running.delete(job); });
-        running.add(job);
-        // Yield so finished helpers deliver their tiles and take the next one.
-        await execution.checkpoint(true);
       }
-      if (running.size > 0) showWaitingForHelpers();
-      await Promise.all(running);
-      // Whatever no helper could take: no helpers, or all of them failed.
-      while (queue.length > 0) {
-        renderTileLocally(tileFromKey(queue.shift()!));
-        await execution.checkpoint(true);
-      }
+      await scheduler.ensure(missing);
     };
     return {
       width: request.outputWidth,
       height: request.outputHeight,
       ensureTiles,
+      prefetch(keys): void {
+        scheduler.prefetch(keys);
+      },
+      retire(keys): void {
+        for (const key of keys) {
+          if (!pinnedKeys.has(key)) dropTile(key);
+        }
+        scheduler.resume();
+      },
       pin(keys): void {
         for (const key of keys) pinnedKeys.add(key);
       },
@@ -1439,6 +1638,15 @@ async function runExport(request: MountainExportRequest): Promise<void> {
       },
       sampleRGBA(x, y, output, offset): void {
         this.sampleField(x, y, output, offset, false);
+      },
+      /** 0..1 stand cover, nearest pixel; tiles without stands have none. */
+      sampleStandCover(x: number, y: number): number {
+        const pixelX = Math.max(0, Math.min(request.outputWidth - 1, Math.round(x)));
+        const pixelY = Math.max(0, Math.min(request.outputHeight - 1, Math.round(y)));
+        const tileX = Math.floor(pixelX / sourceTileSize) * sourceTileSize;
+        const tileY = Math.floor(pixelY / sourceTileSize) * sourceTileSize;
+        const image = tileAt(tileX, tileY);
+        return (image.standCover?.[(pixelY - tileY) * image.width + (pixelX - tileX)] ?? 0) / 255;
       },
       sampleForegroundRGBA(x, y, output, offset): void {
         this.sampleField(x, y, output, offset, true);
@@ -1657,6 +1865,7 @@ async function runExport(request: MountainExportRequest): Promise<void> {
       ...cameraSettingsBase,
       projection: cameraProjection,
       foregroundSource: cameraForegroundSource,
+      ridgeCover: cameraSource.sampleStandCover.bind(cameraSource),
     };
     // Keep projection and depth memory bounded to one band. The camera band
     // retains full-output coordinates for framing, while its color/depth
@@ -1708,40 +1917,47 @@ async function runExport(request: MountainExportRequest): Promise<void> {
               prepareFullTerrainCameraBand(dem, start, end, settings),
             )
           : prepareFullTerrainCameraBand(dem, start, end, settings),
+        CAMERA_TILE_CACHE_BYTES_PER_PIXEL,
       );
       if (regionCount > 1) {
         profiler?.recordMetric("camera band subdivisions", regionCount - 1, "regions");
       }
     }
-    // A small export touches only a handful of source tiles. Plan every band
-    // first and render the whole set across the helper pool, instead of
-    // discovering two or three new tiles per band. Larger exports keep the
-    // per-band path, which still spreads each band's new tiles over the pool.
+    // Plan every band first to learn which source tiles each band samples.
+    // Tiles go to the helpers in the order the bands first need them while
+    // planning continues, instead of two or three new tiles per band once
+    // projection reaches them. Each tile is dropped after the last band that
+    // samples it, so the cache holds only the tiles around the current band
+    // plus what is rendered ahead.
+    const tilesLastNeededByBand = new Map<number, string[]>();
     if (cameraTileHelpers.length > 0) {
-      const prefetchKeys = new Set<string>();
+      const lastBandForTile = new Map<string, number>();
       beginStage("Planning camera texture tiles", "projecting", 0, request.outputHeight);
+      let bandNumber = 0;
       for (let y = rowStart; y < rowEnd; y += cameraBandHeight) {
         if (execution.cancelled()) throw new Error("Export cancelled");
+        bandNumber++;
         const plan = prepareFullTerrainCameraBand(
           dem,
           y,
           Math.min(rowEnd, y + cameraBandHeight),
           cameraSettings,
         );
-        for (const key of getCameraBandTextureTileKeys(
+        const keys = getCameraBandTextureTileKeys(
           plan,
           request.outputWidth,
           request.outputHeight,
           sourceTileSize,
-        )) prefetchKeys.add(key);
+        );
+        for (const key of keys) lastBandForTile.set(key, bandNumber);
+        cameraSource.prefetch(keys);
         await execution.checkpoint();
       }
-      // RGBA plus foreground-prop RGBA per source tile.
-      const prefetchBytes = prefetchKeys.size * sourceTileSize * sourceTileSize * 8;
-      profiler?.recordMetric("camera prefetch texture tiles", prefetchKeys.size, "tiles");
-      if (prefetchBytes <= CAMERA_TILE_CACHE_BUDGET_BYTES * 0.75) {
-        beginStage("Rendering camera texture tiles", "rendering", 0, request.outputHeight);
-        await cameraSource.ensureTiles([...prefetchKeys]);
+      profiler?.recordMetric("camera prefetch texture tiles", lastBandForTile.size, "tiles");
+      for (const [key, band] of lastBandForTile) {
+        const keys = tilesLastNeededByBand.get(band);
+        if (keys) keys.push(key);
+        else tilesLastNeededByBand.set(band, [key]);
       }
     }
     async function* projectedScanlines(): AsyncGenerator<Uint8Array> {
@@ -1761,6 +1977,7 @@ async function runExport(request: MountainExportRequest): Promise<void> {
         );
         const cameraBandData = new Uint8ClampedArray(request.outputWidth * bandHeight * 4);
         await renderVisibleCameraRows(y, y + bandHeight, cameraBandData, y);
+        cameraSource.retire(tilesLastNeededByBand.get(cameraBandNumber) ?? []);
         const cameraBand = {
           width: request.outputWidth,
           height: bandHeight,
@@ -1811,6 +2028,7 @@ async function runExport(request: MountainExportRequest): Promise<void> {
   finishProfile("completed");
   post({ type: "result", id: request.id, filename: request.filename, blob, completedStages });
   } catch (error) {
+    profiler?.setMetadata({ failure: error instanceof Error ? error.message : String(error) });
     finishProfile(cancelled.has(request.id) ? "cancelled" : "failed");
     throw error;
   } finally {
@@ -1818,6 +2036,7 @@ async function runExport(request: MountainExportRequest): Promise<void> {
     // before they were awaited.
     activeCameraTileWorkerCancels.get(request.id)?.();
     activeCameraTileWorkerCancels.delete(request.id);
+    void tileGpuSamplerPromise?.then(sampler => sampler?.dispose());
   }
 }
 

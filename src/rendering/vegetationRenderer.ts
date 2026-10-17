@@ -35,7 +35,6 @@ import {
   type DesertDuneOptions,
   type ResolvedDesertDuneOptions,
 } from "./desertDunes";
-import { parseHexColor } from "./propColorVariation";
 
 import {
   DEFAULT_FOREST_RENDER_SETTINGS,
@@ -45,17 +44,26 @@ import {
   type ForestRenderSettings,
 } from "./forestCanvasRenderer";
 import type { MountainProfiler } from "./mountainProfiler";
+import { boxBlur as standBoxBlur } from "./forestStandGeometry";
 import {
-  boxBlur as standBoxBlur,
-  buildForestStandGeometry,
-  mapForestStandGeometry,
-  sample as sampleStandField,
-  SHRUB_STAND_PROFILE,
-  TREE_STAND_PROFILE,
-  type ForestStandGeometry,
-  type StandProfile,
-} from "./forestStandGeometry";
-import { renderForestStandLayer } from "./forestStandRenderer";
+  buildForestInkGeometry,
+  INK_WASH_TREE_SIZE_PER_MARK,
+  mapForestInkGeometry,
+  type ForestInkGeometry,
+  type ForestInkPens,
+  type ForestInkType,
+} from "./forestInkStands";
+import {
+  addForestStandArea,
+  renderForestInkCanvas,
+  renderForestInkDebugCanvas,
+  type ForestInkStandDebug,
+  type ForestInkWashField,
+} from "./forestInkRenderer";
+import { parseHexColor } from "./propColorVariation";
+import { traceGrassBiomeBorders } from "./biomeBorderInk";
+import { isMountainTintBiome, mountainGrassAmount } from "./mountainTerrainTint";
+import { DEFAULT_SILT_LAYERS, riverSiltCoverage } from "./riverSilt";
 
 export type VegetationMotifFamily = "grass" | "reeds" | "shrub" | "universal" | "arid";
 export type VegetationPatternPreset = "adaptive" | VegetationMotifFamily;
@@ -105,6 +113,8 @@ export interface VegetationRasterPropPlacement {
   opacity: number;
   biomeId: number;
   assetKey: string;
+  /** Placed on open ground to stay a lone tree, never part of a stand. */
+  lone?: boolean;
 }
 
 export interface VegetationMotifVectorPath {
@@ -174,6 +184,8 @@ export interface VegetationStrokePath {
   width: number;
   dashPhase: number;
   points: VegetationStrokePoint[];
+  /** Traced along the border of grass ground rather than a streamline. */
+  border?: true;
 }
 
 export interface VegetationMotifPlacement {
@@ -208,7 +220,28 @@ export interface VegetationPropStand {
   group: string;
   /** Biomes whose plants form this stand; they share its stand colours. */
   biomeIds: number[];
-  geometry: ForestStandGeometry;
+  /** Tree shape of the stand. */
+  forest: ForestInkType;
+  geometry: ForestInkGeometry;
+  /**
+   * Where each biome's plants of this stand group grew, blurred across the
+   * biome blend width; the wash colour grades by it. Shared by the group's
+   * stands; unset when the group grows in one biome or blending is off.
+   */
+  biomeShares?: PropStandBiomeShares;
+  /** Kept only while the stand debug view is on. */
+  debug?: ForestInkStandDebug;
+}
+
+/** Share of each biome's plants per coarse cell, in the stand geometry's map pixels. */
+export interface PropStandBiomeShares {
+  /** Cell size in map pixels; cell (column, row) is centred at ((column + 0.5) * step, (row + 0.5) * step). */
+  step: number;
+  columns: number;
+  rows: number;
+  biomeIds: number[];
+  /** Per cell, one share per biome in `biomeIds`: summing to 1 near plants, all 0 far from any. */
+  shares: Float32Array;
 }
 
 /**
@@ -233,6 +266,7 @@ export type VegetationPlacementTerrain = Pick<
   | "visualWaterCoverage"
   | "wetlandPoolMask"
   | "wetlandPoolCoverage"
+  | "siltDepth"
 >>;
 
 export type RasterPropBiomeSettings = Partial<Record<number, {
@@ -495,6 +529,17 @@ export interface VegetationOverlay {
    * skips this share.
    */
   rasterPropStandShare?: Uint8Array;
+  /**
+   * Coverage (0..255) of forest stands: their area and crowns. The map
+   * shows its ground colours without linework there, under the stand wash
+   * and ink, so no mountain or other lines run through a stand.
+   */
+  rasterPropStandCover?: Uint8Array;
+  /**
+   * Forest stand wash: its paint colour, alpha = how much of it to mix in.
+   * The compositor mixes it into the ground as paint, under the stand ink.
+   */
+  rasterPropStandWash?: Uint8ClampedArray;
 }
 
 /**
@@ -538,6 +583,8 @@ export interface VegetationOverlayStageCache {
   rasterPropCharcoalAlpha?: Uint8Array;
   rasterPropShadowAlpha?: Uint8Array;
   rasterPropStandShare?: Uint8Array;
+  rasterPropStandCover?: Uint8Array;
+  rasterPropStandWash?: Uint8ClampedArray;
 }
 
 const BIOME_SUITABILITY: Readonly<Record<number, number>> = {
@@ -590,6 +637,17 @@ export const BIOME_MOTIF_PERCENTAGES: Readonly<
   19: { grass: 15, reeds: 0, shrub: 65, universal: 20, arid: 0 },
   20: { grass: 75, reeds: 0, shrub: 8, universal: 17, arid: 0 },
 };
+
+/**
+ * Biomes whose flow lines draw grass (the grass, reed, shrub and universal
+ * marks): their borders are inked with those marks too. Deserts use arid marks
+ * and are left out.
+ */
+export const GRASS_GROUND_BIOME_IDS: ReadonlySet<number> = new Set(
+  Object.entries(BIOME_MOTIF_PERCENTAGES)
+    .filter(([, mix]) => mix.grass + mix.reeds + mix.shrub + mix.universal > 0)
+    .map(([biomeId]) => Number(biomeId)),
+);
 
 export function resolveVegetationPatternOptions(
   options: VegetationPatternOptions | undefined,
@@ -687,6 +745,44 @@ function biomeAt(dem: VegetationPlacementTerrain, x: number, y: number): number 
   const ix = Math.max(0, Math.min(dem.width - 1, Math.round(x)));
   const iy = Math.max(0, Math.min(dem.height - 1, Math.round(y)));
   return dem.biomeType[iy * dem.width + ix];
+}
+
+/**
+ * Biome lookup with the borders warped by noise across a band about `blend`
+ * pixels wide, so neighbouring biomes reach into each other in tongues and
+ * islands instead of meeting on the biome map's line. Each point still has
+ * one biome, so two biomes' plants never grow over each other. The warp
+ * depends only on `seed`, so every biome's pass sees the same borders.
+ */
+function blendedBiomeLookup(
+  dem: VegetationPlacementTerrain,
+  blend: number,
+  seed: number,
+): (x: number, y: number) => number {
+  if (!(blend > 0)) return (x, y) => biomeAt(dem, x, y);
+  const warpX = new SimplexNoise(seed ^ 0x3b1e5a7d);
+  const warpY = new SimplexNoise(seed ^ 0x6c0f92e1);
+  // Three octaves: broad tongues with smaller fingers and detached islands.
+  return (x, y) => biomeAt(
+    dem,
+    x + warpX.fbm(x / blend, y / blend, 3, 2, 0.5) * blend * 1.2,
+    y + warpY.fbm(x / blend, y / blend, 3, 2, 0.5) * blend * 1.2,
+  );
+}
+
+/**
+ * Share of plants left off river silt at full depth. Silted old channels are
+ * bare sediment (the flow ink keeps out of them entirely); a few plants still
+ * take root there.
+ */
+const SILT_PLANT_THINNING = 0.75;
+
+/** River silt cover at a point, 0..1, as the map paints it. */
+function siltCoverAt(dem: Pick<VegetationPlacementTerrain, "width" | "height" | "siltDepth">, x: number, y: number): number {
+  if (!dem.siltDepth) return 0;
+  const ix = Math.max(0, Math.min(dem.width - 1, Math.round(x)));
+  const iy = Math.max(0, Math.min(dem.height - 1, Math.round(y)));
+  return riverSiltCoverage(dem.siltDepth[iy * dem.width + ix] ?? 0, DEFAULT_SILT_LAYERS);
 }
 
 function isWaterAt(dem: VegetationPlacementTerrain, x: number, y: number): boolean {
@@ -2402,11 +2498,18 @@ function maximumRenderedFlowStrokeRadius(
   return maximumRadius;
 }
 
+/**
+ * Space SVG marks along a streamline. A biome border passes its grass biome
+ * as `borderBiomeId`: its marks are packed end to end so the border reads as
+ * one line, and all of them take that biome's motif mix, since a sample on
+ * the border itself lands on either side.
+ */
 export function placeMotifsAlongPath(
   geometry: VegetationGeometry,
   dem: MountainDEMData,
   path: VegetationStrokePath,
   options: ResolvedVegetationPatternOptions,
+  borderBiomeId?: number,
 ): void {
   if (options.motifDensity <= 0 || path.points.length < 2) return;
 
@@ -2431,10 +2534,9 @@ export function placeMotifsAlongPath(
   const renderedLength = maximumSize * options.strokeLength;
   const thicknessGap = maximumRenderedFlowStrokeRadius(options) * 2;
   const densitySpacing = 0.72 / Math.sqrt(Math.max(0.08, options.motifDensity));
-  const spacing = Math.max(
-    renderedLength + thicknessGap,
-    renderedLength * densitySpacing,
-  );
+  const spacing = borderBiomeId === undefined
+    ? Math.max(renderedLength + thicknessGap, renderedLength * densitySpacing)
+    : renderedLength + thicknessGap;
   const startDistance = Math.min(
     totalLength * 0.5,
     spacing * (0.2 + hash01(path.key, 61) * 0.55),
@@ -2453,10 +2555,10 @@ export function placeMotifsAlongPath(
       cumulativeLengths,
       distance,
     );
-    const placementBiome = biomeAt(dem, sample.x, sample.y);
+    const placementBiome = borderBiomeId ?? biomeAt(dem, sample.x, sample.y);
     // Streamlines seeded next door can run into sand desert; the dune
     // renderer owns those pixels, so no flow-line marks are placed there.
-    if (isDesertDunePixel(options.desertDunes, placementBiome)) {
+    if (borderBiomeId === undefined && isDesertDunePixel(options.desertDunes, placementBiome)) {
       placementIndex++;
       continue;
     }
@@ -3080,6 +3182,25 @@ function createThrottledPreparationReporter(
   };
 }
 
+/** A forest candidate; `lone` ones were placed on open ground to stay lone trees. */
+export interface ForestCandidate {
+  key: number;
+  x: number;
+  y: number;
+  habitatWeight?: number;
+  lone?: boolean;
+}
+
+/**
+ * Smallest clearing scale, in canopies. Narrower clearings sit within the
+ * stand joining distance (2.5 trees, about 2 canopies), so the plants either
+ * side of them join and the clearing never separates two stands.
+ */
+const FOREST_MIN_GAP_SCALE_CANOPIES = 4;
+
+/** Grid cell, in canopies, holding at most one group of lone trees. */
+const FOREST_LONE_CELL_CANOPIES = 3;
+
 /** @internal Deterministic forest stand candidates shared by all forest assets. */
 export function buildForestCandidates(
   dem: Pick<VegetationPlacementTerrain, "width" | "height">,
@@ -3088,18 +3209,26 @@ export function buildForestCandidates(
   reportProgress?: VegetationPreparationReporter,
   terrain?: VegetationPlacementTerrain,
   targetBiome?: number,
-): Array<{ key: number; x: number; y: number }> {
-  const candidates: Array<{ key: number; x: number; y: number }> = [];
+  biomeLookup?: (x: number, y: number) => number,
+): ForestCandidate[] {
+  const candidates: ForestCandidate[] = [];
   const density = options.rasterPropDensity;
   if (density <= 0) return candidates;
   // Art-directed gap process: overlapping, irregular ellipses carve clearings
   // out of continuous woodland. No thresholded noise contours or candidate grid.
-  const gapScale = Math.min(
-    canopySize * (3.5 + options.rasterPropStandSize * 7),
-    Math.min(dem.width, dem.height) * (0.2 + options.rasterPropStandSize * 0.24),
-  ) * options.rasterPropPlacementNoiseScale;
+  // Smaller stands come from more clearings, never narrower ones: each
+  // clearing stays wide enough to part the stands on either side of it.
+  const standSize = clamp01(options.rasterPropStandSize);
+  const gapScale = Math.max(
+    canopySize * FOREST_MIN_GAP_SCALE_CANOPIES,
+    Math.min(
+      canopySize * (3.5 + standSize * 7),
+      Math.min(dem.width, dem.height) * (0.2 + standSize * 0.24),
+    ) * options.rasterPropPlacementNoiseScale,
+  );
+  const gapCount = 0.7 + 0.7 * (1 - standSize) ** 2;
   const gaps = Array.from({ length: Math.ceil(
-    dem.width * dem.height / (gapScale * gapScale) * 0.7,
+    dem.width * dem.height / (gapScale * gapScale) * gapCount,
   ) }, (_, index) => {
     const key = Math.imul(index + 1, 1597334677) ^ options.seed ^ 0x3c6ef372;
     const angle = hash01(key, 901) * Math.PI * 2;
@@ -3138,26 +3267,10 @@ export function buildForestCandidates(
       }
     }
   }
-  const attempts = Math.ceil(dem.width * dem.height /
-    Math.max(16, canopySize * canopySize * 0.11) * density);
-  const scatteredFraction = (1 - options.rasterPropClustering) ** 3;
-  reportProgress?.("Generating forest candidates", 0, attempts);
-  for (let index = 0; index < attempts; index++) {
-    const key = Math.imul(index + 1, 3812015801) ^ options.seed;
-    const x = hash01(key, 911) * dem.width;
-    const y = hash01(key, 919) * dem.height;
-    // Candidate coordinates and keys stay unchanged, but points that cannot
-    // produce a placement skip shelter and clearing work entirely.
-    if (terrain && targetBiome !== undefined && biomeAt(terrain, x, y) !== targetBiome) {
-      if ((index & 4095) === 4095 || index === attempts - 1) {
-        reportProgress?.("Generating forest candidates", index + 1, attempts);
-      }
-      continue;
-    }
-    const terrainSuitability = terrain
-      ? sampleAlpineForestTerrainSuitability(terrain, x, y)
-      : undefined;
-    const terrainShelter = terrainSuitability?.shelter ?? 0.5;
+  const outsideBiome = (x: number, y: number) =>
+    terrain !== undefined && targetBiome !== undefined &&
+    (biomeLookup ? biomeLookup(x, y) : biomeAt(terrain, x, y)) !== targetBiome;
+  const woodlandAt = (x: number, y: number, terrainShelter: number) => {
     // Shelter protects stands from the broad clearings in this existing
     // process; exposed terrain lets those gaps open farther into the canopy.
     const clearingInfluence = 1.5 - terrainShelter;
@@ -3178,9 +3291,27 @@ export function buildForestCandidates(
         woodland = Math.min(woodland, smoothStep(0.8, 1.25, Math.hypot(u, v) / edge));
       }
     }
-    woodland = clamp01(1 - (1 - woodland) * clearingInfluence);
-    const presence = scatteredFraction + (1 - scatteredFraction) * woodland;
-    if (hash01(key, 929) < presence) {
+    return clamp01(1 - (1 - woodland) * clearingInfluence);
+  };
+  const attempts = Math.ceil(dem.width * dem.height /
+    Math.max(16, canopySize * canopySize * 0.11) * density);
+  reportProgress?.("Generating forest candidates", 0, attempts);
+  for (let index = 0; index < attempts; index++) {
+    const key = Math.imul(index + 1, 3812015801) ^ options.seed;
+    const x = hash01(key, 911) * dem.width;
+    const y = hash01(key, 919) * dem.height;
+    // Candidate coordinates and keys stay unchanged, but points that cannot
+    // produce a placement skip shelter and clearing work entirely.
+    if (outsideBiome(x, y)) {
+      if ((index & 4095) === 4095 || index === attempts - 1) {
+        reportProgress?.("Generating forest candidates", index + 1, attempts);
+      }
+      continue;
+    }
+    const terrainSuitability = terrain
+      ? sampleAlpineForestTerrainSuitability(terrain, x, y)
+      : undefined;
+    if (hash01(key, 929) < woodlandAt(x, y, terrainSuitability?.shelter ?? 0.5)) {
       candidates.push({
         key,
         x,
@@ -3190,6 +3321,46 @@ export function buildForestCandidates(
     }
     if ((index & 4095) === 4095 || index === attempts - 1) {
       reportProgress?.("Generating forest candidates", index + 1, attempts);
+    }
+  }
+
+  // Lone trees: the less a biome clusters, the more single trees and pairs
+  // grow out on the open ground, at most one group per grid cell so they
+  // stand apart. They are marked lone, so no stand takes them in whatever
+  // its joining distance, and they keep clear of the woodland so they never
+  // read as a stand's ragged edge.
+  const loneShare = (1 - clamp01(options.rasterPropClustering)) * Math.min(1, density) * 0.75;
+  if (loneShare > 0) {
+    const cell = canopySize * FOREST_LONE_CELL_CANOPIES;
+    const clear = canopySize * 1.5;
+    const columns = Math.ceil(dem.width / cell);
+    const rows = Math.ceil(dem.height / cell);
+    for (let row = 0; row < rows; row++) {
+      for (let column = 0; column < columns; column++) {
+        const key = (Math.imul(column + 1, 2246822519) ^ Math.imul(row + 1, 3266489917) ^
+          options.seed ^ 0x2f6b9e1d) | 0;
+        if (hash01(key, 971) >= loneShare) continue;
+        const x = (column + 0.2 + hash01(key, 973) * 0.6) * cell;
+        const y = (row + 0.2 + hash01(key, 977) * 0.6) * cell;
+        if (x >= dem.width || y >= dem.height || outsideBiome(x, y)) continue;
+        const terrainSuitability = terrain
+          ? sampleAlpineForestTerrainSuitability(terrain, x, y)
+          : undefined;
+        const shelter = terrainSuitability?.shelter ?? 0.5;
+        if ([[0, 0], [clear, 0], [-clear, 0], [0, clear], [0, -clear]].some(([dx, dy]) =>
+          woodlandAt(x + dx, y + dy, shelter) > 0.02)) continue;
+        const habitat = terrainSuitability ? { habitatWeight: terrainSuitability.habitatWeight } : {};
+        candidates.push({ key, x, y, lone: true, ...habitat });
+        // A third of them grow as a pair, crowns just touching.
+        if (hash01(key, 979) < 0.3) {
+          const side = hash01(key, 983) < 0.5 ? -1 : 1;
+          const mateX = x + side * canopySize * (0.9 + hash01(key, 987) * 0.3);
+          const mateY = y + canopySize * (hash01(key, 991) - 0.5) * 0.2;
+          if (mateX >= 0 && mateX < dem.width) {
+            candidates.push({ key: (Math.imul(key, 1597334677) ^ 0x7f4a7c15) | 0, x: mateX, y: mateY, lone: true, ...habitat });
+          }
+        }
+      }
     }
   }
   return candidates;
@@ -3773,6 +3944,91 @@ function standPropKind(asset: VegetationRasterPropAsset): "tree" | "shrub" | und
 /** Seed salt for shrub candidates sharing a biome with trees, so the two kinds do not compete for the same spots. */
 const SHRUB_CANDIDATE_SEED_SALT = 0x5a1b7e;
 
+/** Raster props placed by biome (foothill boulders are placed separately). */
+function placementRasterPropAssets(
+  options: ResolvedVegetationPatternOptions,
+): VegetationRasterPropAsset[] {
+  return options.rasterPropAssets.filter((asset) =>
+    (asset.placementRole ?? "vegetation") !== "mountain-foothill",
+  );
+}
+
+/** The biomes props are placed in, in placement order. */
+function rasterPropBiomeOrder(assets: readonly VegetationRasterPropAsset[]): number[] {
+  return [...new Set(assets.flatMap((asset) => [...asset.eligibleBiomeIds]))];
+}
+
+/**
+ * One biome's raster props. Each biome has its own collision grid and
+ * candidates, so biomes can be placed independently (also on other workers)
+ * and joined in `rasterPropBiomeOrder`.
+ */
+function placeRasterPropsInBiome(
+  geometry: VegetationGeometry,
+  dem: VegetationPlacementTerrain,
+  options: ResolvedVegetationPatternOptions,
+  vegetationAssets: readonly VegetationRasterPropAsset[],
+  biome: number,
+  profiler?: MountainProfiler,
+  reportProgress?: VegetationPreparationReporter,
+): void {
+  const settings = rasterPropSettingsForBiome(options, biome);
+  const kindDensity = { tree: settings.treeDensity, shrub: settings.shrubDensity };
+  // Stand kinds turned off for this biome take no part in its placement,
+  // including the habitat fields they would otherwise trigger.
+  const biomeAssets = vegetationAssets.filter((asset) => {
+    if (!asset.eligibleBiomeIds.includes(biome)) return false;
+    const kind = standPropKind(asset);
+    return kind === undefined || kindDensity[kind] > 0;
+  });
+  if (biomeAssets.length === 0) return;
+  placeRasterProps(
+    geometry,
+    dem,
+    {
+      ...options,
+      rasterPropAssets: biomeAssets,
+      rasterPropDensity: settings.density,
+      rasterPropClustering: settings.clustering,
+    },
+    biome,
+    profiler,
+    reportProgress,
+    kindDensity,
+  );
+}
+
+/** The biomes raster props are placed in, in placement order. */
+export function rasterPropPlacementBiomes(rawOptions?: VegetationPatternOptions): number[] {
+  return rasterPropBiomeOrder(placementRasterPropAssets(resolveVegetationPatternOptions(rawOptions)));
+}
+
+/**
+ * The raster props of the given biomes, one list per biome. Concatenating
+ * the lists of every biome in `rasterPropPlacementBiomes` order gives exactly
+ * the placements of a full `buildVegetationGeometry` pass.
+ */
+export function placeRasterPropsInBiomes(
+  dem: VegetationPlacementTerrain,
+  rawOptions: VegetationPatternOptions | undefined,
+  biomes: readonly number[],
+  profiler?: MountainProfiler,
+): VegetationRasterPropPlacement[][] {
+  const options = resolveVegetationPatternOptions(rawOptions);
+  const assets = placementRasterPropAssets(options);
+  return biomes.map((biome) => {
+    const geometry: VegetationGeometry = {
+      width: dem.width,
+      height: dem.height,
+      paths: [],
+      motifs: [],
+      rasterProps: [],
+    };
+    placeRasterPropsInBiome(geometry, dem, options, assets, biome, profiler);
+    return geometry.rasterProps ?? [];
+  });
+}
+
 function placeRasterProps(
   geometry: VegetationGeometry,
   dem: VegetationPlacementTerrain,
@@ -3782,39 +4038,11 @@ function placeRasterProps(
   reportProgress?: VegetationPreparationReporter,
   standDensity?: { tree: number; shrub: number },
 ): void {
-  const vegetationAssets = options.rasterPropAssets.filter((asset) =>
-    (asset.placementRole ?? "vegetation") !== "mountain-foothill",
-  );
+  const vegetationAssets = placementRasterPropAssets(options);
   if (vegetationAssets.length === 0) return;
   if (targetBiome === undefined) {
-    const biomes = new Set(
-      vegetationAssets.flatMap((asset) => [...asset.eligibleBiomeIds]),
-    );
-    for (const biome of biomes) {
-      const settings = rasterPropSettingsForBiome(options, biome);
-      const kindDensity = { tree: settings.treeDensity, shrub: settings.shrubDensity };
-      // Stand kinds turned off for this biome take no part in its placement,
-      // including the habitat fields they would otherwise trigger.
-      const biomeAssets = vegetationAssets.filter((asset) => {
-        if (!asset.eligibleBiomeIds.includes(biome)) return false;
-        const kind = standPropKind(asset);
-        return kind === undefined || kindDensity[kind] > 0;
-      });
-      if (biomeAssets.length === 0) continue;
-      placeRasterProps(
-        geometry,
-        dem,
-        {
-          ...options,
-          rasterPropAssets: biomeAssets,
-          rasterPropDensity: settings.density,
-          rasterPropClustering: settings.clustering,
-        },
-        biome,
-        profiler,
-        reportProgress,
-        kindDensity,
-      );
+    for (const biome of rasterPropBiomeOrder(vegetationAssets)) {
+      placeRasterPropsInBiome(geometry, dem, options, vegetationAssets, biome, profiler, reportProgress);
     }
     return;
   }
@@ -3849,12 +4077,18 @@ function placeRasterProps(
   // Trees and shrubs grow as stands: each kind gets its own woodland-style
   // candidates at that kind's density for this biome.
   const kindDensity = standDensity ?? { tree: options.rasterPropDensity, shrub: options.rasterPropDensity };
+  // Stand plants see the biome borders blended (the "Biome blend" width).
+  const standBiomeAt = blendedBiomeLookup(
+    dem,
+    Math.max(0, options.forestSettings.biomeBlend) * propCellSize * STAND_TREE_SIZE_CELLS,
+    options.seed,
+  );
   const forestAssets = vegetationAssets.filter((asset) =>
     asset.eligibleBiomeIds.includes(targetBiome) && standPropKind(asset) !== undefined,
   );
   const forestCandidatesByAsset = new Map<
     VegetationRasterPropAsset,
-    Array<{ key: number; x: number; y: number; habitatWeight?: number }>
+    ForestCandidate[]
   >();
   const forestCandidateStop = forestAssets.length > 0
     ? profiler?.begin("vegetation forest candidate generation and grouping")
@@ -3881,6 +4115,7 @@ function placeRasterProps(
       // Trees read the terrain for shelter-shaped clearings and habitat.
       kind === "tree" ? dem : undefined,
       targetBiome,
+      standBiomeAt,
     );
     reportProgress?.("Grouping forest candidates");
     for (let index = 0; index < forestCandidates.length; index++) {
@@ -3940,14 +4175,16 @@ function placeRasterProps(
       "count",
     );
     let acceptedForAsset = 0;
-    const tryPlaceCandidate = (candidate: {
-      key: number;
-      x: number;
-      y: number;
-      habitatWeight?: number;
-    }): boolean => {
-      const candidateBiome = biomeAt(dem, candidate.x, candidate.y);
+    const tryPlaceCandidate = (candidate: ForestCandidate): boolean => {
+      const candidateBiome = forest
+        ? standBiomeAt(candidate.x, candidate.y)
+        : biomeAt(dem, candidate.x, candidate.y);
       if (candidateBiome !== targetBiome) return false;
+      // River silt carries few plants (wetland plants excepted).
+      if (
+        asset.placementRole !== "wetland" &&
+        hash01(candidate.key, 857) < siltCoverAt(dem, candidate.x, candidate.y) * SILT_PLANT_THINNING
+      ) return false;
       if (forest && kind === "tree") {
         const habitatWeight = candidate.habitatWeight ??
           sampleAlpineForestTerrainSuitability(dem, candidate.x, candidate.y).habitatWeight;
@@ -3963,6 +4200,7 @@ function placeRasterProps(
         opacity: 1,
         biomeId: candidateBiome,
         assetKey: asset.key,
+        ...(candidate.lone ? { lone: true } : {}),
       };
       if (
         placement.biomeId === 7 && wetlandWaterDistance &&
@@ -4106,13 +4344,38 @@ export function buildVegetationRasterPropPlacements(
  */
 export type VegetationLayerPart = "all" | "flow" | "props";
 
+/** Montane meadow: the biome the land tint's grass flats are drawn as. */
+const MEADOW_BIOME_ID = 20;
+
+/**
+ * The flow lines' view of the ground. Flat, low ground that the land tint
+ * paints green counts as meadow even inside the rock and forest belts, so it
+ * gets flow lines and an inked border like any meadow. Props keep the real
+ * biomes.
+ */
+export function withMountainGrassGround(dem: MountainDEMData): MountainDEMData {
+  let biomeType: Uint8Array | undefined;
+  const elevationRange = Math.max(1e-6, dem.maxElevationM - dem.minElevationM);
+  for (let index = 0; index < dem.biomeType.length; index++) {
+    const biome = dem.biomeType[index];
+    if (GRASS_GROUND_BIOME_IDS.has(biome) || !isMountainTintBiome(biome)) continue;
+    const normElev = dem.normalizedElevation?.[index]
+      ?? (dem.elevation[index] - dem.minElevationM) / elevationRange;
+    if (mountainGrassAmount(dem.slopeDeg[index], normElev, dem.tpi?.[index] ?? 0) < 0.5) continue;
+    biomeType ??= dem.biomeType.slice();
+    biomeType[index] = MEADOW_BIOME_ID;
+  }
+  return biomeType ? { ...dem, biomeType } : dem;
+}
+
 function buildVegetationFlowGeometry(
   geometry: VegetationGeometry,
-  dem: MountainDEMData,
+  sourceDem: MountainDEMData,
   options: ResolvedVegetationPatternOptions,
   profiler: MountainProfiler | undefined,
   reportProgress: VegetationPreparationReporter | undefined,
 ): void {
+  const dem = withMountainGrassGround(sourceDem);
   const densityNoise = new SimplexNoise(options.seed + 101);
   const flowNoise = new SimplexNoise(options.seed + 907);
   reportProgress?.("Preparing vegetation boundaries");
@@ -4138,6 +4401,34 @@ function buildVegetationFlowGeometry(
   let flowTraceAttempts = 0;
   let flowTracedPaths = 0;
   let flowCollisionRejects = 0;
+  const borderStop = profiler?.begin("vegetation biome borders");
+  const borderPaths: VegetationStrokePath[] = [];
+  if (options.motifDensity > 0) {
+    reportProgress?.("Tracing biome borders");
+    // Stands cover their biome's edge, so the more open side draws a border
+    // between two grass biomes.
+    const standDensity = (biomeId: number): number => {
+      const settings = rasterPropSettingsForBiome(options, biomeId);
+      return settings.treeDensity + settings.shrubDensity;
+    };
+    for (const [index, border] of traceGrassBiomeBorders(dem, GRASS_GROUND_BIOME_IDS, standDensity).entries()) {
+      const key = (Math.imul(index + 1, 0x2c1b3c6d) ^ Math.imul(border.biomeId, 0x297a2d39) ^ options.seed ^ 0x5bd1e995) | 0;
+      const path: VegetationStrokePath = {
+        key,
+        biomeId: border.biomeId,
+        width: 0.9,
+        dashPhase: hash01(key, 59) * 19,
+        points: border.points,
+        border: true,
+      };
+      geometry.paths.push(path);
+      borderPaths.push(path);
+      // The grass lies on the +normal side of the path, where the SVGs draw
+      // their tufts, so the marks grow into the grass.
+      placeMotifsAlongPath(geometry, dem, path, options, border.biomeId);
+    }
+  }
+  borderStop?.();
   if (options.density > 0) {
     const spacing = Math.max(
       7,
@@ -4150,6 +4441,18 @@ function buildVegetationFlowGeometry(
       dem.height,
       maximumFlowStrokeRadius,
     );
+    // Streamlines stop short of the inked borders and the tufts that rise
+    // from them, about a quarter of a mark's size.
+    const borderRadius = Math.max(
+      maximumFlowStrokeRadius,
+      0.25 * 14 * options.patternScale * options.motifSize,
+    );
+    const borderPoisson = new PoissonGrid(dem.width, dem.height, borderRadius);
+    for (const path of borderPaths) {
+      for (const point of path.points) {
+        borderPoisson.add(point.x, point.y, borderRadius);
+      }
+    }
     const columns = Math.ceil(dem.width / spacing);
     const rows = Math.ceil(dem.height / spacing);
     const totalFlowCandidates = (rows + 1) * (columns + 1);
@@ -4261,35 +4564,52 @@ function buildVegetationFlowGeometry(
           maximumFlowStrokeRadius,
           pathWidth * options.strokeThickness,
         );
-        // A traced streamline can curve toward an older one after its seed
-        // passes. Check the sampled centreline with the actual ink radius;
-        // pairwise radius sums give 2x thickness for equal-width lines.
-        if (
-          points.some(
-            (point) => !pathPoisson.isClear(point.x, point.y, lineRadius),
-          )
-        ) {
-          flowCollisionRejects++;
-          continue;
-        }
-        seedPoisson.add(x, y, seedRadius);
+        // Cut the streamline where it reaches an inked border; each piece
+        // that stays clear is kept as its own streamline.
+        const pieces: VegetationStrokePoint[][] = [[]];
         for (const point of points) {
-          pathPoisson.add(point.x, point.y, lineRadius);
+          if (borderPoisson.isClear(point.x, point.y, lineRadius)) {
+            pieces[pieces.length - 1].push(point);
+          } else if (pieces[pieces.length - 1].length > 0) {
+            pieces.push([]);
+          }
         }
-        const biomeId = biomeAt(dem, x, y);
-        const path: VegetationStrokePath = {
-          key,
-          biomeId,
-          width: pathWidth,
-          dashPhase: hash01(key, 59) * 19,
-          points,
-        };
-        geometry.paths.push(path);
-        const motifPlacementStop = profiler?.begin(
-          "vegetation motif placement",
-        );
-        placeMotifsAlongPath(geometry, dem, path, options);
-        motifPlacementStop?.();
+        let accepted = false;
+        for (const [pieceIndex, piece] of pieces.entries()) {
+          if (piece.length < 5) continue;
+          // A traced streamline can curve toward an older one after its seed
+          // passes. Check the sampled centreline with the actual ink radius;
+          // pairwise radius sums give 2x thickness for equal-width lines.
+          if (
+            piece.some(
+              (point) => !pathPoisson.isClear(point.x, point.y, lineRadius),
+            )
+          ) {
+            flowCollisionRejects++;
+            continue;
+          }
+          accepted = true;
+          for (const point of piece) {
+            pathPoisson.add(point.x, point.y, lineRadius);
+          }
+          const pieceKey = pieceIndex === 0
+            ? key
+            : (key ^ Math.imul(pieceIndex, 0x27d4eb2d)) | 0;
+          const path: VegetationStrokePath = {
+            key: pieceKey,
+            biomeId: biomeAt(dem, x, y),
+            width: pathWidth,
+            dashPhase: hash01(pieceKey, 59) * 19,
+            points: piece,
+          };
+          geometry.paths.push(path);
+          const motifPlacementStop = profiler?.begin(
+            "vegetation motif placement",
+          );
+          placeMotifsAlongPath(geometry, dem, path, options);
+          motifPlacementStop?.();
+        }
+        if (accepted) seedPoisson.add(x, y, seedRadius);
       }
     }
     reportProgress?.("Tracing vegetation patterns", totalFlowCandidates, totalFlowCandidates);
@@ -4332,12 +4652,18 @@ function buildVegetationPropGeometry(
   options: ResolvedVegetationPatternOptions,
   profiler: MountainProfiler | undefined,
   reportProgress: VegetationPreparationReporter | undefined,
+  rasterPropPlacements?: readonly VegetationRasterPropPlacement[],
 ): void {
   const rasterPlacementStop = profiler?.begin(
     "vegetation raster prop placement",
   );
   reportProgress?.("Placing raster vegetation");
-  placeRasterProps(geometry, dem, options, undefined, profiler, reportProgress);
+  if (rasterPropPlacements) {
+    // Placed per biome elsewhere (in parallel) and joined in biome order.
+    geometry.rasterProps = [...rasterPropPlacements];
+  } else {
+    placeRasterProps(geometry, dem, options, undefined, profiler, reportProgress);
+  }
   rasterPlacementStop?.();
   const foothillPlacementStop = profiler?.begin(
     "vegetation mountain foothill placement",
@@ -4389,6 +4715,8 @@ export function buildVegetationGeometry(
   profiler?: MountainProfiler,
   onProgress?: VegetationPreparationReporter,
   part: VegetationLayerPart = "all",
+  /** Placements from `placeRasterPropsInBiomes`, joined in biome order. */
+  rasterPropPlacements?: readonly VegetationRasterPropPlacement[],
 ): VegetationGeometry {
   const reportProgress = createThrottledPreparationReporter(onProgress);
   const options = resolveVegetationPatternOptions(rawOptions);
@@ -4400,16 +4728,20 @@ export function buildVegetationGeometry(
     rasterProps: [],
   };
   if (part !== "props") buildVegetationFlowGeometry(geometry, dem, options, profiler, reportProgress);
-  if (part !== "flow") buildVegetationPropGeometry(geometry, dem, options, profiler, reportProgress);
+  if (part !== "flow") {
+    buildVegetationPropGeometry(geometry, dem, options, profiler, reportProgress, rasterPropPlacements);
+  }
   return geometry;
 }
 
-/** Raster props drawn as hand-drawn stands instead of one by one. */
+/** Raster props drawn as pen-and-ink stands instead of one by one. */
 interface PropStandGroup {
   id: string;
   isMember: (asset: VegetationRasterPropAsset) => boolean;
-  /** Templates, L4 shape and plant size relative to a stand tree. */
-  profile: StandProfile;
+  /** Tree shape a biome's stands of this group are drawn in. */
+  forest: (biomeId: number) => ForestInkType;
+  /** Plant size relative to a stand tree. */
+  size: number;
   seedSalt: number;
   /**
    * Stand look from a biome's style: the body colour the wash and plant
@@ -4422,21 +4754,50 @@ interface PropStandGroup {
 }
 
 /**
+ * Tree shape per mountain biome: conifers in the subalpine forest and on
+ * the cold or high ground around it (tundra, montane meadows, rocky desert
+ * juniper and pinyon), broadleaf trees in the woodland and along rivers,
+ * floodplains and the lowland grass and steppe biomes.
+ */
+const CONIFER_BIOMES: ReadonlySet<number> = new Set([2, 3, 16, 20]);
+
+/**
+ * Line weight per kind of tree in the map's stands, as tuned in /forest-lab:
+ * the front row boldest, the grass dots finest. The "Line thickness" setting
+ * scales them all together.
+ */
+const STAND_LINE_WEIGHTS: ForestInkPens = {
+  front: 1.43,
+  second: 1.4,
+  back: 1.34,
+  nearEdge: 1.31,
+  fill: 1.3,
+  lone: 1.28,
+  grass: 1.1,
+};
+
+export function standForestType(biomeId: number): ForestInkType {
+  return CONIFER_BIOMES.has(biomeId) ? "conifer" : "deciduous";
+}
+
+/**
  * Every stand group shares one workflow (placement, stand mask, geometry,
- * painting); a new plant kind is a new row here plus its lodN templates.
+ * painting); a new plant kind is a new row here plus its tree shape.
  */
 const PROP_STAND_GROUPS: readonly PropStandGroup[] = [
   {
     id: "alpine-forest",
     isMember: (asset) => asset.outlineGroup === "alpine-forest",
-    profile: TREE_STAND_PROFILE,
+    forest: standForestType,
+    size: 1,
     seedSalt: 0,
     style: (biome) => ({ body: biome.tree }),
   },
   {
     id: "wetland-shrubs",
     isMember: (asset) => asset.outlineGroup === "wetland-forest" && asset.family === "shrub",
-    profile: SHRUB_STAND_PROFILE,
+    forest: () => "shrub",
+    size: 0.75,
     seedSalt: 0x5a1b7e,
     // A shrub stand's accent plants are the biome's trees.
     style: (biome, settings) => ({
@@ -4455,6 +4816,39 @@ function propStandGroupStyle(
     propStandStyleForBiome(options.forestSettings, options.rasterPropBiomeSettings, biomeId),
     options.forestSettings,
   );
+}
+
+/** One wash colour field per biome share field and colour set. */
+const propStandWashFields = new WeakMap<PropStandBiomeShares, ForestInkWashField>();
+
+/** The group's wash colours mixed by the biome shares (NaN far from any plant). */
+function propStandWashField(
+  group: PropStandGroup,
+  options: Pick<ResolvedVegetationPatternOptions, "forestSettings" | "rasterPropBiomeSettings">,
+  biomeShares: PropStandBiomeShares,
+): ForestInkWashField | undefined {
+  const colors = biomeShares.biomeIds.map((biomeId) => propStandGroupStyle(group, options, biomeId).body);
+  const key = JSON.stringify(colors);
+  const cached = propStandWashFields.get(biomeShares);
+  if (cached?.key === key) return cached;
+  const rgbs = colors.map((color) => parseHexColor(color));
+  if (rgbs.some((rgb) => !rgb)) return undefined;
+  const { columns, rows, shares } = biomeShares;
+  const count = rgbs.length;
+  const rgb = new Float32Array(columns * rows * 3).fill(Number.NaN);
+  for (let cell = 0; cell < columns * rows; cell++) {
+    let total = 0;
+    for (let biome = 0; biome < count; biome++) total += shares[cell * count + biome];
+    if (total === 0) continue;
+    for (let channel = 0; channel < 3; channel++) {
+      let value = 0;
+      for (let biome = 0; biome < count; biome++) value += shares[cell * count + biome] * rgbs[biome]![channel];
+      rgb[cell * 3 + channel] = value;
+    }
+  }
+  const field = { step: biomeShares.step, columns, rows, rgb, key };
+  propStandWashFields.set(biomeShares, field);
+  return field;
 }
 
 /**
@@ -4489,6 +4883,185 @@ export function propStandColorPartition(options: VegetationPatternOptions | unde
 const STAND_TREE_SIZE_CELLS = 1.65 * 0.8;
 
 /**
+ * Where each biome's plants grew, blurred over `blend` pixels: the colour
+ * weights the stand wash grades by across biome borders. Undefined when the
+ * plants all belong to one biome or `blend` is 0.
+ */
+export function buildPropStandBiomeShares(
+  placements: readonly Pick<VegetationRasterPropPlacement, "x" | "y" | "biomeId">[],
+  width: number,
+  height: number,
+  blend: number,
+): PropStandBiomeShares | undefined {
+  const biomeIds = [...new Set(placements.map((placement) => placement.biomeId))].sort((a, b) => a - b);
+  if (!(blend > 0) || biomeIds.length < 2) return undefined;
+  const step = Math.max(2, blend / 4);
+  const columns = Math.ceil(width / step);
+  const rows = Math.ceil(height / step);
+  const cells = columns * rows;
+  const count = biomeIds.length;
+  const planes = biomeIds.map(() => new Float32Array(cells));
+  for (const placement of placements) {
+    const column = Math.max(0, Math.min(columns - 1, Math.floor(placement.x / step)));
+    const row = Math.max(0, Math.min(rows - 1, Math.floor(placement.y / step)));
+    planes[biomeIds.indexOf(placement.biomeId)][row * columns + column]++;
+  }
+  // Two box passes of half the blend width each spread a biome's plants
+  // across the whole band.
+  const radius = Math.max(1, Math.round(blend / 2 / step));
+  const blurred = planes.map((plane) =>
+    standBoxBlur(standBoxBlur(plane, columns, rows, radius), columns, rows, radius));
+  const shares = new Float32Array(cells * count);
+  for (let cell = 0; cell < cells; cell++) {
+    let total = 0;
+    for (let biome = 0; biome < count; biome++) total += blurred[biome][cell];
+    if (total <= 1e-6) continue;
+    for (let biome = 0; biome < count; biome++) shares[cell * count + biome] = blurred[biome][cell] / total;
+  }
+  return { step, columns, rows, biomeIds, shares };
+}
+
+/**
+ * Plants join into stands with their neighbours: a plant with at least two
+ * others within `joinTrees` stand trees belongs to a stand, the rest stay
+ * lone trees. The stand area is the union of discs around its plants, so it
+ * follows where plants actually grow (terrain, clearings, clustering) and
+ * never fills open ground. Distances are in stand trees, not a group's plant
+ * size, so shrubs and trees join alike. Plants placed as lone trees stay
+ * lone and count as no stand plant's neighbour.
+ */
+export function formPropStandArea(
+  placements: readonly Pick<VegetationRasterPropPlacement, "x" | "y" | "lone">[],
+  width: number,
+  height: number,
+  standTreeSize: number,
+  joinTrees: number,
+): { forest: Float32Array; loneTrees: Array<{ x: number; y: number }> } {
+  const join = standTreeSize * joinTrees;
+  const centre = (placement: Pick<VegetationRasterPropPlacement, "x" | "y">) => ({ x: placement.x, y: placement.y - standTreeSize * 0.45 });
+  const grid = new Map<number, number[]>();
+  const columns = Math.ceil(width / join) + 3;
+  const cellOf = (cx: number, cy: number) => (cy + 1) * columns + cx + 1;
+  placements.forEach((placement, index) => {
+    if (placement.lone) return;
+    const { x, y } = centre(placement);
+    const key = cellOf(Math.floor(x / join), Math.floor(y / join));
+    const bucket = grid.get(key);
+    if (bucket) bucket.push(index);
+    else grid.set(key, [index]);
+  });
+  const inStand = placements.map((placement, index) => {
+    if (placement.lone) return false;
+    const { x, y } = centre(placement);
+    const cx = Math.floor(x / join);
+    const cy = Math.floor(y / join);
+    let neighbours = 0;
+    for (let oy = -1; oy <= 1; oy++) {
+      for (let ox = -1; ox <= 1; ox++) {
+        for (const other of grid.get(cellOf(cx + ox, cy + oy)) ?? []) {
+          if (other === index) continue;
+          const point = centre(placements[other]);
+          if (Math.hypot(point.x - x, point.y - y) <= join) neighbours++;
+          if (neighbours >= 2) return true;
+        }
+      }
+    }
+    return false;
+  });
+  // Discs reaching just past halfway to a neighbour, so joined plants meet.
+  const radius = join * 0.55;
+  const discs = new Float32Array(width * height);
+  const loneTrees: Array<{ x: number; y: number }> = [];
+  placements.forEach((placement, index) => {
+    if (!inStand[index]) {
+      loneTrees.push({ x: placement.x, y: placement.y });
+      return;
+    }
+    const { x: px, y: py } = centre(placement);
+    for (let y = Math.max(0, Math.floor(py - radius)); y <= Math.min(height - 1, Math.ceil(py + radius)); y++) {
+      for (let x = Math.max(0, Math.floor(px - radius)); x <= Math.min(width - 1, Math.ceil(px + radius)); x++) {
+        if ((x - px) ** 2 + (y - py) ** 2 <= radius * radius) discs[y * width + x] = 1;
+      }
+    }
+  });
+  // Soften the disc edges a little; the ink stands round them further.
+  const softened = standBoxBlur(discs, width, height, Math.max(1, Math.round(radius * 0.3)));
+  const forest = new Float32Array(width * height);
+  for (let index = 0; index < forest.length; index++) forest[index] = smoothStep(0.35, 0.65, softened[index]);
+  return { forest, loneTrees };
+}
+
+/**
+ * Largest gap, in stand trees, between plants that still join into one
+ * stand (the "Stand joining" setting); 2.5 when unset.
+ */
+export function standJoinTrees(join: number): number {
+  return Number.isFinite(join) ? Math.max(0.5, join) : 2.5;
+}
+
+/**
+ * Dry-land ground for stands, 0..1 per DEM cell, by the same rules that keep
+ * plants off it: no permanent snow or glacier, fading out on slopes too
+ * steep for trees. Water is left to propStandGround.
+ */
+export function buildPropStandTerrain(
+  dem: Pick<MountainDEMData, "width" | "height" | "biomeType"> &
+    Partial<Pick<MountainDEMData, "slopeDeg" | "normalizedElevation" | "temperatureC">>,
+): Float32Array {
+  const terrain = new Float32Array(dem.width * dem.height);
+  for (let index = 0; index < terrain.length; index++) {
+    const biome = dem.biomeType[index];
+    const snow = biome === 0 || ((dem.normalizedElevation?.[index] ?? 0) > 0.72 && (dem.temperatureC?.[index] ?? 0) < -2);
+    // Biome 8 is open ocean, whatever the water mask says.
+    if (snow || biome === 8) continue;
+    terrain[index] = 1 - smoothStep(36, 46, dem.slopeDeg?.[index] ?? 0);
+  }
+  return terrain;
+}
+
+/**
+ * Where a stand of `markSize` trees gives way to river silt, 0..1, from the
+ * distance into the silt (`siltDepth`, in cells). The stand reaches in an
+ * uneven way, from a fifth of a tree to a whole tree, so its edge along the
+ * silt stays organic; past that the silt is open.
+ */
+export function propStandSiltClearing(
+  siltDepth: Float32Array,
+  width: number,
+  height: number,
+  markSize: number,
+  noise: SimplexNoise,
+): Float32Array {
+  const clearing = new Float32Array(width * height);
+  const soft = Math.max(0.75, markSize * 0.25);
+  const scale = Math.max(4, markSize * 6);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const index = y * width + x;
+      const depth = siltDepth[index];
+      if (!(depth > 0)) continue;
+      const reach = markSize * (0.2 + 0.8 * clamp01(0.5 + 0.5 * noise.noise2D(x / scale, y / scale)));
+      clearing[index] = smoothStep(reach - soft, reach + soft, depth);
+    }
+  }
+  return clearing;
+}
+
+/**
+ * The ground a stand of `markSize` trees may cover: dry terrain, kept a
+ * third of a tree back from any water so no crown overhangs a river or
+ * a lake shore.
+ */
+export function propStandGround(terrain: Float32Array, waterDistance: Float32Array, markSize: number): Float32Array {
+  const clearance = Math.max(1, markSize * 0.35);
+  const ground = new Float32Array(terrain.length);
+  for (let index = 0; index < ground.length; index++) {
+    ground[index] = terrain[index] * smoothStep(clearance * 0.5, clearance * 1.5, waterDistance[index] ?? Infinity);
+  }
+  return ground;
+}
+
+/**
  * Placements of every stand group become hand-drawn stands: plants
  * standing in company mark the stand area, isolated ones stay lone (L1),
  * and the stand renderer draws both instead of the per-prop art. Placement
@@ -4505,6 +5078,7 @@ function buildPropStands(
   const buckets = new Map<string, {
     group: PropStandGroup;
     style: ReturnType<PropStandGroup["style"]>;
+    forest: ForestInkType;
     biomeIds: number[];
     placements: VegetationRasterPropPlacement[];
   }>();
@@ -4517,10 +5091,12 @@ function buildPropStands(
       continue;
     }
     const style = propStandGroupStyle(group, options, placement.biomeId);
-    const key = `${group.id}|${JSON.stringify(style)}`;
+    // Biomes with different tree shapes never share a stand.
+    const forest = group.forest(placement.biomeId);
+    const key = `${group.id}|${forest}|${JSON.stringify(style)}`;
     let bucket = buckets.get(key);
     if (!bucket) {
-      bucket = { group, style, biomeIds: [], placements: [] };
+      bucket = { group, style, forest, biomeIds: [], placements: [] };
       buckets.set(key, bucket);
     }
     if (!bucket.biomeIds.includes(placement.biomeId)) bucket.biomeIds.push(placement.biomeId);
@@ -4548,10 +5124,42 @@ function buildPropStands(
     }
   }
 
+  // Where trees can stand at all: not on water, snow or cliffs. Stand areas are discs around plants, so they bridge rivers
+  // and spill over lake shores; this cuts them back. Only water drawn on the
+  // map counts: hidden drainage channels must not split a stand.
+  const waterDistance = buildWetlandImageWaterDistance(dem);
+  const terrain = buildPropStandTerrain(dem);
+  // River silt is open land: stands stop at its edge (reaching a little way
+  // in), while the few plants out on it stand as lone trees, thinned as
+  // placement thins them.
+  let silt: { depth: Float32Array; sparse: Float32Array; noise: SimplexNoise } | undefined;
+  if (dem.siltDepth?.length === width * height) {
+    const sparse = new Float32Array(width * height);
+    const inside = new Uint8Array(width * height);
+    for (let index = 0; index < sparse.length; index++) {
+      const cover = riverSiltCoverage(dem.siltDepth[index], DEFAULT_SILT_LAYERS);
+      sparse[index] = cover * SILT_PLANT_THINNING;
+      inside[index] = cover >= 0.5 ? 1 : 0;
+    }
+    silt = { depth: buildDistanceField(inside, width, height), sparse, noise: new SimplexNoise(options.seed ^ 0x5117ed9e) };
+  }
+
   const settings = options.forestSettings;
   const stands: VegetationPropStand[] = [];
   const bucketsPerGroup = new Map<string, number>();
-  for (const { group, style, biomeIds, placements } of buckets.values()) {
+  // One colour blend per group, across all its stands, so the wash of two
+  // biomes' stands grades the same way on both sides of their border.
+  const sharesPerGroup = new Map<string, PropStandBiomeShares | undefined>();
+  for (const group of new Set([...buckets.values()].map((bucket) => bucket.group))) {
+    const groupPlacements = [...buckets.values()]
+      .filter((bucket) => bucket.group === group)
+      .flatMap((bucket) => bucket.placements);
+    const cellSizes = groupPlacements.map((placement) => placement.cellSize).sort((a, b) => a - b);
+    const treeSize = Math.max(4, cellSizes[Math.floor(cellSizes.length / 2)] * STAND_TREE_SIZE_CELLS);
+    sharesPerGroup.set(group.id, buildPropStandBiomeShares(
+      groupPlacements, width, height, Math.max(0, settings.biomeBlend) * treeSize));
+  }
+  for (const { group, style, forest: forestType, biomeIds, placements } of buckets.values()) {
     // The first stand of a group keeps the group's seed; later ones vary it.
     const bucketIndex = bucketsPerGroup.get(group.id) ?? 0;
     bucketsPerGroup.set(group.id, bucketIndex + 1);
@@ -4559,59 +5167,74 @@ function buildPropStands(
     // The floor applies to the shared tree size, never to one group alone,
     // so small preview scales keep every group in proportion.
     const standTreeSize = Math.max(4, cellSizes[Math.floor(cellSizes.length / 2)] * STAND_TREE_SIZE_CELLS);
-    const treeSize = standTreeSize * group.profile.size;
-    // The stand mask follows placement spacing, which the shared prop scale
-    // sets for every group alike, so it is sized from the stand tree, not
-    // from this group's plant size (small shrubs would all read as lone).
-    const radius = standTreeSize * 0.45;
-    const stamp = (target: Float32Array, placement: VegetationRasterPropPlacement) => {
-      const cy = placement.y - radius;
-      for (let y = Math.max(0, Math.floor(cy - radius)); y <= Math.min(height - 1, Math.ceil(cy + radius)); y++) {
-        for (let x = Math.max(0, Math.floor(placement.x - radius)); x <= Math.min(width - 1, Math.ceil(placement.x + radius)); x++) {
-          if ((x - placement.x) ** 2 + (y - cy) ** 2 <= radius * radius) target[y * width + x] = 1;
-        }
-      }
-    };
-    // Plants with neighbours form stands; one on its own stays a lone L1.
-    const all = new Float32Array(width * height);
-    for (const placement of placements) stamp(all, placement);
-    const company = standBoxBlur(all, width, height, Math.round(standTreeSize * 1.2));
-    const standing = new Float32Array(width * height);
-    const loneTrees: Array<{ x: number; y: number }> = [];
-    for (const placement of placements) {
-      if (sampleStandField(company, width, height, placement.x, placement.y - radius) < 0.25) {
-        loneTrees.push({ x: placement.x, y: placement.y });
-      } else {
-        stamp(standing, placement);
-      }
-    }
-    // Bridge the gaps between neighbouring plants into one stand area.
-    const bridged = standBoxBlur(standing, width, height, Math.round(standTreeSize * 0.5));
-    const forest = new Float32Array(width * height);
-    for (let index = 0; index < forest.length; index++) forest[index] = smoothStep(0.25, 0.45, bridged[index]);
+    // Prop scale alone sizes the drawn trees: marks keep the lab's ratio to
+    // the stand tree (5.5 to 7.5).
+    const markSize = standTreeSize * group.size / INK_WASH_TREE_SIZE_PER_MARK;
+    const clearing = silt ? propStandSiltClearing(silt.depth, width, height, markSize, silt.noise) : undefined;
+    // Plants out on the silt never join a stand.
+    const standPlacements = clearing
+      ? placements.map((placement) => sampleScalarField(clearing, width, height, placement.x, placement.y) >= 0.5
+        ? { ...placement, lone: true }
+        : placement)
+      : placements;
+    const { forest, loneTrees } = formPropStandArea(standPlacements, width, height, standTreeSize, standJoinTrees(settings.standJoin));
+    const ground = propStandGround(terrain, waterDistance, markSize);
 
+    const inkGeometry = buildForestInkGeometry({
+      width,
+      height,
+      forest,
+      seed: ((options.seed ^ Math.imul(settings.seed, 2654435761)) ^ group.seedSalt ^
+        Math.imul(bucketIndex, 0x9e3779b1)) >>> 0,
+      settings: {
+        type: forestType,
+        markSize,
+        density: settings.inkFillDensity,
+        edgeRows: settings.inkEdgeRows,
+        edgeDensity: settings.inkEdgeDensity,
+        edgeDepth: settings.inkEdgeDepth,
+        meadowTrees: settings.inkMeadowTrees,
+        grass: settings.inkGrass,
+      },
+      slope: dem.slopeDeg,
+      ground,
+      clearing,
+      sparse: silt?.sparse,
+      light,
+      lightStrength: settings.inkLight,
+      loneTrees,
+      // Trees among shrubs: the biome's share of shrub-stand plants drawn as trees.
+      accentShare: style.accent?.share,
+    });
+    let debug: ForestInkStandDebug | undefined;
+    if (settings.showStandDebug) {
+      const plants = new Float32Array(placements.length * 3);
+      const lone = new Set(loneTrees.map((tree) => `${tree.x},${tree.y}`));
+      placements.forEach((placement, index) => {
+        plants[index * 3] = placement.x;
+        plants[index * 3 + 1] = placement.y;
+        plants[index * 3 + 2] = lone.has(`${placement.x},${placement.y}`) ? 1 : 0;
+      });
+      const share = (field: Float32Array) => {
+        let count = 0;
+        for (const value of field) if (value >= 0.5) count++;
+        return `${(count / field.length * 100).toFixed(2)}%`;
+      };
+      debug = {
+        plants,
+        area: forest,
+        label: `${group.id} · ${forestType} · biomes ${biomeIds.join(",")} · ${placements.length} plants, ` +
+          `${loneTrees.length} lone · area ${share(forest)} → stand ${share(inkGeometry.mask)} · ` +
+          `tree ${standTreeSize.toFixed(1)} px, mark ${markSize.toFixed(1)} px · ${inkGeometry.marks.length} marks`,
+      };
+    }
     stands.push({
       group: group.id,
       biomeIds: biomeIds.sort((a, b) => a - b),
-      geometry: buildForestStandGeometry({
-        width,
-        height,
-        forest,
-        treeSize,
-        seed: ((options.seed ^ Math.imul(settings.seed, 2654435761)) ^ group.seedSalt ^
-          Math.imul(bucketIndex, 0x9e3779b1)) >>> 0,
-        settings: {
-          markSpacing: settings.standMarkSpacing,
-          edgeTrees: settings.standEdgeTrees,
-          interiorTrees: settings.standInteriorTrees,
-          meadowTrees: settings.standMeadowTrees,
-          accentTrees: style.accent?.share,
-        },
-        slope: dem.slopeDeg,
-        light,
-        loneTrees,
-        profile: group.profile,
-      }),
+      forest: forestType,
+      geometry: inkGeometry,
+      biomeShares: sharesPerGroup.get(group.id),
+      debug,
     });
   }
   geometry.stands = stands;
@@ -5063,7 +5686,11 @@ export function mapVegetationGeometryToTile(
     stands: geometry.stands?.map((stand) => ({
       group: stand.group,
       biomeIds: stand.biomeIds,
-      geometry: mapForestStandGeometry(stand.geometry, scaleX, scaleY, tileX, tileY, tileWidth, tileHeight),
+      forest: stand.forest,
+      geometry: mapForestInkGeometry(stand.geometry, scaleX, scaleY, tileX, tileY, tileWidth, tileHeight),
+      // In the stand geometry's own map pixels, like its mask.
+      biomeShares: stand.biomeShares,
+      debug: stand.debug,
     })),
   };
 }
@@ -6710,6 +7337,8 @@ interface RasterPropLayers {
   rasterPropCharcoalAlpha: Uint8Array;
   rasterPropShadowAlpha: Uint8Array;
   rasterPropStandShare?: Uint8Array;
+  rasterPropStandCover?: Uint8Array;
+  rasterPropStandWash?: Uint8ClampedArray;
 }
 
 /**
@@ -6744,7 +7373,7 @@ function renderRasterPropLayers(
     options.forestRenderScale,
     forestRenderSettingsSignature(options.forestSettings),
     vegetationRasterPropAssetSignature(options.rasterPropAssets),
-    (geometry.stands ?? []).map((stand) => stand.geometry.items.length),
+    (geometry.stands ?? []).map((stand) => stand.geometry.marks.length),
     (geometry.rasterProps ?? []).map((placement) => [
       placement.x,
       placement.y,
@@ -6771,6 +7400,14 @@ function renderRasterPropLayers(
   let rasterPropStandShare =
     stageCache?.rasterPropKey === rasterPropKey
       ? stageCache.rasterPropStandShare
+      : undefined;
+  let rasterPropStandCover =
+    stageCache?.rasterPropKey === rasterPropKey
+      ? stageCache.rasterPropStandCover
+      : undefined;
+  let rasterPropStandWash =
+    stageCache?.rasterPropKey === rasterPropKey
+      ? stageCache.rasterPropStandWash
       : undefined;
   const rasterPropsCacheHit = Boolean(
     rasterPropRGBA && rasterPropShadowAlpha && rasterPropCharcoalAlpha,
@@ -7010,50 +7647,91 @@ function renderRasterPropLayers(
       }
     }
     forestStop?.();
-    for (const stand of geometry.stands ?? []) {
-      const group = PROP_STAND_GROUPS.find((candidate) => candidate.id === stand.group);
-      if (!group) continue;
+    const allStands = geometry.stands ?? [];
+    const standsCanvas = allStands.length > 0 && typeof OffscreenCanvas !== "undefined"
+      ? new OffscreenCanvas(dem.width, dem.height).getContext("2d", { willReadFrequently: true })
+      : null;
+    if (standsCanvas) {
       const standStop = profiler?.begin("vegetation forest stands");
       const settings = options.forestSettings;
-      const colors = propStandGroupStyle(group, options, stand.biomeIds[0] ?? -1);
-      // Wash and plant fills share one colour: the biome's foliage for this
-      // group, darkened to the value the lab was tuned with.
-      const foliage = parseHexColor(colors.body) ?? [86, 123, 84];
-      const standPixels = renderForestStandLayer(dem.width, dem.height, stand.geometry, {
-        washColor: `#${foliage.map((channel) => Math.round(channel * 0.75).toString(16).padStart(2, "0")).join("")}`,
-        washStrength: settings.standWashStrength,
-        washVariation: settings.standWashVariation,
-        washSoftness: settings.standWashSoftness,
-        inkColor: settings.outlineColor,
-        inkWeight: settings.standInkWeight,
-        lightStrength: settings.standLightStrength,
-        accentColor: colors.accent?.body,
-        trunkColor: colors.accent?.trunk,
-      }, profiler);
-      if (standPixels) {
-        rasterPropStandShare ??= new Uint8Array(dem.width * dem.height);
-        // Stands are background: composite them beneath every other prop.
-        for (let pixel = 0; pixel < dem.width * dem.height; pixel++) {
-          const offset = pixel * 4;
-          const standAlpha = standPixels[offset + 3] / 255;
-          if (standAlpha <= 0) continue;
-          const propAlpha = rasterPropRGBA[offset + 3] / 255;
-          const outputAlpha = propAlpha + standAlpha * (1 - propAlpha);
-          for (let channel = 0; channel < 3; channel++) {
-            rasterPropRGBA[offset + channel] = Math.round(
-              (rasterPropRGBA[offset + channel] * propAlpha +
-                standPixels[offset + channel] * standAlpha * (1 - propAlpha)) /
-                outputAlpha,
-            );
-          }
-          rasterPropRGBA[offset + 3] = Math.round(outputAlpha * 255);
-          // Share of the pixel that is stand paint, including stands composited before.
-          rasterPropStandShare[pixel] = Math.round(
-            (rasterPropStandShare[pixel] / 255 * propAlpha + standAlpha * (1 - propAlpha)) / outputAlpha * 255,
-          );
+      // Stand areas and crowns, for the compositor to show line-free ground under.
+      const coverCanvas = settings.showStandDebug
+        ? null
+        : new OffscreenCanvas(dem.width, dem.height).getContext("2d", { willReadFrequently: true });
+      // The wash on its own, for the compositor to mix into the ground.
+      const washCanvas = settings.showStandDebug
+        ? null
+        : new OffscreenCanvas(dem.width, dem.height).getContext("2d", { willReadFrequently: true });
+      // Every stand paints onto one canvas. A later stand goes underneath
+      // the earlier ones, so stands are drawn last to first.
+      for (let standIndex = allStands.length - 1; standIndex >= 0; standIndex--) {
+        const stand = allStands[standIndex];
+        const group = PROP_STAND_GROUPS.find((candidate) => candidate.id === stand.group);
+        if (!group) continue;
+        if (settings.showStandDebug && stand.debug) {
+          // The debug view replaces the ink; the stand drawn first (the
+          // bottom one) carries the white background.
+          const debugCanvas = renderForestInkDebugCanvas(dem.width, dem.height, stand.geometry, stand.debug,
+            standIndex, standIndex === allStands.length - 1);
+          if (debugCanvas) standsCanvas.drawImage(debugCanvas, 0, 0);
+          continue;
         }
+        const colors = propStandGroupStyle(group, options, stand.biomeIds[0] ?? -1);
+        // The wash under stands and crowns is the biome's foliage for this
+        // group, graded toward the neighbouring biomes' near their borders.
+        renderForestInkCanvas(dem.width, dem.height, stand.geometry, {
+          inkColor: settings.outlineColor,
+          inkWeight: settings.inkWeight,
+          washColor: colors.body,
+          washField: stand.biomeShares ? propStandWashField(group, options, stand.biomeShares) : undefined,
+          washAlpha: settings.inkTint,
+          washVariation: settings.inkWashVariation,
+          washSoftness: settings.inkWashSoftness,
+          lightStrength: settings.inkLight,
+          charcoal: settings.inkCharcoal,
+          interruptions: settings.inkInterruptions,
+          thickness: STAND_LINE_WEIGHTS,
+        }, standsCanvas, { cover: coverCanvas ?? undefined, wash: washCanvas ?? undefined });
       }
       standStop?.();
+      const readbackStop = profiler?.begin("vegetation forest stand readback");
+      const standPixels = standsCanvas.getImageData(0, 0, dem.width, dem.height).data;
+      if (coverCanvas) {
+        const coverPixels = coverCanvas.getImageData(0, 0, dem.width, dem.height).data;
+        rasterPropStandCover = new Uint8Array(dem.width * dem.height);
+        for (let pixel = 0; pixel < rasterPropStandCover.length; pixel++) {
+          rasterPropStandCover[pixel] = coverPixels[pixel * 4 + 3];
+        }
+        // The whole stand area, not just the crowns, keeps lines out.
+        for (const stand of allStands) {
+          addForestStandArea(rasterPropStandCover, dem.width, dem.height, stand.geometry);
+        }
+      }
+      if (washCanvas) {
+        rasterPropStandWash = new Uint8ClampedArray(
+          washCanvas.getImageData(0, 0, dem.width, dem.height).data.buffer,
+        );
+      }
+      readbackStop?.();
+      rasterPropStandShare ??= new Uint8Array(dem.width * dem.height);
+      // Stands are background: composite them beneath every other prop.
+      for (let pixel = 0; pixel < dem.width * dem.height; pixel++) {
+        const offset = pixel * 4;
+        const standAlpha = standPixels[offset + 3] / 255;
+        if (standAlpha <= 0) continue;
+        const propAlpha = rasterPropRGBA[offset + 3] / 255;
+        const outputAlpha = propAlpha + standAlpha * (1 - propAlpha);
+        for (let channel = 0; channel < 3; channel++) {
+          rasterPropRGBA[offset + channel] = Math.round(
+            (rasterPropRGBA[offset + channel] * propAlpha +
+              standPixels[offset + channel] * standAlpha * (1 - propAlpha)) /
+              outputAlpha,
+          );
+        }
+        rasterPropRGBA[offset + 3] = Math.round(outputAlpha * 255);
+        // Share of the pixel that is stand paint.
+        rasterPropStandShare[pixel] = Math.round(standAlpha * (1 - propAlpha) / outputAlpha * 255);
+      }
     }
     const rasterInkOpacityStop = profiler?.begin(
       "vegetation raster prop ink opacity",
@@ -7074,10 +7752,15 @@ function renderRasterPropLayers(
       stageCache.rasterPropCharcoalAlpha = rasterPropCharcoalAlpha;
       stageCache.rasterPropShadowAlpha = rasterPropShadowAlpha;
       stageCache.rasterPropStandShare = rasterPropStandShare;
+      stageCache.rasterPropStandCover = rasterPropStandCover;
+      stageCache.rasterPropStandWash = rasterPropStandWash;
     }
   }
   rasterPropsStop?.();
-  return { rasterPropRGBA, rasterPropCharcoalAlpha, rasterPropShadowAlpha, rasterPropStandShare };
+  return {
+    rasterPropRGBA, rasterPropCharcoalAlpha, rasterPropShadowAlpha,
+    rasterPropStandShare, rasterPropStandCover, rasterPropStandWash,
+  };
 }
 
 function emptyRasterPropLayers(): RasterPropLayers {
@@ -7099,6 +7782,8 @@ export function mergeVegetationOverlay(
     rasterPropCharcoalAlpha: props.rasterPropCharcoalAlpha,
     rasterPropShadowAlpha: props.rasterPropShadowAlpha,
     rasterPropStandShare: props.rasterPropStandShare,
+    rasterPropStandCover: props.rasterPropStandCover,
+    rasterPropStandWash: props.rasterPropStandWash,
   };
 }
 
@@ -7608,5 +8293,7 @@ export function renderVegetationOverlay(
     rasterPropCharcoalAlpha: propLayers.rasterPropCharcoalAlpha,
     rasterPropShadowAlpha: propLayers.rasterPropShadowAlpha,
     rasterPropStandShare: propLayers.rasterPropStandShare,
+    rasterPropStandCover: propLayers.rasterPropStandCover,
+    rasterPropStandWash: propLayers.rasterPropStandWash,
   };
 }
