@@ -58,6 +58,8 @@ export function forestStandWashCells(
   opaque = false,
   /** Optional wash output alongside the opaque fill, sharing the noise evaluation. */
   washCells?: Uint8ClampedArray<ArrayBuffer>,
+  /** `washCells` alpha inside the patch per unit of wash strength. */
+  washCellStrength = 1.15,
 ): Uint8ClampedArray<ArrayBuffer> {
   const { maskWidth, maskHeight } = stands;
   const width = Math.max(0, x1 - x0);
@@ -121,7 +123,7 @@ export function forestStandWashCells(
         washCells[offset] = out[offset];
         washCells[offset + 1] = out[offset + 1];
         washCells[offset + 2] = out[offset + 2];
-        washCells[offset + 3] = 255 * clamp01(smoothStep(edgeFrom, edgeTo, m) * paint.washStrength * 1.15);
+        washCells[offset + 3] = 255 * clamp01(smoothStep(edgeFrom, edgeTo, m) * paint.washStrength * washCellStrength);
       }
     }
   }

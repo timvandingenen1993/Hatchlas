@@ -32,8 +32,8 @@ export interface ForestInkPaint {
    */
   washField?: ForestInkWashField;
   /**
-   * Wash strength: how far the wash and crowns shift from the ground below
-   * toward the wash colour. 0 leaves the marks on bare ground, as on paper.
+   * Wash strength: how much paint the wash and crowns mix into the ground
+   * below (see mixPaintChannel). 0 is the ground, 1 the wash colour.
    */
   washAlpha?: number;
   /** 0 = flat wash, 1 = default splotches, 2 = strong colour and value variation. */
@@ -316,7 +316,9 @@ function standWash(geometry: ForestInkGeometry, paint: ForestInkPaint, width: nu
   const cellWidth = gx1 - gx0;
   const cellHeight = gy1 - gy0;
   const washCells = new Uint8ClampedArray(cellWidth * cellHeight * 4);
-  const fillCells = forestStandWashCells(stands, standPaint, gx0, gy0, gx1, gy1, true, washCells);
+  // The amount of paint mixed in is the strength itself inside the patch,
+  // so the whole slider range stays usable.
+  const fillCells = forestStandWashCells(stands, standPaint, gx0, gy0, gx1, gy1, true, washCells, 1);
   const base = paint.washField ? washBaseRgb(standPaint.washColor) : null;
   if (paint.washField && base) {
     shiftWashCells(washCells, cellWidth, gx0, gy0, base, paint.washField);
@@ -366,10 +368,14 @@ function scratchContexts(width: number, height: number): { ink: Ctx; tint: Ctx }
  * canvas and one readback); otherwise onto a new canvas. The geometry's own
  * mapping places it (see mapForestInkGeometry).
  *
- * With `cover`, every crown body is also filled onto it, opaque: the map
- * shows its ground colours without linework there, under the crown's wash,
- * so the wash strength mixes the ground into the crowns rather than letting
- * contours and other lines show through them.
+ * With `layers.cover`, every crown body is also filled onto it, opaque: the
+ * map shows its ground colours without linework there. The stand area itself
+ * is added from the mask (see addForestStandArea), which is far cheaper than
+ * drawing it.
+ *
+ * With `layers.wash`, the wash goes onto it instead of under the ink, for the
+ * caller to mix into the ground (see mixWashPixels). Without it, the wash
+ * is laid under the ink as plain paint.
  */
 export function renderForestInkCanvas(
   width: number,
@@ -377,8 +383,9 @@ export function renderForestInkCanvas(
   geometry: ForestInkGeometry,
   paint: ForestInkPaint,
   target?: Ctx,
-  cover?: Ctx,
+  layers: ForestInkLayers = {},
 ): OffscreenCanvas | null {
+  const { cover } = layers;
   if (width <= 0 || height <= 0 || typeof OffscreenCanvas === "undefined") return null;
   const contexts = scratchContexts(width, height);
   if (!contexts) return null;
@@ -400,7 +407,7 @@ export function renderForestInkCanvas(
   const washTexture = washAlpha > 0 ? standWash(geometry, paint, width, height) : null;
   const tint = washTexture ? contexts.tint : null;
   let crownFill: CanvasPattern | null = null;
-  const crownAlpha = Math.min(1, washAlpha * 1.15);
+  const crownAlpha = washAlpha;
   if (tint && washTexture) {
     tint.setTransform(scaleX, 0, 0, scaleY, -offsetX, -offsetY);
     tint.imageSmoothingEnabled = true;
@@ -527,10 +534,137 @@ export function renderForestInkCanvas(
   output.setTransform(1, 0, 0, 1, 0, 0);
   output.globalAlpha = 1;
   output.globalCompositeOperation = "source-over";
-  if (tint) output.drawImage(tint.canvas, 0, 0);
+  if (tint) {
+    if (layers.wash) {
+      layers.wash.save();
+      layers.wash.setTransform(1, 0, 0, 1, 0, 0);
+      layers.wash.globalAlpha = 1;
+      layers.wash.globalCompositeOperation = "source-over";
+      layers.wash.drawImage(tint.canvas, 0, 0);
+      layers.wash.restore();
+    } else {
+      output.drawImage(tint.canvas, 0, 0);
+    }
+  }
   output.drawImage(ctx.canvas, 0, 0);
   output.restore();
   return output.canvas as OffscreenCanvas;
+}
+
+/** Mask values where the stand area starts to hide lines, and fully hides them. */
+const STAND_AREA_FROM = 0.3;
+const STAND_AREA_TO = 0.5;
+
+function standAreaAlpha(value: number): number {
+  if (value <= STAND_AREA_FROM) return 0;
+  if (value >= STAND_AREA_TO) return 255;
+  const t = (value - STAND_AREA_FROM) / (STAND_AREA_TO - STAND_AREA_FROM);
+  return Math.round(t * t * (3 - 2 * t) * 255);
+}
+
+/**
+ * Coverage (0..255) of the stand area per mask cell: fully opaque from the
+ * stand edge (0.5) inward, fading out just outside it so lines end softly.
+ */
+export function forestStandAreaAlpha(mask: ArrayLike<number>): Uint8ClampedArray {
+  const alpha = new Uint8ClampedArray(mask.length);
+  for (let index = 0; index < mask.length; index++) alpha[index] = standAreaAlpha(mask[index]);
+  return alpha;
+}
+
+/**
+ * Raises `cover` (0..255 per pixel of a `width` × `height` view) to the stand
+ * area of `geometry`, so no mountain or other lines run through the stand,
+ * not just through its crowns.
+ */
+export function addForestStandArea(
+  cover: Uint8Array,
+  width: number,
+  height: number,
+  geometry: ForestInkGeometry,
+): void {
+  const { mask, maskWidth, maskHeight, scaleX, scaleY, offsetX, offsetY } = geometry;
+  if (maskWidth <= 0 || maskHeight <= 0 || scaleX <= 0 || scaleY <= 0) return;
+  if (scaleX === 1 && scaleY === 1 && offsetX === 0 && offsetY === 0
+    && maskWidth === width && maskHeight === height) {
+    for (let index = 0; index < width * height; index++) {
+      const value = mask[index];
+      if (value <= STAND_AREA_FROM) continue;
+      const alpha = standAreaAlpha(value);
+      if (alpha > cover[index]) cover[index] = alpha;
+    }
+    return;
+  }
+  for (let y = 0; y < height; y++) {
+    const cellY = Math.floor((y + 0.5 + offsetY) / scaleY);
+    if (cellY < 0 || cellY >= maskHeight) continue;
+    for (let x = 0; x < width; x++) {
+      const cellX = Math.floor((x + 0.5 + offsetX) / scaleX);
+      if (cellX < 0 || cellX >= maskWidth) continue;
+      const alpha = standAreaAlpha(mask[cellY * maskWidth + cellX]);
+      if (alpha > cover[y * width + x]) cover[y * width + x] = alpha;
+    }
+  }
+}
+
+/** Extra layers renderForestInkCanvas fills next to the ink. */
+export interface ForestInkLayers {
+  /** Crown bodies, opaque: where the ground shows without its linework. */
+  cover?: Ctx;
+  /** The wash on its own: paint colour, alpha = how much of it is mixed in. */
+  wash?: Ctx;
+}
+
+const SRGB_TO_LINEAR = Float32Array.from({ length: 256 }, (_, value) => {
+  const unit = value / 255;
+  return unit <= 0.04045 ? unit / 12.92 : ((unit + 0.055) / 1.055) ** 2.4;
+});
+
+/** Kubelka-Munk absorption over scattering (K/S) of a linear reflectance. */
+function absorption(reflectance: number): number {
+  const r = Math.max(0.001, Math.min(1, reflectance));
+  return (1 - r) * (1 - r) / (2 * r);
+}
+
+const SRGB_TO_ABSORPTION = Float32Array.from(SRGB_TO_LINEAR, absorption);
+
+// Linear light back to sRGB through a table: a power per channel and pixel
+// made the stand wash cost more than the rest of the compositor.
+const LINEAR_TO_SRGB_STEPS = 8191;
+const LINEAR_TO_SRGB = Uint8Array.from({ length: LINEAR_TO_SRGB_STEPS + 1 }, (_, step) => {
+  const value = step / LINEAR_TO_SRGB_STEPS;
+  const unit = value <= 0.0031308 ? value * 12.92 : 1.055 * value ** (1 / 2.4) - 0.055;
+  return Math.round(Math.max(0, Math.min(1, unit)) * 255);
+});
+
+function linearToSrgb(value: number): number {
+  return LINEAR_TO_SRGB[Math.round(Math.max(0, Math.min(1, value)) * LINEAR_TO_SRGB_STEPS)];
+}
+
+/**
+ * One channel of a paint mix: `amount` of `paint` mixed into `ground` as
+ * pigments mix (Kubelka-Munk, in linear light), not as a transparent layer.
+ * 0 is the ground, 1 is the paint colour exactly; in between, the darker
+ * pigment tints more strongly, as in a real wash, instead of fading to grey.
+ */
+export function mixPaintChannel(ground: number, paint: number, amount: number): number {
+  const groundIndex = Math.max(0, Math.min(255, Math.round(ground)));
+  if (amount <= 0) return groundIndex;
+  const paintIndex = Math.max(0, Math.min(255, Math.round(paint)));
+  if (amount >= 1) return paintIndex;
+  const ks = SRGB_TO_ABSORPTION[groundIndex] * (1 - amount) + SRGB_TO_ABSORPTION[paintIndex] * amount;
+  return linearToSrgb(1 + ks - Math.sqrt(ks * ks + 2 * ks));
+}
+
+/** Mixes an RGBA wash layer (alpha = amount of paint) into RGBA `ground` in place. */
+export function mixWashPixels(ground: Uint8ClampedArray, wash: Uint8ClampedArray): void {
+  for (let offset = 0; offset + 3 < ground.length && offset + 3 < wash.length; offset += 4) {
+    const amount = wash[offset + 3] / 255;
+    if (amount <= 0) continue;
+    for (let channel = 0; channel < 3; channel++) {
+      ground[offset + channel] = mixPaintChannel(ground[offset + channel], wash[offset + channel], amount);
+    }
+  }
 }
 
 /** What the stand builder started from, kept for the stand debug view. */

@@ -48,6 +48,11 @@ export interface MountainGpuComposeResult {
   report: MountainGpuRenderReport;
 }
 
+/** The fast mountain layer, plus its rock and snow without linework. */
+export interface MountainGpuMountainLayerResult extends MountainGpuComposeResult {
+  materialData?: Uint8ClampedArray;
+}
+
 /** A layer accepted by the resident GPU compositor. */
 export interface MountainGpuLayerInput {
   image: ImageData;
@@ -143,7 +148,7 @@ export interface MountainGpuSession {
   rasterizeMountainLayer?(
     input: MountainGpuMountainLayerInput,
     control?: MountainFieldGpuPrepareControl,
-  ): Promise<MountainGpuComposeResult>;
+  ): Promise<MountainGpuMountainLayerResult>;
   compose(
     image: ImageData,
     control?: MountainFieldGpuPrepareControl,
@@ -216,6 +221,7 @@ class MountainGpuSessionImpl implements MountainGpuSession {
   private lastMountainRasterFields: MountainIllustrationPreparedFields | undefined;
   private lastMountainRasterOptionsKey = '';
   private lastMountainRasterData: Uint8ClampedArray | undefined;
+  private lastMountainRasterMaterial: Uint8ClampedArray | undefined;
   private readonly fieldSets = new Map<string, MountainGpuFieldSet>();
 
   constructor(fieldSession: MountainFieldGpuSession, initializationMs: number) {
@@ -280,6 +286,7 @@ class MountainGpuSessionImpl implements MountainGpuSession {
     this.lastMountainRasterFields = undefined;
     this.lastMountainRasterOptionsKey = '';
     this.lastMountainRasterData = undefined;
+    this.lastMountainRasterMaterial = undefined;
     const fieldSet = MountainGpuFieldSet.create(
       input.dependencyKey,
       result.fields,
@@ -355,7 +362,7 @@ class MountainGpuSessionImpl implements MountainGpuSession {
   async rasterizeMountainLayer(
     input: MountainGpuMountainLayerInput,
     control: MountainFieldGpuPrepareControl = {},
-  ): Promise<MountainGpuComposeResult> {
+  ): Promise<MountainGpuMountainLayerResult> {
     if (this.lost) throw new Error('WebGPU device was lost');
     if (!this.fieldSession.rasterizeMountainLayer) {
       throw new Error('The active WebGPU session has no mountain raster pass');
@@ -378,6 +385,7 @@ class MountainGpuSessionImpl implements MountainGpuSession {
     ) {
       return {
         imageData: makeImageData(input.fields.width, input.fields.height, this.lastMountainRasterData),
+        materialData: this.lastMountainRasterMaterial,
         report: {
           backend: 'webgpu',
           mode: 'gpuFast',
@@ -413,8 +421,10 @@ class MountainGpuSessionImpl implements MountainGpuSession {
       this.lastMountainRasterFields = input.fields;
       this.lastMountainRasterOptionsKey = optionsKey;
       this.lastMountainRasterData = new Uint8ClampedArray(result.data);
+      this.lastMountainRasterMaterial = result.materialData;
       return {
         imageData: makeImageData(input.fields.width, input.fields.height, result.data),
+        materialData: result.materialData,
         report: {
           backend: 'webgpu',
           mode: 'gpuFast',
@@ -622,6 +632,7 @@ class MountainGpuSessionImpl implements MountainGpuSession {
     this.lastMountainRasterFields = undefined;
     this.lastMountainRasterOptionsKey = '';
     this.lastMountainRasterData = undefined;
+    this.lastMountainRasterMaterial = undefined;
     this.lost = true;
   }
 }

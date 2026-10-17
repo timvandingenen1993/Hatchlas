@@ -35,8 +35,10 @@ self.onmessage = (event: MessageEvent<TileMessage>) => {
     })) ?? [];
     const data = image.data;
     const foregroundData = image.foregroundPropsRGBA;
+    const coverData = image.standCover;
     const transfer: Transferable[] = [data.buffer];
     if (foregroundData) transfer.push(foregroundData.buffer);
+    if (coverData) transfer.push(coverData.buffer);
     self.postMessage({
       type: "tile",
       id: message.id,
@@ -44,6 +46,7 @@ self.onmessage = (event: MessageEvent<TileMessage>) => {
       height: image.height,
       data: data.buffer,
       foregroundData: foregroundData?.buffer,
+      coverData: coverData?.buffer,
       computeMs,
       externalStages,
     }, { transfer });

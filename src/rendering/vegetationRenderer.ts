@@ -54,6 +54,7 @@ import {
   type ForestInkType,
 } from "./forestInkStands";
 import {
+  addForestStandArea,
   renderForestInkCanvas,
   renderForestInkDebugCanvas,
   type ForestInkStandDebug,
@@ -529,11 +530,16 @@ export interface VegetationOverlay {
    */
   rasterPropStandShare?: Uint8Array;
   /**
-   * Coverage (0..255) of forest stand crowns. The map shows its ground
-   * colours without linework there, under the raster props, so the stand
-   * wash mixes the ground into the crowns.
+   * Coverage (0..255) of forest stands: their area and crowns. The map
+   * shows its ground colours without linework there, under the stand wash
+   * and ink, so no mountain or other lines run through a stand.
    */
   rasterPropStandCover?: Uint8Array;
+  /**
+   * Forest stand wash: its paint colour, alpha = how much of it to mix in.
+   * The compositor mixes it into the ground as paint, under the stand ink.
+   */
+  rasterPropStandWash?: Uint8ClampedArray;
 }
 
 /**
@@ -578,6 +584,7 @@ export interface VegetationOverlayStageCache {
   rasterPropShadowAlpha?: Uint8Array;
   rasterPropStandShare?: Uint8Array;
   rasterPropStandCover?: Uint8Array;
+  rasterPropStandWash?: Uint8ClampedArray;
 }
 
 const BIOME_SUITABILITY: Readonly<Record<number, number>> = {
@@ -7331,6 +7338,7 @@ interface RasterPropLayers {
   rasterPropShadowAlpha: Uint8Array;
   rasterPropStandShare?: Uint8Array;
   rasterPropStandCover?: Uint8Array;
+  rasterPropStandWash?: Uint8ClampedArray;
 }
 
 /**
@@ -7396,6 +7404,10 @@ function renderRasterPropLayers(
   let rasterPropStandCover =
     stageCache?.rasterPropKey === rasterPropKey
       ? stageCache.rasterPropStandCover
+      : undefined;
+  let rasterPropStandWash =
+    stageCache?.rasterPropKey === rasterPropKey
+      ? stageCache.rasterPropStandWash
       : undefined;
   const rasterPropsCacheHit = Boolean(
     rasterPropRGBA && rasterPropShadowAlpha && rasterPropCharcoalAlpha,
@@ -7642,8 +7654,12 @@ function renderRasterPropLayers(
     if (standsCanvas) {
       const standStop = profiler?.begin("vegetation forest stands");
       const settings = options.forestSettings;
-      // Crown bodies, for the compositor to show line-free ground under.
+      // Stand areas and crowns, for the compositor to show line-free ground under.
       const coverCanvas = settings.showStandDebug
+        ? null
+        : new OffscreenCanvas(dem.width, dem.height).getContext("2d", { willReadFrequently: true });
+      // The wash on its own, for the compositor to mix into the ground.
+      const washCanvas = settings.showStandDebug
         ? null
         : new OffscreenCanvas(dem.width, dem.height).getContext("2d", { willReadFrequently: true });
       // Every stand paints onto one canvas. A later stand goes underneath
@@ -7675,7 +7691,7 @@ function renderRasterPropLayers(
           charcoal: settings.inkCharcoal,
           interruptions: settings.inkInterruptions,
           thickness: STAND_LINE_WEIGHTS,
-        }, standsCanvas, coverCanvas ?? undefined);
+        }, standsCanvas, { cover: coverCanvas ?? undefined, wash: washCanvas ?? undefined });
       }
       standStop?.();
       const readbackStop = profiler?.begin("vegetation forest stand readback");
@@ -7686,6 +7702,15 @@ function renderRasterPropLayers(
         for (let pixel = 0; pixel < rasterPropStandCover.length; pixel++) {
           rasterPropStandCover[pixel] = coverPixels[pixel * 4 + 3];
         }
+        // The whole stand area, not just the crowns, keeps lines out.
+        for (const stand of allStands) {
+          addForestStandArea(rasterPropStandCover, dem.width, dem.height, stand.geometry);
+        }
+      }
+      if (washCanvas) {
+        rasterPropStandWash = new Uint8ClampedArray(
+          washCanvas.getImageData(0, 0, dem.width, dem.height).data.buffer,
+        );
       }
       readbackStop?.();
       rasterPropStandShare ??= new Uint8Array(dem.width * dem.height);
@@ -7728,10 +7753,14 @@ function renderRasterPropLayers(
       stageCache.rasterPropShadowAlpha = rasterPropShadowAlpha;
       stageCache.rasterPropStandShare = rasterPropStandShare;
       stageCache.rasterPropStandCover = rasterPropStandCover;
+      stageCache.rasterPropStandWash = rasterPropStandWash;
     }
   }
   rasterPropsStop?.();
-  return { rasterPropRGBA, rasterPropCharcoalAlpha, rasterPropShadowAlpha, rasterPropStandShare, rasterPropStandCover };
+  return {
+    rasterPropRGBA, rasterPropCharcoalAlpha, rasterPropShadowAlpha,
+    rasterPropStandShare, rasterPropStandCover, rasterPropStandWash,
+  };
 }
 
 function emptyRasterPropLayers(): RasterPropLayers {
@@ -7754,6 +7783,7 @@ export function mergeVegetationOverlay(
     rasterPropShadowAlpha: props.rasterPropShadowAlpha,
     rasterPropStandShare: props.rasterPropStandShare,
     rasterPropStandCover: props.rasterPropStandCover,
+    rasterPropStandWash: props.rasterPropStandWash,
   };
 }
 
@@ -8264,5 +8294,6 @@ export function renderVegetationOverlay(
     rasterPropShadowAlpha: propLayers.rasterPropShadowAlpha,
     rasterPropStandShare: propLayers.rasterPropStandShare,
     rasterPropStandCover: propLayers.rasterPropStandCover,
+    rasterPropStandWash: propLayers.rasterPropStandWash,
   };
 }

@@ -55,9 +55,11 @@ import {
   type FullTerrainCameraTextureSource,
   type FullTerrainCameraType,
 } from './fullTerrainCameraRenderer';
+import { sampleScalarField } from './cartographicStrokeRenderer';
 import type { MountainProfiler } from './mountainProfiler';
 import type { MountainGpuRenderMode } from './mountainGpuRenderer';
 import { forestRenderSettingsSignature } from './forestCanvasRenderer';
+import { mixPaintChannel } from './forestInkRenderer';
 import {
   getMountainIllustrationFieldDependencySignature,
   isMountainIllustrationPreparedFieldsCompatible,
@@ -308,6 +310,11 @@ export interface MountainRenderOptions {
   mountainIllustrationRGBA?: Uint8ClampedArray;
   /** Ink coverage (0..255) of `mountainIllustrationRGBA`; washes stay off it. */
   mountainIllustrationInkAlpha?: Uint8Array;
+  /**
+   * The rock and snow of `mountainIllustrationRGBA` without its linework,
+   * shown under forest stand crowns.
+   */
+  mountainIllustrationMaterialRGBA?: Uint8ClampedArray;
   /** Local pixels an export tile keeps; offshore waves paint only near it. */
   waterPaintWindow?: WaterPaintWindow;
   /** Internal export crop: intermediate fields retain halos, final pixels do not. */
@@ -415,6 +422,8 @@ export function waterGeometryStageKey(options: MountainRenderOptions): string {
  * layer retained for the full-terrain camera pass. */
 export type MountainDetailImageData = ImageData & {
   foregroundPropsRGBA?: Uint8ClampedArray;
+  /** 0..255 forest stand cover, where the camera's ridge ink gives way. */
+  standCover?: Uint8Array;
 };
 
 /**
@@ -710,6 +719,8 @@ function createForegroundPropRGBA(
   height: number,
   inkColor: RGB,
   terrainShade?: Float32Array,
+  /** Painted water (0..255) per pixel: the stand's trees stay off it. */
+  standWaterCut?: Uint8Array,
 ): Uint8ClampedArray | undefined {
   const rasterPixels = overlay?.rasterPropRGBA;
   const charcoalAlpha = overlay?.rasterPropCharcoalAlpha;
@@ -717,8 +728,15 @@ function createForegroundPropRGBA(
   const total = width * height;
   const foreground = new Uint8ClampedArray(total * 4);
   if (rasterPixels) foreground.set(rasterPixels);
+  const standShare = overlay?.rasterPropStandShare;
+  if (rasterPixels && standShare && standWaterCut?.length === total) {
+    for (let index = 0; index < total; index++) {
+      const water = standWaterCut[index];
+      if (water === 0 || standShare[index] === 0) continue;
+      foreground[index * 4 + 3] *= 1 - (standShare[index] / 255) * (water / 255);
+    }
+  }
   if (rasterPixels && terrainShade) {
-    const standShare = overlay?.rasterPropStandShare;
     for (let index = 0; index < total; index++) {
       // Forest stands are lit per tree already; only the rest is shaded.
       const shade = 1 - (1 - terrainShade[index]) * (1 - (standShare?.[index] ?? 0) / 255);
@@ -2138,6 +2156,25 @@ export function renderMountainDetailDEMWithCache(
       : mountainIllustration && shouldRenderFullTerrainIllustration
         ? mountainCameraIllustrationInkAlpha(mountainIllustration, mountainCameraStyle)
         : mountainIllustration && mountainIllustrationInkAlpha(mountainIllustration);
+  // The illustration's rock and snow without linework, for the ground under
+  // forest stand crowns. Without it, the ink share is taken off its alpha.
+  const mountainMaterialRGBA = !mountainIllustrationRGBA
+    ? undefined
+    : externalMountainIllustration
+      ? options.mountainIllustrationMaterialRGBA?.length === totalCells * 4
+        ? options.mountainIllustrationMaterialRGBA
+        : undefined
+      : mountainIllustration?.materialRgba?.length === totalCells * 4
+        ? mountainIllustration.materialRgba
+        : undefined;
+  const standWash = vegetationOverlay?.rasterPropStandWash?.length === totalCells * 4
+    ? vegetationOverlay.rasterPropStandWash
+    : undefined;
+  // Painted water per pixel, for the camera's foreground stand trees.
+  const standWaterCut = options.fullTerrainCameraElevationDeg !== undefined
+    && vegetationOverlay?.rasterPropStandShare?.length === totalCells
+    ? new Uint8Array(totalCells)
+    : undefined;
   const vegetationTransitionWashRGB =
     layer === 'vegetation_patterns' && mountainIllustrationRGBA
       ? new Uint8ClampedArray(totalCells * 3)
@@ -2635,10 +2672,14 @@ export function renderMountainDetailDEMWithCache(
       ? waterOverlay.waterAlpha[i] > 0 || wetlandPriorityAlpha > 0
       : isOriginalWater;
 
+    // Painted water at this pixel: forest stands stay off it.
+    let paintedWater = 0;
     if (hasWaterWash && (!isPureHeightmapLayer || options.showHeightmapWater) && layer !== 'slope' && layer !== 'aspect' && layer !== 'wave_patterns') {
       const waterAlpha = waterOverlay
         ? Math.max(waterOverlay.waterAlpha[i], wetlandPriorityAlpha) / 255
         : 1.0;
+      paintedWater = waterAlpha;
+      if (standWaterCut) standWaterCut[i] = Math.round(waterAlpha * 255);
       const toneValue = waterOverlay?.waterTone?.[i] ?? 128;
       const toneNorm = toneValue / 255;
       const [baseWaterR, baseWaterG, baseWaterB] = getWaterWashRGB(
@@ -2784,8 +2825,10 @@ export function renderMountainDetailDEMWithCache(
     }
 
     // The ground's colours and washes before any linework, shown under
-    // forest stand crowns (see rasterPropStandCover).
-    const standCover = (vegetationOverlay?.rasterPropStandCover?.[i] ?? 0) / 255;
+    // forest stands (see rasterPropStandCover).
+    // Stand areas are cut back from the water cells, but rivers are painted
+    // wider than those on a regional map: keep stands off painted water too.
+    const standCover = (vegetationOverlay?.rasterPropStandCover?.[i] ?? 0) / 255 * (1 - paintedWater);
     let groundR = r;
     let groundG = g;
     let groundB = b;
@@ -2969,7 +3012,14 @@ export function renderMountainDetailDEMWithCache(
     // the material share is re-tinted: mountain ink stays on top of washes.
     const mountainMaterialAlpha = Math.max(0,
       mountainIllustrationAlpha - (mountainInkAlpha?.[i] ?? 0) / 255);
-    if (standCover > 0 && mountainMaterialAlpha > 0) {
+    if (standCover > 0 && mountainMaterialRGBA) {
+      const materialAlpha = mountainMaterialRGBA[idx4 + 3] / 255;
+      if (materialAlpha > 0) {
+        groundR = blendContourColor(groundR, mountainMaterialRGBA[idx4], materialAlpha);
+        groundG = blendContourColor(groundG, mountainMaterialRGBA[idx4 + 1], materialAlpha);
+        groundB = blendContourColor(groundB, mountainMaterialRGBA[idx4 + 2], materialAlpha);
+      }
+    } else if (standCover > 0 && mountainMaterialAlpha > 0) {
       groundR = blendContourColor(groundR, mountainIllustrationRGBA![idx4], mountainMaterialAlpha);
       groundG = blendContourColor(groundG, mountainIllustrationRGBA![idx4 + 1], mountainMaterialAlpha);
       groundB = blendContourColor(groundB, mountainIllustrationRGBA![idx4 + 2], mountainMaterialAlpha);
@@ -2993,13 +3043,19 @@ export function renderMountainDetailDEMWithCache(
       }
     }
 
-    // Forest stand crowns hide the linework beneath them: their wash (in the
-    // raster props below) lies on the ground colours alone, so the stand
-    // wash strength mixes the ground into the crowns.
+    // Forest stands hide the linework beneath them, across their whole area.
     if (standCover > 0) {
       r = blendContourColor(r, groundR, standCover);
       g = blendContourColor(g, groundG, standCover);
       b = blendContourColor(b, groundB, standCover);
+    }
+    // The stand wash mixes its tree colour into the washed ground beneath
+    // as paint mixes, from the ground at 0 to the tree colour at 1.
+    const standWashAmount = (standWash?.[idx4 + 3] ?? 0) / 255 * (1 - paintedWater);
+    if (standWashAmount > 0) {
+      r = mixPaintChannel(r, standWash![idx4], standWashAmount);
+      g = mixPaintChannel(g, standWash![idx4 + 1], standWashAmount);
+      b = mixPaintChannel(b, standWash![idx4 + 2], standWashAmount);
     }
 
     // This preview-only diagnostic colors the placement suitability score
@@ -3045,12 +3101,14 @@ export function renderMountainDetailDEMWithCache(
     }
 
     const rasterPropPixelIndex = i * 4;
+    const standShare = (vegetationOverlay?.rasterPropStandShare?.[i] ?? 0) / 255;
+    // The stand's trees stay off painted water; other props keep their place.
     const rasterPropAlpha =
-      (vegetationOverlay?.rasterPropRGBA?.[rasterPropPixelIndex + 3] ?? 0) / 255;
+      (vegetationOverlay?.rasterPropRGBA?.[rasterPropPixelIndex + 3] ?? 0) / 255
+      * (1 - standShare * paintedWater);
     if (rasterPropAlpha > 0) {
       const rasterPropPixels = vegetationOverlay!.rasterPropRGBA!;
       // Forest stands are lit per tree already; only the rest is shaded.
-      const standShare = (vegetationOverlay?.rasterPropStandShare?.[i] ?? 0) / 255;
       const propShade = 1 - (1 - (propTerrainShade?.[i] ?? 1)) * (1 - standShare);
       r = blendContourColor(
         r,
@@ -3093,11 +3151,17 @@ export function renderMountainDetailDEMWithCache(
     ? new ImageData(pixels, width, height)
     : { width, height, data: pixels } as unknown as ImageData;
   const foregroundPropsRGBA = options.fullTerrainCameraElevationDeg !== undefined
-    ? createForegroundPropRGBA(vegetationOverlay, width, height, propOutlineColor, propTerrainShade)
+    ? createForegroundPropRGBA(vegetationOverlay, width, height, propOutlineColor, propTerrainShade, standWaterCut)
     : undefined;
   if (foregroundPropsRGBA) {
     (image as MountainDetailImageData).foregroundPropsRGBA = foregroundPropsRGBA;
   }
+  const overlayStandCover = vegetationOverlay?.rasterPropStandCover;
+  const standCover = options.fullTerrainCameraElevationDeg !== undefined
+    && overlayStandCover?.length === totalCells
+    ? overlayStandCover
+    : undefined;
+  if (standCover) (image as MountainDetailImageData).standCover = standCover;
   if (options.fullTerrainCameraElevationDeg === undefined || options.deferFullTerrainCamera) {
     detailStop?.();
     return image as MountainDetailImageData;
@@ -3137,6 +3201,9 @@ export function renderMountainDetailDEMWithCache(
     // Pattern path widths already contain the user's ridge thickness.
     ridgeThicknessScale: 0.75,
     charcoalRidges: true,
+    ridgeCover: standCover
+      ? (x, y) => sampleScalarField(standCover, width, height, x, y) / 255
+      : undefined,
     cameraType: options.fullTerrainCameraType ?? 'orthographic',
     elevationDeg: options.fullTerrainCameraElevationDeg,
     fieldOfViewDeg: 35,

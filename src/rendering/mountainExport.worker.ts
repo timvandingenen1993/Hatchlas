@@ -196,6 +196,13 @@ function recordParallelLayerProfile(
   }
 }
 
+/** Bytes a camera tile image holds: RGBA, foreground props and stand cover. */
+function cameraTileImageBytes(image: MountainDetailImageData): number {
+  return image.data.byteLength
+    + (image.foregroundPropsRGBA?.byteLength ?? 0)
+    + (image.standCover?.byteLength ?? 0);
+}
+
 interface CameraTileWorkerResult {
   image: MountainDetailImageData;
   foregroundPropsRGBA?: Uint8ClampedArray;
@@ -296,6 +303,7 @@ async function createCameraTileWorker(
       height?: number;
       data?: ArrayBuffer;
       foregroundData?: ArrayBuffer;
+      coverData?: ArrayBuffer;
       computeMs?: number;
       externalStages?: CameraTileWorkerResult["externalStages"];
       message?: string;
@@ -331,12 +339,13 @@ async function createCameraTileWorker(
       if (response.foregroundData) {
         image.foregroundPropsRGBA = new Uint8ClampedArray(response.foregroundData);
       }
+      if (response.coverData) image.standCover = new Uint8Array(response.coverData);
       job.resolve({
         image,
         foregroundPropsRGBA: image.foregroundPropsRGBA,
         computeMs: response.computeMs ?? 0,
         roundTripMs: performance.now() - job.startedAt,
-        outputBytes: image.data.byteLength + (image.foregroundPropsRGBA?.byteLength ?? 0),
+        outputBytes: cameraTileImageBytes(image),
         externalStages: response.externalStages ?? [],
       });
     };
@@ -353,8 +362,9 @@ async function createCameraTileWorker(
 }
 
 const CAMERA_TILE_CACHE_BUDGET_BYTES = 256 * 1024 * 1024;
-// A cached camera tile holds RGBA plus the foreground-prop RGBA layer.
-const CAMERA_TILE_CACHE_BYTES_PER_PIXEL = 8;
+// A cached camera tile holds RGBA, the foreground-prop RGBA layer and the
+// one-byte stand cover.
+const CAMERA_TILE_CACHE_BYTES_PER_PIXEL = 9;
 // Each helper holds one prepared tile plus the renderer scratch, so its memory
 // depends on the tile size only, never on the size of the export. Tiles are
 // admitted one by one against a budget that scales with the machine's RAM
@@ -1225,6 +1235,7 @@ async function runExport(request: MountainExportRequest): Promise<void> {
       output: Uint8ClampedArray,
       offset: number,
     ): void;
+    sampleStandCover(x: number, y: number): number;
   } {
     const cache = new Map<string, MountainDetailImageData>();
     const renderedSourceTiles = new Set<string>();
@@ -1265,7 +1276,7 @@ async function runExport(request: MountainExportRequest): Promise<void> {
       const image = cache.get(key);
       if (!image) return;
       cache.delete(key);
-      cachedBytes -= image.data.byteLength + (image.foregroundPropsRGBA?.byteLength ?? 0);
+      cachedBytes -= cameraTileImageBytes(image);
       if (key === `${mostRecentTileX},${mostRecentTileY}`) {
         mostRecentTileX = -1;
         mostRecentTileY = -1;
@@ -1276,7 +1287,7 @@ async function runExport(request: MountainExportRequest): Promise<void> {
       const key = `${tile.x},${tile.y}`;
       if (cache.has(key)) return;
       cache.set(key, image);
-      cachedBytes += image.data.byteLength + (image.foregroundPropsRGBA?.byteLength ?? 0);
+      cachedBytes += cameraTileImageBytes(image);
       actualRenderCount++;
       if (!renderedSourceTiles.has(key)) {
         renderedSourceTiles.add(key);
@@ -1296,7 +1307,7 @@ async function runExport(request: MountainExportRequest): Promise<void> {
         }
         if (oldestKey === undefined) {
           cache.delete(key);
-          cachedBytes -= image.data.byteLength + (image.foregroundPropsRGBA?.byteLength ?? 0);
+          cachedBytes -= cameraTileImageBytes(image);
           throw new Error("Pinned camera texture tiles exceeded the 256 MiB cache budget");
         }
         dropTile(oldestKey);
@@ -1628,6 +1639,15 @@ async function runExport(request: MountainExportRequest): Promise<void> {
       sampleRGBA(x, y, output, offset): void {
         this.sampleField(x, y, output, offset, false);
       },
+      /** 0..1 stand cover, nearest pixel; tiles without stands have none. */
+      sampleStandCover(x: number, y: number): number {
+        const pixelX = Math.max(0, Math.min(request.outputWidth - 1, Math.round(x)));
+        const pixelY = Math.max(0, Math.min(request.outputHeight - 1, Math.round(y)));
+        const tileX = Math.floor(pixelX / sourceTileSize) * sourceTileSize;
+        const tileY = Math.floor(pixelY / sourceTileSize) * sourceTileSize;
+        const image = tileAt(tileX, tileY);
+        return (image.standCover?.[(pixelY - tileY) * image.width + (pixelX - tileX)] ?? 0) / 255;
+      },
       sampleForegroundRGBA(x, y, output, offset): void {
         this.sampleField(x, y, output, offset, true);
       },
@@ -1845,6 +1865,7 @@ async function runExport(request: MountainExportRequest): Promise<void> {
       ...cameraSettingsBase,
       projection: cameraProjection,
       foregroundSource: cameraForegroundSource,
+      ridgeCover: cameraSource.sampleStandCover.bind(cameraSource),
     };
     // Keep projection and depth memory bounded to one band. The camera band
     // retains full-output coordinates for framing, while its color/depth

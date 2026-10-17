@@ -1780,6 +1780,10 @@ export function renderPreparedMountainExportTile(
     const foregroundCore = foreground && foreground.length === renderedWidth * renderedHeight * 4
       ? new Uint8ClampedArray(tile.width * tile.height * 4)
       : undefined;
+    const cover = rendered.standCover;
+    const coverCore = cover && cover.length === renderedWidth * renderedHeight
+      ? new Uint8Array(tile.width * tile.height)
+      : undefined;
     for (let y = 0; y < tile.height; y++) {
       const sourceOffset = ((y + sourceY) * renderedWidth + sourceX) * 4;
       core.set(rendered.data.subarray(sourceOffset, sourceOffset + tile.width * 4), y * tile.width * 4);
@@ -1789,6 +1793,10 @@ export function renderPreparedMountainExportTile(
           y * tile.width * 4,
         );
       }
+      if (coverCore && cover) {
+        const coverOffset = (y + sourceY) * renderedWidth + sourceX;
+        coverCore.set(cover.subarray(coverOffset, coverOffset + tile.width), y * tile.width);
+      }
     }
     assemblyStop?.();
     tileStop?.();
@@ -1796,6 +1804,7 @@ export function renderPreparedMountainExportTile(
       ? new ImageData(core, tile.width, tile.height)
       : { width: tile.width, height: tile.height, data: core } as unknown as ImageData) as MountainDetailImageData;
     if (foregroundCore) result.foregroundPropsRGBA = foregroundCore;
+    if (coverCore) result.standCover = coverCore;
     return result;
   };
   if (illustrated) {
@@ -1945,6 +1954,15 @@ export function renderPreparedMountainExportTile(
           detailTileX, detailTileY, detailWidth, detailHeight,
         )
       : undefined;
+    // The rock and snow without linework, for the ground under forest stands.
+    const mountainIllustrationMaterialRGBA = mountainStage && !waterOnly
+      ? placeMountainIllustrationPixels(
+          mountainStage.materialRgba,
+          4,
+          mountainX, mountainY, mountainWidth, mountainHeight,
+          detailTileX, detailTileY, detailWidth, detailHeight,
+        )
+      : undefined;
     const detailOceanMaskCoverage = water
       ? water.oceanMaskCoverage
       : cropNumericTileField(
@@ -2021,6 +2039,7 @@ export function renderPreparedMountainExportTile(
       maxErosionDepthMOverride: maxErosionDepthM,
       mountainIllustrationRGBA,
       mountainIllustrationInkAlpha,
+      mountainIllustrationMaterialRGBA,
     };
     return { frame, dem: detailDem, options: detailOptions };
     };

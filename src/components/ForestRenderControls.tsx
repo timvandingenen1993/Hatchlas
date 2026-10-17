@@ -72,7 +72,7 @@ const standControls: Array<{ key: StandControlKey; label: string; min: number; m
   { key: "inkWeight", label: "Line thickness", min: 0, max: 2, step: 0.05,
     tip: "Pen width of every stand line. The kinds of tree keep their relative weights: the front row boldest, then the second row, back edge, fill and lone trees, and the grass dots finest." },
   { key: "inkTint", label: "Stand wash", min: 0, max: 1, step: 0.05,
-    tip: "Mix of the watercolour wash under the stands and inside each tree, from the ground's own colours (biomes and washes, without contours or other lines) at 0 to the biome's tree or shrub colour at 1." },
+    tip: "Mixes the biome's tree or shrub colour into the washed ground beneath the stands and inside each tree (biomes and washes, without contours or other lines), as paints mix: 0 is the ground's own colour, 1 the tree colour." },
   { key: "inkWashVariation", label: "Wash variation", min: 0, max: 2, step: 0.05,
     tip: "Splotchiness of the wash: 0 is flat colour, higher adds blooms and shifts in value and warmth." },
   { key: "inkWashSoftness", label: "Wash softness", min: 0, max: 1, step: 0.05,

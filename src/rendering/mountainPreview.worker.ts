@@ -1870,6 +1870,7 @@ const renderCoordinator = new LatestRequestCoordinator<
     }
   }
   let gpuMountainLayer: Uint8ClampedArray | undefined;
+  let gpuMountainMaterial: Uint8ClampedArray | undefined;
   if (mountainGpuLayerSession) {
     if (!stageInputs || !preparedFieldSet || !mountainGpuLayerSession.rasterizeMountainLayer) {
       recordGpuMountainRasterEvent(profiler, "fallback");
@@ -1908,6 +1909,7 @@ const renderCoordinator = new LatestRequestCoordinator<
         recordGpuMountainRasterReport(profiler, gpuResult.report);
         recordGpuMountainRasterEvent(profiler, "success");
         gpuMountainLayer = gpuResult.imageData.data;
+        gpuMountainMaterial = gpuResult.materialData;
         gpuMountainLayerComposed = true;
         profiler?.setMetadata({
           mountainGpuRasterLayer: "mountain-material",
@@ -1933,6 +1935,7 @@ const renderCoordinator = new LatestRequestCoordinator<
     ? {
       ...options,
       mountainIllustrationRGBA: gpuMountainLayer,
+      mountainIllustrationMaterialRGBA: gpuMountainMaterial,
       skipMountainIllustrationStage: true,
     }
     : options;

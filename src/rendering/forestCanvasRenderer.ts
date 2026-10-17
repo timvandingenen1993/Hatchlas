@@ -98,8 +98,9 @@ export interface ForestRenderSettings {
   /** Line thickness: one multiplier for every stand line (kinds of tree keep their relative weights). */
   inkWeight: number;
   /**
-   * Watercolour wash under the stands (strength, splotch variation, edge
-   * softness). Its strength mixes the line-free ground into the crowns.
+   * Watercolour wash under the stands (amount, splotch variation, edge
+   * softness). Its amount mixes the tree colour into the line-free ground
+   * under the crowns as paint: 0 is the ground, 1 the tree colour.
    */
   inkTint: number;
   inkWashVariation: number;

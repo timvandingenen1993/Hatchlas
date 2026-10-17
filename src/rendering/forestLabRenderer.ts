@@ -13,7 +13,7 @@ import {
 } from "./forestStandGeometry";
 import { renderForestStandCanvas } from "./forestStandRenderer";
 import { buildForestInkGeometry, DEFAULT_FOREST_INK_PENS, mapForestInkGeometry, type ForestInkGeometry, type ForestInkType } from "./forestInkStands";
-import { renderForestInkCanvas } from "./forestInkRenderer";
+import { mixWashPixels, renderForestInkCanvas } from "./forestInkRenderer";
 
 /**
  * /forest-lab: a synthetic alpine slope (ground, form lines, crest lines)
@@ -627,6 +627,8 @@ export function renderForestLab(canvas: HTMLCanvasElement, settings: ForestLabSe
       cache.inkKey = inkKey;
     }
     const inkView = mapForestInkGeometry(cache.ink, scale, scale, 0, 0, canvas.width, canvas.height);
+    const washLayer = new OffscreenCanvas(canvas.width, canvas.height)
+      .getContext("2d", { willReadFrequently: true }) ?? undefined;
     const inkLayer = renderForestInkCanvas(canvas.width, canvas.height, inkView, {
       inkColor: settings.inkColor,
       inkWeight: settings.inkWeight,
@@ -646,7 +648,13 @@ export function renderForestLab(canvas: HTMLCanvasElement, settings: ForestLabSe
         lone: settings.inkLineLone,
         grass: settings.inkLineGrass,
       },
-    });
+    }, undefined, { wash: washLayer });
+    // The wash mixes into the ground as paint does, then the ink goes on.
+    if (washLayer) {
+      const ground = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      mixWashPixels(ground.data, washLayer.getImageData(0, 0, canvas.width, canvas.height).data);
+      ctx.putImageData(ground, 0, 0);
+    }
     if (inkLayer) ctx.drawImage(inkLayer, 0, 0);
     finishLab(ctx, canvas, cache, settings);
     return;
