@@ -146,7 +146,7 @@ function buildMountainCameraIllustration(
   const cacheKey = `${hatchColor.join(',')}:${requestedHorizontalOpacity}:${requestedVerticalOpacity}:${legacyHatchOpacity}`;
   let styleCache = textures.get(illustration);
   if (!styleCache) {
-    styleCache = new Map<string, Uint8ClampedArray>();
+    styleCache = new Map<string, MountainCameraIllustrationOutput>();
     textures.set(illustration, styleCache);
   }
   const cached = styleCache.get(cacheKey);
