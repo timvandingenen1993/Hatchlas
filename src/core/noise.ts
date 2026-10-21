@@ -22,6 +22,25 @@ export class FastRandom {
   }
 }
 
+/**
+ * The shuffled 0..255 table a SimplexNoise of this seed hashes with. GPU
+ * shaders upload it to evaluate exactly the same noise.
+ */
+export function simplexPermutation(seed: number): Uint8Array {
+  const rng = new FastRandom(seed);
+  const p = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) {
+    p[i] = i;
+  }
+  for (let i = 255; i > 0; i--) {
+    const j = Math.floor(rng.next() * (i + 1));
+    const tmp = p[i];
+    p[i] = p[j];
+    p[j] = tmp;
+  }
+  return p;
+}
+
 // 2D Simplex Noise generator with seed support.
 // Follows Stefan Gustavson's public-domain reference implementation
 // ("Simplex noise demystified", 2005).
@@ -39,18 +58,7 @@ export class SimplexNoise {
   ]);
 
   constructor(seed: number = 1337) {
-    const rng = new FastRandom(seed);
-    const p = new Uint8Array(256);
-    for (let i = 0; i < 256; i++) {
-      p[i] = i;
-    }
-    for (let i = 255; i > 0; i--) {
-      const j = Math.floor(rng.next() * (i + 1));
-      const tmp = p[i];
-      p[i] = p[j];
-      p[j] = tmp;
-    }
-
+    const p = simplexPermutation(seed);
     this.perm = new Uint8Array(512);
     this.permMod12 = new Uint8Array(512);
     for (let i = 0; i < 512; i++) {

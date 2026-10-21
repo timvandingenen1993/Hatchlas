@@ -62,6 +62,15 @@ import {
 } from "./forestInkRenderer";
 import { parseHexColor } from "./propColorVariation";
 import { traceGrassBiomeBorders } from "./biomeBorderInk";
+import {
+  renderForestCandidatesGl,
+  type ForestCandidateTerrain,
+  renderVegetationBackgroundGl,
+  renderVegetationPotentialGl,
+  renderVegetationMotifShadowGl,
+  renderVegetationWashShadowGl,
+  type VegetationFieldDomain,
+} from "./vegetationFieldGl";
 import { isMountainTintBiome, mountainGrassAmount } from "./mountainTerrainTint";
 import { DEFAULT_SILT_LAYERS, riverSiltCoverage } from "./riverSilt";
 
@@ -434,6 +443,11 @@ export interface VegetationPatternOptions extends DesertDuneOptions {
   coordinateSourceHeight?: number;
   /** Unscaled pattern control used for world-space flow fields in exports. */
   coordinatePatternScale?: number;
+  /**
+   * Compute the wash background and the wash and motif shadows on the GPU
+   * (WebGL2) when available. Default true; `?mountainGpu=cpu` turns it off.
+   */
+  gpuFields?: boolean;
 }
 
 export interface ResolvedVegetationPatternOptions {
@@ -495,6 +509,7 @@ export interface ResolvedVegetationPatternOptions {
   coordinateSourceWidth: number;
   coordinateSourceHeight: number;
   coordinatePatternScale: number;
+  gpuFields: boolean;
 }
 
 export interface VegetationOverlay {
@@ -738,6 +753,7 @@ export function resolveVegetationPatternOptions(
         options?.coordinatePatternScale ?? options?.patternScale ?? 1,
       ),
     ),
+    gpuFields: options?.gpuFields ?? true,
   };
 }
 
@@ -754,20 +770,23 @@ function biomeAt(dem: VegetationPlacementTerrain, x: number, y: number): number 
  * one biome, so two biomes' plants never grow over each other. The warp
  * depends only on `seed`, so every biome's pass sees the same borders.
  */
+/** A biome lookup, with the warp it applies (for the GPU candidate pass). */
+type BiomeLookup = ((x: number, y: number) => number) & { blend: number; seed: number };
+
 function blendedBiomeLookup(
   dem: VegetationPlacementTerrain,
   blend: number,
   seed: number,
-): (x: number, y: number) => number {
-  if (!(blend > 0)) return (x, y) => biomeAt(dem, x, y);
+): BiomeLookup {
+  if (!(blend > 0)) return Object.assign((x: number, y: number) => biomeAt(dem, x, y), { blend: 0, seed });
   const warpX = new SimplexNoise(seed ^ 0x3b1e5a7d);
   const warpY = new SimplexNoise(seed ^ 0x6c0f92e1);
   // Three octaves: broad tongues with smaller fingers and detached islands.
-  return (x, y) => biomeAt(
+  return Object.assign((x: number, y: number) => biomeAt(
     dem,
     x + warpX.fbm(x / blend, y / blend, 3, 2, 0.5) * blend * 1.2,
     y + warpY.fbm(x / blend, y / blend, 3, 2, 0.5) * blend * 1.2,
-  );
+  ), { blend, seed });
 }
 
 /**
@@ -1306,12 +1325,12 @@ export interface VegetationFlowCache {
   materialBoundary: Uint8Array;
 }
 
-function createVegetationFlowCache(
-  dem: MountainDEMData,
-  originX = 0,
-  originY = 0,
-  materialBoundary = buildVegetationMaterialBoundary(dem),
-): VegetationFlowCache {
+/** The two-pixel world grid a flow cache samples, for a DEM at this origin. */
+function vegetationFlowCacheGrid(
+  dem: Pick<MountainDEMData, "width" | "height">,
+  originX: number,
+  originY: number,
+) {
   const stride = 2;
   const resolvedOriginX = Math.round(originX);
   const resolvedOriginY = Math.round(originY);
@@ -1319,19 +1338,29 @@ function createVegetationFlowCache(
   const gridOriginY = Math.floor(resolvedOriginY / stride);
   const gridEndX = Math.floor((resolvedOriginX + Math.max(0, dem.width - 1)) / stride);
   const gridEndY = Math.floor((resolvedOriginY + Math.max(0, dem.height - 1)) / stride);
-  const width = Math.max(1, gridEndX - gridOriginX + 1);
-  const height = Math.max(1, gridEndY - gridOriginY + 1);
-  const total = width * height;
   return {
     stride,
-    width,
-    height,
-    sourceWidth: dem.width,
-    sourceHeight: dem.height,
     originX: resolvedOriginX,
     originY: resolvedOriginY,
     gridOriginX,
     gridOriginY,
+    width: Math.max(1, gridEndX - gridOriginX + 1),
+    height: Math.max(1, gridEndY - gridOriginY + 1),
+  };
+}
+
+function createVegetationFlowCache(
+  dem: MountainDEMData,
+  originX = 0,
+  originY = 0,
+  materialBoundary = buildVegetationMaterialBoundary(dem),
+): VegetationFlowCache {
+  const grid = vegetationFlowCacheGrid(dem, originX, originY);
+  const total = grid.width * grid.height;
+  return {
+    ...grid,
+    sourceWidth: dem.width,
+    sourceHeight: dem.height,
     potential: new Float32Array(total),
     potentialReady: new Uint8Array(total),
     suitability: new Float32Array(total),
@@ -1457,6 +1486,30 @@ function createVegetationFlowSampling(
     sourceXByPixel,
     sourceYByPixel,
     materialBoundary,
+  };
+}
+
+/** The pixel-to-source map and grain constants the GPU field passes share. */
+function vegetationFieldDomain(
+  dem: Pick<MountainDEMData, "width" | "height">,
+  options: ResolvedVegetationPatternOptions,
+  sampling: VegetationFlowSampling,
+): VegetationFieldDomain {
+  return {
+    width: dem.width,
+    height: dem.height,
+    offsetX: options.coordinateOffsetX,
+    offsetY: options.coordinateOffsetY,
+    outputWidth: sampling.outputWidth,
+    outputHeight: sampling.outputHeight,
+    outputXDenominator: sampling.outputXDenominator,
+    outputYDenominator: sampling.outputYDenominator,
+    sourceXRange: sampling.sourceXRange,
+    sourceYRange: sampling.sourceYRange,
+    grainStride: sampling.grainStride,
+    // sampleCartographicGrain's salt and coarse scale.
+    grainSalt: (options.seed + 3379) | 0,
+    grainScale: Math.max(1.6, 2.6 / options.coordinatePatternScale),
   };
 }
 
@@ -1845,12 +1898,8 @@ function buildFlowBackgroundTone(
   wetlandDryness: Float32Array;
   wetlandImagePropHabitat: Float32Array;
 } {
-  const tone = new Float32Array(dem.width * dem.height);
-  const noise = new Float32Array(dem.width * dem.height);
-  const dryness = new Float32Array(dem.width * dem.height);
   const wetlandDryness = new Float32Array(dem.width * dem.height);
   const wetlandImagePropHabitat = new Float32Array(dem.width * dem.height);
-  const flowNoise = new SimplexNoise(options.seed + 907);
   const washNoise = new SimplexNoise(options.seed + 1403);
   const dryPatchNoise = new SimplexNoise(options.seed + 1801);
   const grainNoise = new SimplexNoise(options.seed + 3221);
@@ -1871,6 +1920,61 @@ function buildFlowBackgroundTone(
     14,
     Math.max(10, 18 / options.coordinatePatternScale),
   );
+  const dryDistanceStart = Math.min(
+    options.wetlandDryDistanceStart,
+    options.wetlandDryDistanceEnd - 1,
+  );
+  const dryDistanceEnd = Math.max(dryDistanceStart + 1, options.wetlandDryDistanceEnd);
+  if (options.gpuFields) {
+    const gpuStop = profiler?.begin("vegetation gpu wash background");
+    const sampling = createVegetationFlowSampling(dem, options);
+    const grid = vegetationFlowCacheGrid(dem, options.coordinateOffsetX, options.coordinateOffsetY);
+    const gpu = renderVegetationBackgroundGl({
+      domain: vegetationFieldDomain(dem, options, sampling),
+      seeds: {
+        flow: options.seed + 907,
+        wash: options.seed + 1403,
+        dryPatch: options.seed + 1801,
+        grain: options.seed + 3221,
+      },
+      clip,
+      biomeType: dem.biomeType,
+      waterDistance,
+      gridOriginX: grid.gridOriginX,
+      gridOriginY: grid.gridOriginY,
+      gridWidth: grid.width,
+      gridHeight: grid.height,
+      flowSalt: (options.seed + 1907) | 0,
+      swirlStrength: options.swirlStrength,
+      flowScale: sampling.flowScale,
+      swirlScale: sampling.swirlScale,
+      cellSize: sampling.cellSize,
+      washNoiseScale: sampling.washNoiseScale,
+      dryPatchScale: sampling.dryPatchScale,
+      blurRadius,
+      dryDistanceStart,
+      dryDistanceEnd,
+      dryNoiseStrength: options.wetlandDryNoiseStrength,
+    });
+    gpuStop?.();
+    if (gpu) {
+      for (let index = 0; index < dem.biomeType.length; index++) {
+        if (dem.biomeType[index] !== 7) continue;
+        const gradientPosition = smoothStep(dryDistanceStart, dryDistanceEnd, waterDistance[index]);
+        wetlandDryness[index] = gradientPosition;
+        wetlandImagePropHabitat[index] = 1 - smoothStep(
+          0.08,
+          0.26,
+          Math.abs(gradientPosition - options.wetlandImagePropDrynessBias),
+        );
+      }
+      return { ...gpu, wetlandDryness, wetlandImagePropHabitat };
+    }
+  }
+  const tone = new Float32Array(dem.width * dem.height);
+  const noise = new Float32Array(dem.width * dem.height);
+  const dryness = new Float32Array(dem.width * dem.height);
+  const flowNoise = new SimplexNoise(options.seed + 907);
   const materialBoundary = sharedFlowCache?.materialBoundary
     ?? buildVegetationMaterialBoundary(dem);
   const flowSampling = createVegetationFlowSampling(
@@ -1949,11 +2053,6 @@ function buildFlowBackgroundTone(
       potentialSupport[downY[y] * dem.width + x] = 1;
     }
   }
-  const dryDistanceStart = Math.min(
-    options.wetlandDryDistanceStart,
-    options.wetlandDryDistanceEnd - 1,
-  );
-  const dryDistanceEnd = Math.max(dryDistanceStart + 1, options.wetlandDryDistanceEnd);
   const potentialField = new Float32Array(dem.width * dem.height);
   const potentialStop = profiler?.begin("vegetation wash potential field");
   let potentialCellsEvaluated = 0;
@@ -3201,6 +3300,52 @@ const FOREST_MIN_GAP_SCALE_CANOPIES = 4;
 /** Grid cell, in canopies, holding at most one group of lone trees. */
 const FOREST_LONE_CELL_CANOPIES = 3;
 
+/** The gap grid's cells as flat lists, indexed like the grid's cell keys. */
+function gapCellLists(gapCells: ReadonlyMap<number, readonly number[]>): { gapStarts: Int32Array; gapIndices: Int32Array } {
+  let cells = 0;
+  let total = 0;
+  for (const [cell, gapIds] of gapCells) {
+    if (cell >= 0) cells = Math.max(cells, cell + 1);
+    total += gapIds.length;
+  }
+  const gapStarts = new Int32Array(cells + 1);
+  for (const [cell, gapIds] of gapCells) if (cell >= 0) gapStarts[cell + 1] = gapIds.length;
+  for (let cell = 0; cell < cells; cell++) gapStarts[cell + 1] += gapStarts[cell];
+  const gapIndices = new Int32Array(total);
+  for (const [cell, gapIds] of gapCells) if (cell >= 0) gapIndices.set(gapIds, gapStarts[cell]);
+  return { gapStarts, gapIndices };
+}
+
+/** The candidate pass's view of the terrain; the water mask is built on first use. */
+const forestCandidateTerrains = new WeakMap<VegetationPlacementTerrain, ForestCandidateTerrain>();
+
+function forestCandidateTerrain(terrain: VegetationPlacementTerrain): ForestCandidateTerrain {
+  let view = forestCandidateTerrains.get(terrain);
+  if (view) return view;
+  let water: Uint8Array | undefined;
+  view = {
+    width: terrain.width,
+    height: terrain.height,
+    biomeType: terrain.biomeType,
+    slopeDeg: terrain.slopeDeg,
+    precipitationMmYr: terrain.precipitationMmYr,
+    runoffDepthMmYr: terrain.runoffDepthMmYr,
+    elevation: terrain.elevation,
+    dxMeters: terrain.dxMeters,
+    dyMeters: terrain.dyMeters,
+    water: () => {
+      if (water) return water;
+      water = new Uint8Array(terrain.width * terrain.height);
+      for (let y = 0; y < terrain.height; y++) {
+        for (let x = 0; x < terrain.width; x++) water[y * terrain.width + x] = isWaterAt(terrain, x, y) ? 1 : 0;
+      }
+      return water;
+    },
+  };
+  forestCandidateTerrains.set(terrain, view);
+  return view;
+}
+
 /** @internal Deterministic forest stand candidates shared by all forest assets. */
 export function buildForestCandidates(
   dem: Pick<VegetationPlacementTerrain, "width" | "height">,
@@ -3209,7 +3354,7 @@ export function buildForestCandidates(
   reportProgress?: VegetationPreparationReporter,
   terrain?: VegetationPlacementTerrain,
   targetBiome?: number,
-  biomeLookup?: (x: number, y: number) => number,
+  biomeLookup?: ((x: number, y: number) => number) & Partial<Pick<BiomeLookup, "blend" | "seed">>,
 ): ForestCandidate[] {
   const candidates: ForestCandidate[] = [];
   const density = options.rasterPropDensity;
@@ -3296,10 +3441,48 @@ export function buildForestCandidates(
   const attempts = Math.ceil(dem.width * dem.height /
     Math.max(16, canopySize * canopySize * 0.11) * density);
   reportProgress?.("Generating forest candidates", 0, attempts);
+  // The GPU settles every attempt it can tell apart in float32; the ones
+  // close to a rounding edge or threshold (code 2) take the exact path below.
+  const gpu = options.gpuFields && (!biomeLookup || biomeLookup.blend !== undefined)
+    ? renderForestCandidatesGl({
+        attempts,
+        seed: options.seed,
+        width: dem.width,
+        height: dem.height,
+        gaps: Float32Array.from(gaps.flatMap((gap) => [gap.x, gap.y, gap.radius, gap.aspect, gap.cos, gap.sin, gap.phase])),
+        gapCellSize,
+        gapColumns,
+        ...gapCellLists(gapCells),
+        terrain: terrain ? forestCandidateTerrain(terrain) : undefined,
+        targetBiome,
+        biomeBlend: biomeLookup?.blend !== undefined
+          ? { blend: biomeLookup.blend, seed: biomeLookup.seed ?? 0 }
+          : undefined,
+      })
+    : null;
   for (let index = 0; index < attempts; index++) {
+    const code = gpu ? gpu.codes[index] : 2;
+    if (code === 0) continue;
     const key = Math.imul(index + 1, 3812015801) ^ options.seed;
     const x = hash01(key, 911) * dem.width;
     const y = hash01(key, 919) * dem.height;
+    if (code === 1) {
+      if (!terrain) {
+        candidates.push({ key, x, y });
+        continue;
+      }
+      // NaN: too close to its placement roll; use the exact weight.
+      const habitat = gpu!.habitat[index];
+      candidates.push({
+        key,
+        x,
+        y,
+        habitatWeight: Number.isNaN(habitat)
+          ? sampleAlpineForestTerrainSuitability(terrain, x, y).habitatWeight
+          : habitat,
+      });
+      continue;
+    }
     // Candidate coordinates and keys stay unchanged, but points that cannot
     // produce a placement skip shelter and clearing work entirely.
     if (outsideBiome(x, y)) {
@@ -4064,7 +4247,8 @@ function placeRasterProps(
     dem.height,
     Math.max(4, propCellSize * 0.5),
   );
-  const hasWetlandHabitatRasterProps = vegetationAssets.some((asset) =>
+  // Only biome 7 placements read it (placement keeps to the target biome).
+  const hasWetlandHabitatRasterProps = targetBiome === 7 && vegetationAssets.some((asset) =>
     asset.eligibleBiomeIds.includes(7) && asset.placementRole !== "wetland",
   );
   const wetlandWaterDistance = hasWetlandHabitatRasterProps
@@ -4368,6 +4552,47 @@ export function withMountainGrassGround(dem: MountainDEMData): MountainDEMData {
   return biomeType ? { ...dem, biomeType } : dem;
 }
 
+/**
+ * A flow cache for tracing: the potential grid from the GPU (or filled
+ * lazily on the CPU when the GPU is unavailable), attached to `sampling`
+ * with lazy population for anything still missing.
+ */
+function buildTracingFlowCache(
+  dem: MountainDEMData,
+  options: ResolvedVegetationPatternOptions,
+  sampling: VegetationFlowSampling,
+  materialBoundary: Uint8Array,
+  flowNoise: SimplexNoise,
+  densityNoise: SimplexNoise,
+  profiler?: MountainProfiler,
+): VegetationFlowCache {
+  const stop = profiler?.begin("vegetation flow field grid");
+  const cache = createVegetationFlowCache(dem, options.coordinateOffsetX, options.coordinateOffsetY, materialBoundary);
+  const potential = renderVegetationPotentialGl({
+    domain: vegetationFieldDomain(dem, options, sampling),
+    flowSeed: options.seed + 907,
+    gridOriginX: cache.gridOriginX,
+    gridOriginY: cache.gridOriginY,
+    gridWidth: cache.width,
+    gridHeight: cache.height,
+    flowSalt: (options.seed + 1907) | 0,
+    swirlStrength: options.swirlStrength,
+    flowScale: sampling.flowScale,
+    swirlScale: sampling.swirlScale,
+    cellSize: sampling.cellSize,
+  });
+  if (potential) {
+    cache.potential.set(potential);
+    cache.potentialReady.fill(1);
+  }
+  profiler?.recordMetric("vegetation flow field grid on GPU", potential ? 1 : 0, "gpu");
+  sampling.flowCache = cache;
+  sampling.potentialPopulate = (gridX, gridY) => flowPotentialAtDirect(dem, flowNoise, gridX, gridY, options, sampling);
+  sampling.suitabilityPopulate = (gridX, gridY) => sampleVegetationSuitabilityDirect(dem, gridX, gridY, densityNoise, options);
+  stop?.();
+  return cache;
+}
+
 function buildVegetationFlowGeometry(
   geometry: VegetationGeometry,
   sourceDem: MountainDEMData,
@@ -4385,13 +4610,17 @@ function buildVegetationFlowGeometry(
     options,
     materialBoundary,
   );
-  // Keep seed/trace topology on the analytic sampler. Categorical biome and
-  // water masks are part of the geometry contract; interpolating a coarse
-  // procedural field can move a streamline far enough to change prop
-  // clearance even when the raster appearance is close. The shared two-pixel
-  // cache is attached after topology is complete and reused by the broad wash
-  // and overlay consumers, where interpolation is safe and most samples are
-  // repeated.
+  // With GPU fields, seeds and traces read the shared two-pixel field cache:
+  // its potential grid comes from one GPU pass (the grid the wash uses), and
+  // the samplers still evaluate analytically near material boundaries, water
+  // and their stop thresholds. Traces then cost a fraction of the analytic
+  // sampler's, while strokes keep their style; single strokes can shift a
+  // little, since interpolation nudges where each one stops and which later
+  // ones fit. Without GPU fields (?mountainGpu=cpu) topology stays on the
+  // analytic sampler, and the cache is attached after it for the overlay.
+  const tracingCache = options.gpuFields
+    ? buildTracingFlowCache(dem, options, flowSampling, materialBoundary, flowNoise, densityNoise, profiler)
+    : undefined;
   reportProgress?.("Preparing vegetation distance fields");
   const waterDistanceStop = profiler?.begin("vegetation water distance");
   const waterDistance = buildVegetationWaterDistance(dem, profiler);
@@ -4622,6 +4851,13 @@ function buildVegetationFlowGeometry(
     options.coordinateOffsetY,
     materialBoundary,
   );
+  // The potential depends on coordinates and the flow noise only, so the
+  // overlay reuses the tracing grid. Its suitability is left to the overlay,
+  // which samples a different DEM (without the grass ground).
+  if (tracingCache) {
+    geometry.flowCache.potential.set(tracingCache.potential);
+    geometry.flowCache.potentialReady.set(tracingCache.potentialReady);
+  }
   if (profiler) {
     profiler.recordMetric("vegetation flow grid candidates", flowGridCandidates, "count");
     profiler.recordMetric("vegetation flow suitability passes", flowSuitabilityPasses, "count");
@@ -4653,6 +4889,7 @@ function buildVegetationPropGeometry(
   profiler: MountainProfiler | undefined,
   reportProgress: VegetationPreparationReporter | undefined,
   rasterPropPlacements?: readonly VegetationRasterPropPlacement[],
+  deferStands = false,
 ): void {
   const rasterPlacementStop = profiler?.begin(
     "vegetation raster prop placement",
@@ -4683,10 +4920,12 @@ function buildVegetationPropGeometry(
       geometry.rasterProps.push(placement);
     }
   }
-  const standStop = profiler?.begin("vegetation forest stand geometry");
-  reportProgress?.("Building forest stands");
-  buildPropStands(geometry, dem, options);
-  standStop?.();
+  if (!deferStands) {
+    const standStop = profiler?.begin("vegetation forest stand geometry");
+    reportProgress?.("Building forest stands");
+    buildPropStands(geometry, dem, options, profiler);
+    standStop?.();
+  }
   if (profiler) {
     profiler.recordMetric(
       "vegetation raster props",
@@ -4717,6 +4956,11 @@ export function buildVegetationGeometry(
   part: VegetationLayerPart = "all",
   /** Placements from `placeRasterPropsInBiomes`, joined in biome order. */
   rasterPropPlacements?: readonly VegetationRasterPropPlacement[],
+  /**
+   * Leave the stand placements in `rasterProps` for finishPropStands, so
+   * the caller can build the stands on several workers.
+   */
+  deferStands = false,
 ): VegetationGeometry {
   const reportProgress = createThrottledPreparationReporter(onProgress);
   const options = resolveVegetationPatternOptions(rawOptions);
@@ -4729,7 +4973,7 @@ export function buildVegetationGeometry(
   };
   if (part !== "props") buildVegetationFlowGeometry(geometry, dem, options, profiler, reportProgress);
   if (part !== "flow") {
-    buildVegetationPropGeometry(geometry, dem, options, profiler, reportProgress, rasterPropPlacements);
+    buildVegetationPropGeometry(geometry, dem, options, profiler, reportProgress, rasterPropPlacements, deferStands);
   }
   return geometry;
 }
@@ -5067,23 +5311,37 @@ export function propStandGround(terrain: Float32Array, waterDistance: Float32Arr
  * and the stand renderer draws both instead of the per-prop art. Placement
  * itself (biomes, clearings, suitability, water clearance) is unchanged.
  */
-function buildPropStands(
-  geometry: VegetationGeometry,
-  dem: MountainDEMData,
+/** Placements of one stand group and look, which form one stand. */
+interface PropStandBucket {
+  group: PropStandGroup;
+  style: ReturnType<PropStandGroup["style"]>;
+  forest: ForestInkType;
+  biomeIds: number[];
+  placements: VegetationRasterPropPlacement[];
+}
+
+/** Map-wide fields every stand is built from. */
+interface PropStandFields {
+  light?: Float32Array;
+  waterDistance: Float32Array;
+  terrain: Float32Array;
+  silt?: { depth: Float32Array; sparse: Float32Array; noise: SimplexNoise };
+}
+
+/**
+ * Splits placements into stands (one per group and look, in first-seen
+ * order) and the props that stay single.
+ */
+function collectPropStandBuckets(
+  rasterProps: readonly VegetationRasterPropPlacement[],
   options: ResolvedVegetationPatternOptions,
-): void {
+): { kept: VegetationRasterPropPlacement[]; buckets: PropStandBucket[] } {
   const assets = new Map(options.rasterPropAssets.map((asset) => [asset.key, asset]));
   // One stand per group and look: biomes styled alike share a stand, so it
   // runs across their borders; differently styled biomes get their own.
-  const buckets = new Map<string, {
-    group: PropStandGroup;
-    style: ReturnType<PropStandGroup["style"]>;
-    forest: ForestInkType;
-    biomeIds: number[];
-    placements: VegetationRasterPropPlacement[];
-  }>();
+  const buckets = new Map<string, PropStandBucket>();
   const kept: VegetationRasterPropPlacement[] = [];
-  for (const placement of geometry.rasterProps ?? []) {
+  for (const placement of rasterProps) {
     const asset = assets.get(placement.assetKey);
     const group = asset ? PROP_STAND_GROUPS.find((candidate) => candidate.isMember(asset)) : undefined;
     if (!group) {
@@ -5102,10 +5360,27 @@ function buildPropStands(
     if (!bucket.biomeIds.includes(placement.biomeId)) bucket.biomeIds.push(placement.biomeId);
     bucket.placements.push(placement);
   }
-  if (buckets.size === 0) return;
-  geometry.rasterProps = kept;
+  return { kept, buckets: [...buckets.values()] };
+}
 
-  const { width, height } = geometry;
+/** Each stand's index within its group: the first keeps the group's seed, later ones vary it. */
+function propStandBucketIndices(buckets: readonly PropStandBucket[]): number[] {
+  const perGroup = new Map<string, number>();
+  return buckets.map((bucket) => {
+    const index = perGroup.get(bucket.group.id) ?? 0;
+    perGroup.set(bucket.group.id, index + 1);
+    return index;
+  });
+}
+
+function buildPropStandFields(
+  dem: MountainDEMData,
+  options: ResolvedVegetationPatternOptions,
+  width: number,
+  height: number,
+  profiler?: MountainProfiler,
+): PropStandFields {
+  const fieldsStop = profiler?.begin("vegetation stand terrain fields");
   // Terrain light relative to flat ground (the same reference the map's
   // prop shading uses): 0.5 on flat ground, lower in shadow, higher when lit.
   let light: Float32Array | undefined;
@@ -5143,15 +5418,132 @@ function buildPropStands(
     }
     silt = { depth: buildDistanceField(inside, width, height), sparse, noise: new SimplexNoise(options.seed ^ 0x5117ed9e) };
   }
+  fieldsStop?.();
+  return { light, waterDistance, terrain, silt };
+}
 
+/** One stand, without the group's biome shares (buildPropStands adds them). */
+function buildPropStand(
+  { group, style, forest: forestType, biomeIds, placements }: PropStandBucket,
+  bucketIndex: number,
+  { light, waterDistance, terrain, silt }: PropStandFields,
+  dem: MountainDEMData,
+  options: ResolvedVegetationPatternOptions,
+  width: number,
+  height: number,
+  profiler?: MountainProfiler,
+): VegetationPropStand {
   const settings = options.forestSettings;
-  const stands: VegetationPropStand[] = [];
-  const bucketsPerGroup = new Map<string, number>();
+  const cellSizes = placements.map((placement) => placement.cellSize).sort((a, b) => a - b);
+  // The floor applies to the shared tree size, never to one group alone,
+  // so small preview scales keep every group in proportion.
+  const standTreeSize = Math.max(4, cellSizes[Math.floor(cellSizes.length / 2)] * STAND_TREE_SIZE_CELLS);
+  // Prop scale alone sizes the drawn trees: marks keep the lab's ratio to
+  // the stand tree (5.5 to 7.5).
+  const markSize = standTreeSize * group.size / INK_WASH_TREE_SIZE_PER_MARK;
+  const areaStop = profiler?.begin("vegetation stand area");
+  const clearing = silt ? propStandSiltClearing(silt.depth, width, height, markSize, silt.noise) : undefined;
+  // Plants out on the silt never join a stand.
+  const standPlacements = clearing
+    ? placements.map((placement) => sampleScalarField(clearing, width, height, placement.x, placement.y) >= 0.5
+      ? { ...placement, lone: true }
+      : placement)
+    : placements;
+  const { forest, loneTrees } = formPropStandArea(standPlacements, width, height, standTreeSize, standJoinTrees(settings.standJoin));
+  areaStop?.();
+  const groundStop = profiler?.begin("vegetation stand ground");
+  const ground = propStandGround(terrain, waterDistance, markSize);
+  groundStop?.();
+  const inkStop = profiler?.begin("vegetation stand ink geometry");
+
+  const inkGeometry = buildForestInkGeometry({
+    width,
+    height,
+    forest,
+    seed: ((options.seed ^ Math.imul(settings.seed, 2654435761)) ^ group.seedSalt ^
+      Math.imul(bucketIndex, 0x9e3779b1)) >>> 0,
+    settings: {
+      type: forestType,
+      markSize,
+      density: settings.inkFillDensity,
+      edgeRows: settings.inkEdgeRows,
+      edgeDensity: settings.inkEdgeDensity,
+      edgeDepth: settings.inkEdgeDepth,
+      meadowTrees: settings.inkMeadowTrees,
+      grass: settings.inkGrass,
+    },
+    slope: dem.slopeDeg,
+    ground,
+    clearing,
+    sparse: silt?.sparse,
+    light,
+    lightStrength: settings.inkLight,
+    loneTrees,
+    // Trees among shrubs: the biome's share of shrub-stand plants drawn as trees.
+    accentShare: style.accent?.share,
+  });
+  inkStop?.();
+  let debug: ForestInkStandDebug | undefined;
+  if (settings.showStandDebug) {
+    const plants = new Float32Array(placements.length * 3);
+    const lone = new Set(loneTrees.map((tree) => `${tree.x},${tree.y}`));
+    placements.forEach((placement, index) => {
+      plants[index * 3] = placement.x;
+      plants[index * 3 + 1] = placement.y;
+      plants[index * 3 + 2] = lone.has(`${placement.x},${placement.y}`) ? 1 : 0;
+    });
+    const share = (field: Float32Array) => {
+      let count = 0;
+      for (const value of field) if (value >= 0.5) count++;
+      return `${(count / field.length * 100).toFixed(2)}%`;
+    };
+    debug = {
+      plants,
+      area: forest,
+      label: `${group.id} · ${forestType} · biomes ${biomeIds.join(",")} · ${placements.length} plants, ` +
+        `${loneTrees.length} lone · area ${share(forest)} → stand ${share(inkGeometry.mask)} · ` +
+        `tree ${standTreeSize.toFixed(1)} px, mark ${markSize.toFixed(1)} px · ${inkGeometry.marks.length} marks`,
+    };
+  }
+  return {
+    group: group.id,
+    biomeIds: biomeIds.sort((a, b) => a - b),
+    forest: forestType,
+    geometry: inkGeometry,
+    debug,
+  };
+}
+
+/**
+ * Placements of every stand group become hand-drawn stands: plants
+ * standing in company mark the stand area, isolated ones stay lone (L1),
+ * and the stand renderer draws both instead of the per-prop art. Placement
+ * itself (biomes, clearings, suitability, water clearance) is unchanged.
+ * Stands in `prebuilt` (by bucket index, built elsewhere from the same
+ * placements) are taken as they are.
+ */
+function buildPropStands(
+  geometry: VegetationGeometry,
+  dem: MountainDEMData,
+  options: ResolvedVegetationPatternOptions,
+  profiler?: MountainProfiler,
+  prebuilt?: ReadonlyMap<number, VegetationPropStand>,
+): void {
+  const { kept, buckets } = collectPropStandBuckets(geometry.rasterProps ?? [], options);
+  if (buckets.length === 0) return;
+  geometry.rasterProps = kept;
+
+  const { width, height } = geometry;
+  const fields = buckets.every((_, index) => prebuilt?.has(index))
+    ? undefined
+    : buildPropStandFields(dem, options, width, height, profiler);
+  const settings = options.forestSettings;
   // One colour blend per group, across all its stands, so the wash of two
   // biomes' stands grades the same way on both sides of their border.
   const sharesPerGroup = new Map<string, PropStandBiomeShares | undefined>();
-  for (const group of new Set([...buckets.values()].map((bucket) => bucket.group))) {
-    const groupPlacements = [...buckets.values()]
+  const sharesStop = profiler?.begin("vegetation stand biome shares");
+  for (const group of new Set(buckets.map((bucket) => bucket.group))) {
+    const groupPlacements = buckets
       .filter((bucket) => bucket.group === group)
       .flatMap((bucket) => bucket.placements);
     const cellSizes = groupPlacements.map((placement) => placement.cellSize).sort((a, b) => a - b);
@@ -5159,85 +5551,58 @@ function buildPropStands(
     sharesPerGroup.set(group.id, buildPropStandBiomeShares(
       groupPlacements, width, height, Math.max(0, settings.biomeBlend) * treeSize));
   }
-  for (const { group, style, forest: forestType, biomeIds, placements } of buckets.values()) {
-    // The first stand of a group keeps the group's seed; later ones vary it.
-    const bucketIndex = bucketsPerGroup.get(group.id) ?? 0;
-    bucketsPerGroup.set(group.id, bucketIndex + 1);
-    const cellSizes = placements.map((placement) => placement.cellSize).sort((a, b) => a - b);
-    // The floor applies to the shared tree size, never to one group alone,
-    // so small preview scales keep every group in proportion.
-    const standTreeSize = Math.max(4, cellSizes[Math.floor(cellSizes.length / 2)] * STAND_TREE_SIZE_CELLS);
-    // Prop scale alone sizes the drawn trees: marks keep the lab's ratio to
-    // the stand tree (5.5 to 7.5).
-    const markSize = standTreeSize * group.size / INK_WASH_TREE_SIZE_PER_MARK;
-    const clearing = silt ? propStandSiltClearing(silt.depth, width, height, markSize, silt.noise) : undefined;
-    // Plants out on the silt never join a stand.
-    const standPlacements = clearing
-      ? placements.map((placement) => sampleScalarField(clearing, width, height, placement.x, placement.y) >= 0.5
-        ? { ...placement, lone: true }
-        : placement)
-      : placements;
-    const { forest, loneTrees } = formPropStandArea(standPlacements, width, height, standTreeSize, standJoinTrees(settings.standJoin));
-    const ground = propStandGround(terrain, waterDistance, markSize);
+  sharesStop?.();
+  const indices = propStandBucketIndices(buckets);
+  geometry.stands = buckets.map((bucket, index) => ({
+    ...(prebuilt?.get(index) ?? buildPropStand(bucket, indices[index], fields!, dem, options, width, height, profiler)),
+    biomeShares: sharesPerGroup.get(bucket.group.id),
+  }));
+}
 
-    const inkGeometry = buildForestInkGeometry({
-      width,
-      height,
-      forest,
-      seed: ((options.seed ^ Math.imul(settings.seed, 2654435761)) ^ group.seedSalt ^
-        Math.imul(bucketIndex, 0x9e3779b1)) >>> 0,
-      settings: {
-        type: forestType,
-        markSize,
-        density: settings.inkFillDensity,
-        edgeRows: settings.inkEdgeRows,
-        edgeDensity: settings.inkEdgeDensity,
-        edgeDepth: settings.inkEdgeDepth,
-        meadowTrees: settings.inkMeadowTrees,
-        grass: settings.inkGrass,
-      },
-      slope: dem.slopeDeg,
-      ground,
-      clearing,
-      sparse: silt?.sparse,
-      light,
-      lightStrength: settings.inkLight,
-      loneTrees,
-      // Trees among shrubs: the biome's share of shrub-stand plants drawn as trees.
-      accentShare: style.accent?.share,
-    });
-    let debug: ForestInkStandDebug | undefined;
-    if (settings.showStandDebug) {
-      const plants = new Float32Array(placements.length * 3);
-      const lone = new Set(loneTrees.map((tree) => `${tree.x},${tree.y}`));
-      placements.forEach((placement, index) => {
-        plants[index * 3] = placement.x;
-        plants[index * 3 + 1] = placement.y;
-        plants[index * 3 + 2] = lone.has(`${placement.x},${placement.y}`) ? 1 : 0;
-      });
-      const share = (field: Float32Array) => {
-        let count = 0;
-        for (const value of field) if (value >= 0.5) count++;
-        return `${(count / field.length * 100).toFixed(2)}%`;
-      };
-      debug = {
-        plants,
-        area: forest,
-        label: `${group.id} · ${forestType} · biomes ${biomeIds.join(",")} · ${placements.length} plants, ` +
-          `${loneTrees.length} lone · area ${share(forest)} → stand ${share(inkGeometry.mask)} · ` +
-          `tree ${standTreeSize.toFixed(1)} px, mark ${markSize.toFixed(1)} px · ${inkGeometry.marks.length} marks`,
-      };
-    }
-    stands.push({
-      group: group.id,
-      biomeIds: biomeIds.sort((a, b) => a - b),
-      forest: forestType,
-      geometry: inkGeometry,
-      biomeShares: sharesPerGroup.get(group.id),
-      debug,
-    });
-  }
-  geometry.stands = stands;
+/**
+ * The plant count of each stand the placements form, in bucket order (see
+ * buildPropStandsForBuckets); a rough measure of each stand's work.
+ */
+export function propStandSizes(
+  rasterProps: readonly VegetationRasterPropPlacement[],
+  rawOptions?: VegetationPatternOptions,
+): number[] {
+  return collectPropStandBuckets(rasterProps, resolveVegetationPatternOptions(rawOptions))
+    .buckets.map((bucket) => bucket.placements.length);
+}
+
+/**
+ * Builds the stands at `bucketIndices` from the full placement list, exactly
+ * as buildPropStands would, so they can be built on other workers.
+ */
+export function buildPropStandsForBuckets(
+  dem: MountainDEMData,
+  rawOptions: VegetationPatternOptions | undefined,
+  rasterProps: readonly VegetationRasterPropPlacement[],
+  bucketIndices: readonly number[],
+  profiler?: MountainProfiler,
+): VegetationPropStand[] {
+  const options = resolveVegetationPatternOptions(rawOptions);
+  const { buckets } = collectPropStandBuckets(rasterProps, options);
+  if (bucketIndices.length === 0) return [];
+  const fields = buildPropStandFields(dem, options, dem.width, dem.height, profiler);
+  const indices = propStandBucketIndices(buckets);
+  return bucketIndices.map((index) =>
+    buildPropStand(buckets[index], indices[index], fields, dem, options, dem.width, dem.height, profiler));
+}
+
+/**
+ * Turns the stand placements of a geometry built with `deferStands` into
+ * stands, taking those in `prebuilt` (by bucket index) as they are.
+ */
+export function finishPropStands(
+  geometry: VegetationGeometry,
+  dem: MountainDEMData,
+  rawOptions: VegetationPatternOptions | undefined,
+  prebuilt: ReadonlyMap<number, VegetationPropStand>,
+  profiler?: MountainProfiler,
+): void {
+  buildPropStands(geometry, dem, resolveVegetationPatternOptions(rawOptions), profiler, prebuilt);
 }
 
 function boundsIntersect(
@@ -6999,9 +7364,9 @@ function buildNoisyDirectionalShadowCoverage(
   height: number,
   options: ResolvedVegetationPatternOptions,
   sunAzimuthDeg: number,
+  profiler?: MountainProfiler,
 ): Float32Array {
-  const shadow = new Float32Array(alpha.length);
-  if (options.motifShadowDistance <= 0) return shadow;
+  if (options.motifShadowDistance <= 0) return new Float32Array(alpha.length);
   const azimuth = (sunAzimuthDeg * Math.PI) / 180;
   // Screen coordinates have Y down. A 315° northwest sun therefore casts
   // southeast (+X,+Y), matching the terrain hillshade convention.
@@ -7015,8 +7380,24 @@ function buildNoisyDirectionalShadowCoverage(
       (0.45 + options.motifShadowSoftness * 0.7) * options.patternScale,
     ),
   );
-  const grainNoise = new SimplexNoise(options.seed + 3221);
   const grainSampling = createVegetationFlowSampling(dem, options);
+  if (options.gpuFields) {
+    // The GPU skips the occupancy blocks: an empty block gives no footprint.
+    const gpuStop = profiler?.begin("vegetation gpu motif shadow");
+    const gpu = renderVegetationMotifShadowGl({
+      domain: vegetationFieldDomain(dem, options, grainSampling),
+      grainSeed: options.seed + 3221,
+      clip,
+      alpha,
+      shiftX: shadowX * distance,
+      shiftY: shadowY * distance,
+      grainRadius,
+    });
+    gpuStop?.();
+    if (gpu) return gpu;
+  }
+  const shadow = new Float32Array(alpha.length);
+  const grainNoise = new SimplexNoise(options.seed + 3221);
   const occupancyBlockSize = 32;
   const occupancyColumns = Math.ceil(width / occupancyBlockSize);
   const occupancyRows = Math.ceil(height / occupancyBlockSize);
@@ -7179,9 +7560,9 @@ function buildDirectionalWashShadowCoverage(
   height: number,
   options: ResolvedVegetationPatternOptions,
   sunAzimuthDeg: number,
+  profiler?: MountainProfiler,
 ): Float32Array {
-  const shadow = new Float32Array(tone.length);
-  if (options.washShadowDistance + options.washShadowGap <= 0) return shadow;
+  if (options.washShadowDistance + options.washShadowGap <= 0) return new Float32Array(tone.length);
 
   const azimuth = (sunAzimuthDeg * Math.PI) / 180;
   // A 315° northwest sun casts southeast (+X,+Y) in screen coordinates.
@@ -7195,10 +7576,28 @@ function buildDirectionalWashShadowCoverage(
   );
   const perpendicularX = -shadowY;
   const perpendicularY = shadowX;
-  const grainNoise = new SimplexNoise(options.seed + 3221);
   const grainSampling = createVegetationFlowSampling(dem, options);
   const receiverXOffset = -shadowX * distance;
   const receiverYOffset = -shadowY * distance;
+  if (options.gpuFields) {
+    const gpuStop = profiler?.begin("vegetation gpu wash shadow");
+    const gpu = renderVegetationWashShadowGl({
+      domain: vegetationFieldDomain(dem, options, grainSampling),
+      grainSeed: options.seed + 3221,
+      clip,
+      tone,
+      minus: [receiverXOffset - perpendicularX * spread, receiverYOffset - perpendicularY * spread],
+      centre: [receiverXOffset, receiverYOffset],
+      plus: [receiverXOffset + perpendicularX * spread, receiverYOffset + perpendicularY * spread],
+      shiftX: shadowX * distance,
+      shiftY: shadowY * distance,
+      washShadowGrain: options.washShadowGrain,
+    });
+    gpuStop?.();
+    if (gpu) return gpu;
+  }
+  const shadow = new Float32Array(tone.length);
+  const grainNoise = new SimplexNoise(options.seed + 3221);
   // The three receiver taps are affine translations of the output grid.
   // Resolve their clamped bilinear indices once instead of repeating the
   // clamp/floor work for every tap in every output cell.
@@ -7648,8 +8047,12 @@ function renderRasterPropLayers(
     }
     forestStop?.();
     const allStands = geometry.stands ?? [];
+    // The stand canvases stay GPU canvases (no willReadFrequently): every
+    // stand is drawn on GPU scratch canvases and copied onto them, which on a
+    // CPU canvas reads the full-size scratch back once per stand. Each is
+    // read back once, after the last stand.
     const standsCanvas = allStands.length > 0 && typeof OffscreenCanvas !== "undefined"
-      ? new OffscreenCanvas(dem.width, dem.height).getContext("2d", { willReadFrequently: true })
+      ? new OffscreenCanvas(dem.width, dem.height).getContext("2d")
       : null;
     if (standsCanvas) {
       const standStop = profiler?.begin("vegetation forest stands");
@@ -7657,11 +8060,11 @@ function renderRasterPropLayers(
       // Stand areas and crowns, for the compositor to show line-free ground under.
       const coverCanvas = settings.showStandDebug
         ? null
-        : new OffscreenCanvas(dem.width, dem.height).getContext("2d", { willReadFrequently: true });
+        : new OffscreenCanvas(dem.width, dem.height).getContext("2d");
       // The wash on its own, for the compositor to mix into the ground.
       const washCanvas = settings.showStandDebug
         ? null
-        : new OffscreenCanvas(dem.width, dem.height).getContext("2d", { willReadFrequently: true });
+        : new OffscreenCanvas(dem.width, dem.height).getContext("2d");
       // Every stand paints onto one canvas. A later stand goes underneath
       // the earlier ones, so stands are drawn last to first.
       for (let standIndex = allStands.length - 1; standIndex >= 0; standIndex--) {
@@ -7691,7 +8094,8 @@ function renderRasterPropLayers(
           charcoal: settings.inkCharcoal,
           interruptions: settings.inkInterruptions,
           thickness: STAND_LINE_WEIGHTS,
-        }, standsCanvas, { cover: coverCanvas ?? undefined, wash: washCanvas ?? undefined });
+          gpu: options.gpuFields,
+        }, standsCanvas, { cover: coverCanvas ?? undefined, wash: washCanvas ?? undefined }, profiler);
       }
       standStop?.();
       const readbackStop = profiler?.begin("vegetation forest stand readback");
@@ -8147,6 +8551,7 @@ export function renderVegetationOverlay(
           dem.height,
           options,
           sunAzimuthDeg,
+          profiler,
         );
         if (stageCache) {
           stageCache.washShadowCoverageKey = washShadowCoverageKey;
@@ -8222,6 +8627,7 @@ export function renderVegetationOverlay(
           dem.height,
           options,
           sunAzimuthDeg,
+          profiler,
         );
         if (stageCache) {
           stageCache.shadowCoverageKey = shadowCoverageKey;

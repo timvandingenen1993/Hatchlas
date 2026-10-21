@@ -179,6 +179,11 @@ const SMOOTHING_LABELS = [
 // Keep interactive rendering responsive; export resolution is handled by the
 // worker and never feeds back into the visible canvases.
 const MOUNTAIN_PREVIEW_ANALYSIS_LONG_EDGE = FOREST_REFERENCE_LONG_EDGE;
+// Once the fast frame is up and the settings sit still this long, the export
+// pipeline renders the same settings at 4K, from the preview's 2048px
+// analysis, and replaces the frame. Any newer render cancels it.
+const PREVIEW_4K_LONG_EDGE = 4096;
+const PREVIEW_4K_IDLE_MS = 600;
 // Opt-in because console tables and timing snapshots are intentionally absent
 // from the normal preview/export path.
 const MOUNTAIN_PROFILE_QUERY =
@@ -199,6 +204,11 @@ const EXPORT_HELPER_MEMORY_GB: number | undefined =
         return Number.isFinite(value) && value > 0 ? value : undefined;
       })()
     : undefined;
+// The export dialog's worker choices; 0 lets the export size them from memory.
+const EXPORT_WORKER_COUNT_OPTIONS: readonly (readonly [number, string])[] = [
+  [0, "Auto"],
+  ...[1, 2, 3, 4, 5, 6, 7, 8].map((count) => [count, String(count)] as const),
+];
 // Use the fast GPU path by default; URL options can still select CPU or approximate rendering.
 const MOUNTAIN_GPU_RENDER_MODE: MountainRenderOptions["gpuRenderMode"] =
   typeof window !== "undefined"
@@ -566,16 +576,18 @@ function drawPreviewRaster(
   const y0 = profileA.y * canvas.height;
   const x1 = profileB.x * canvas.width;
   const y1 = profileB.y * canvas.height;
+  // Sized for the 2048px frame; the 4K frame scales them so they look the same.
+  const unit = Math.max(1, Math.max(canvas.width, canvas.height) / 2048);
   context.save();
   context.strokeStyle = "rgba(0, 0, 0, 0.75)";
-  context.lineWidth = 4.5;
+  context.lineWidth = 4.5 * unit;
   context.beginPath();
   context.moveTo(x0, y0);
   context.lineTo(x1, y1);
   context.stroke();
   context.strokeStyle = "#38bdf8";
-  context.lineWidth = 2.5;
-  context.setLineDash([6, 4]);
+  context.lineWidth = 2.5 * unit;
+  context.setLineDash([6 * unit, 4 * unit]);
   context.beginPath();
   context.moveTo(x0, y0);
   context.lineTo(x1, y1);
@@ -583,13 +595,26 @@ function drawPreviewRaster(
   context.setLineDash([]);
   context.fillStyle = "#10b981";
   context.beginPath();
-  context.arc(x0, y0, 6, 0, Math.PI * 2);
+  context.arc(x0, y0, 6 * unit, 0, Math.PI * 2);
   context.fill();
   context.fillStyle = "#ef4444";
   context.beginPath();
-  context.arc(x1, y1, 6, 0, Math.PI * 2);
+  context.arc(x1, y1, 6 * unit, 0, Math.PI * 2);
   context.fill();
   context.restore();
+}
+
+/** The viewport's water surface and, when asked for, its analysed DEM. */
+interface PreviewWaterSnapshot {
+  water?: MountainExportWaterSurface;
+  analysis?: MountainDEMData;
+}
+
+/** Progress of the background 4K pass shown in the status bar. */
+interface PreviewRefineStatus {
+  phase: MountainExportProgress["phase"] | "done";
+  completed: number;
+  total: number;
 }
 
 interface MountainDetailStudioProps {
@@ -612,6 +637,12 @@ export function MountainDetailStudio({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const exportWorkerRef = useRef<Worker | null>(null);
   const exportRequestIdRef = useRef(0);
+  const refineWorkerRef = useRef<Worker | null>(null);
+  const refineRequestIdRef = useRef(0);
+  // Set synchronously when an export starts, before its awaits create the
+  // export worker: a 4K pass must never start beside it.
+  const exportActiveRef = useRef(false);
+  const previewReleasedForExportRef = useRef(false);
   // Resolves the pending part of a (split) export when the user cancels it.
   const exportPartAbortRef = useRef<(() => void) | null>(null);
   const previewWorkerRef = useRef<Worker | null>(null);
@@ -766,7 +797,11 @@ export function MountainDetailStudio({
   const [domainWidthKm, setDomainWidthKm] = useState<number>(45);
   const [outputLongEdge, setOutputLongEdge] = useState<number>(MOUNTAIN_DEFAULT_OUTPUT_LONG_EDGE);
   const [splitExportIntoStrips, setSplitExportIntoStrips] = useState(false);
+  // Export tile workers: 0 = automatic (from the memory budget). Not kept
+  // across reloads, so a crash from too many workers goes back to automatic.
+  const [exportWorkerCount, setExportWorkerCount] = useState(0);
   const [exportStrip, setExportStrip] = useState<"all" | "1" | "2" | "3" | "4">("all");
+  const [exportSplitLayout, setExportSplitLayout] = useState<"strips" | "grid">("grid");
   const [heightmapSmoothingPasses, setHeightmapSmoothingPasses] =
     useState<number>(1);
 
@@ -926,6 +961,12 @@ export function MountainDetailStudio({
     useState<MountainPreviewFlowSnapshot | null>(null);
   const [analysisRevision, setAnalysisRevision] = useState(0);
   const [frameVersion, setFrameVersion] = useState(0);
+  // Bumped after an export that released the preview's memory, to render again.
+  const [previewEpoch, setPreviewEpoch] = useState(0);
+  // Counts fast preview frames; each one schedules the 4K pass.
+  const [fastFrameVersion, setFastFrameVersion] = useState(0);
+  const [preview4k, setPreview4k] = useState(true);
+  const [refineStatus, setRefineStatus] = useState<PreviewRefineStatus | null>(null);
   const [previewStatus, setPreviewStatus] = useState<PreviewStatusValue | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewWorkerGeneration, setPreviewWorkerGeneration] = useState(0);
@@ -1044,7 +1085,7 @@ export function MountainDetailStudio({
   })();
   const [settingsReady, setSettingsReady] = useState<boolean>(false);
   const waterSnapshotResolversRef = useRef(
-    new Map<number, (value: MountainExportWaterSurface | undefined) => void>(),
+    new Map<number, (value: PreviewWaterSnapshot | undefined) => void>(),
   );
   const heightmapResolversRef = useRef(
     new Map<
@@ -1136,6 +1177,7 @@ export function MountainDetailStudio({
             setCameraGrid(response.cameraGrid ?? null);
             if (response.vegetationCover) setVegetationCover(response.vegetationCover);
             setFrameVersion((version) => version + 1);
+            setFastFrameVersion((version) => version + 1);
             const canvas = canvasRef.current;
             if (canvas) {
               drawPreviewRaster(
@@ -1191,21 +1233,23 @@ export function MountainDetailStudio({
           );
           waterSnapshotResolversRef.current.delete(response.requestId);
           const value = response.value;
-          resolve?.(
-            value.wetlandPoolMask &&
+          resolve?.({
+            water:
+              value.wetlandPoolMask &&
               value.visualWaterMask &&
               value.wetlandPoolCoverage &&
               value.visualWaterCoverage
-              ? {
-                  width: value.width,
-                  height: value.height,
-                  wetlandPoolMask: value.wetlandPoolMask,
-                  visualWaterMask: value.visualWaterMask,
-                  wetlandPoolCoverage: value.wetlandPoolCoverage,
-                  visualWaterCoverage: value.visualWaterCoverage,
-                }
-              : undefined,
-          );
+                ? {
+                    width: value.width,
+                    height: value.height,
+                    wetlandPoolMask: value.wetlandPoolMask,
+                    visualWaterMask: value.visualWaterMask,
+                    wetlandPoolCoverage: value.wetlandPoolCoverage,
+                    visualWaterCoverage: value.visualWaterCoverage,
+                  }
+                : undefined,
+            analysis: response.analysis,
+          });
           return;
         }
         if (response.type === "heightmapResult") {
@@ -1253,6 +1297,8 @@ export function MountainDetailStudio({
       previewWorkerRef.current = null;
       exportWorkerRef.current?.terminate();
       exportWorkerRef.current = null;
+      refineWorkerRef.current?.terminate();
+      refineWorkerRef.current = null;
       for (const resolve of waterSnapshotResolversRef.current.values())
         resolve(undefined);
       waterSnapshotResolversRef.current.clear();
@@ -2218,6 +2264,7 @@ export function MountainDetailStudio({
   const beginHeightmapLoad = () => {
     exportWorkerRef.current?.terminate();
     exportWorkerRef.current = null;
+    cancelPreviewRefine();
     setExportProgress(null);
     setIsLoading(true);
     setLoadError(null);
@@ -2349,6 +2396,9 @@ export function MountainDetailStudio({
     exportWorkerRef.current?.terminate();
     exportWorkerRef.current = null;
     setExportProgress(null);
+    refineWorkerRef.current?.terminate();
+    refineWorkerRef.current = null;
+    setRefineStatus(null);
     const nextAnalysisRevision = analysisRevisionRef.current + 1;
     analysisRevisionRef.current = nextAnalysisRevision;
     const requestId = ++previewRequestIdRef.current;
@@ -2410,8 +2460,15 @@ export function MountainDetailStudio({
 
     const targetWidth = demData.width;
     const targetHeight = demData.height;
+    const previewWorker = previewWorkerRef.current;
 
-    if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
+    // Worker frames size the canvas themselves (drawPreviewRaster), and the
+    // 4K frame is larger than the DEM: resizing here would blank it on every
+    // edit until the next fast frame arrives.
+    if (
+      (!previewWorker || !rasterCanvasRef.current)
+      && (canvas.width !== targetWidth || canvas.height !== targetHeight)
+    ) {
       canvas.width = targetWidth;
       canvas.height = targetHeight;
     }
@@ -2419,7 +2476,6 @@ export function MountainDetailStudio({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    const previewWorker = previewWorkerRef.current;
     const previewRiverThreshold =
       previewMetadata?.riverThresholdKm2 ?? riverThresholdKm2;
     const visualWaterDem = previewWorker
@@ -2609,12 +2665,19 @@ export function MountainDetailStudio({
         washShadowGap: vegetationWashShadowGap,
         washShadowGrain: vegetationWashShadowGrain,
         motifAssets: vegetationMotifAssets ?? undefined,
+        gpuFields: MOUNTAIN_GPU_RENDER_MODE !== "cpuExact",
       },
     };
 
     if (previewWorker) {
+      // The preview released its memory to a running export; the render after
+      // the export (previewEpoch) picks up any settings changed meanwhile.
+      if (exportActiveRef.current && previewReleasedForExportRef.current) return;
       const finalRequestId = ++previewRequestIdRef.current;
       const settingsRevision = ++settingsRevisionRef.current;
+      refineWorkerRef.current?.terminate();
+      refineWorkerRef.current = null;
+      setRefineStatus(null);
       // The final compositor now uses a bounded 1536px internal raster and
       // publishes a 2048px frame. Sending a separate 768px draft would repeat
       // the complete water, vegetation, mountain-pattern, and illustration
@@ -2782,6 +2845,7 @@ export function MountainDetailStudio({
     }
   }, [
     demData,
+    previewEpoch,
     previewMetadata,
     activeLayer,
     activePalette,
@@ -3194,7 +3258,7 @@ export function MountainDetailStudio({
     const hitEpic = customEpicenters.find((epic) => {
       const dx = (epic.normX - xRatio) * cw;
       const dy = (epic.normY - yRatio) * ch;
-      return Math.hypot(dx, dy) <= 22;
+      return Math.hypot(dx, dy) <= 22 * Math.max(1, Math.max(cw, ch) / 2048);
     });
 
     if (hitEpic) {
@@ -3269,8 +3333,8 @@ export function MountainDetailStudio({
     }
   }
 
-  function requestPreviewWaterSnapshot(): Promise<
-    MountainExportWaterSurface | undefined
+  function requestPreviewWaterSnapshot(includeAnalysis = false): Promise<
+    PreviewWaterSnapshot | undefined
   > {
     const worker = previewWorkerRef.current;
     if (!worker) return Promise.resolve(undefined);
@@ -3281,6 +3345,7 @@ export function MountainDetailStudio({
         type: "waterSnapshot",
         requestId,
         analysisRevision,
+        includeAnalysis,
         options: {
           siltReachM,
           siltTopRemoved,
@@ -3302,8 +3367,8 @@ export function MountainDetailStudio({
   useEffect(() => {
     if (!hasStructureRoads || isLoading) return;
     let cancelled = false;
-    void requestPreviewWaterSnapshot().then((water) => {
-      if (!cancelled && water) setRoutingWater(water);
+    void requestPreviewWaterSnapshot().then((snapshot) => {
+      if (!cancelled && snapshot?.water) setRoutingWater(snapshot.water);
     });
     return () => { cancelled = true; };
   }, [
@@ -3322,15 +3387,144 @@ export function MountainDetailStudio({
     riverThresholdKm2,
   ]);
 
-  async function handleExportImage(
-    region?: { x0: number; y0: number; x1: number; y1: number },
-  ) {
-    if (!rawLuminance || !outputSize || isLoading) return;
+  /** Stops the running 4K pass, if any. */
+  function cancelPreviewRefine() {
+    refineWorkerRef.current?.terminate();
+    refineWorkerRef.current = null;
+    setRefineStatus(null);
+  }
+
+  /**
+   * Renders the current settings at 4K through the export pipeline and
+   * replaces the fast frame with the result. It keeps the preview's 2048px
+   * analysis, so rivers and biomes match the fast frame exactly.
+   */
+  async function startPreviewRefine(settingsRevision: number) {
+    if (!rawLuminance || isLoading || exportActiveRef.current || exportWorkerRef.current) return;
+    cancelPreviewRefine();
+    const id = ++refineRequestIdRef.current;
+    const analysisRevisionAtStart = analysisRevisionRef.current;
+    const size = getHeightmapFitResolution(
+      rawLuminance.width,
+      rawLuminance.height,
+      PREVIEW_4K_LONG_EDGE,
+    );
+    let request: MountainExportRequest;
+    try {
+      request = await buildExportRequest(size, MOUNTAIN_PREVIEW_ANALYSIS_LONG_EDGE, true);
+    } catch (error) {
+      console.warn("4K preview skipped:", error);
+      return;
+    }
+    if (
+      refineRequestIdRef.current !== id
+      || settingsRevisionRef.current !== settingsRevision
+      || analysisRevisionRef.current !== analysisRevisionAtStart
+      || exportActiveRef.current
+      || exportWorkerRef.current
+    ) return;
+    const worker = new Worker(
+      new URL("../rendering/mountainExport.worker.ts", import.meta.url),
+      { type: "module" },
+    );
+    refineWorkerRef.current = worker;
+    setRefineStatus({ phase: "analysis", completed: 0, total: 0 });
+    const finish = () => {
+      worker.terminate();
+      if (refineWorkerRef.current === worker) refineWorkerRef.current = null;
+    };
+    worker.onmessage = (event: MessageEvent<MountainExportWorkerResponse>) => {
+      const response = event.data;
+      if (refineWorkerRef.current !== worker || response.id !== id) return;
+      if (response.type === "progress") {
+        const rows = response.phase === "projecting" || response.phase === "encoding";
+        setRefineStatus({
+          phase: response.phase,
+          completed: rows ? response.completedRows ?? 0 : response.completedTiles,
+          total: rows ? response.totalRows ?? 0 : response.totalTiles,
+        });
+        return;
+      }
+      finish();
+      if (response.type === "error") {
+        console.warn("4K preview failed:", response.message);
+        setRefineStatus(null);
+        return;
+      }
+      if (
+        response.type !== "pixels"
+        || settingsRevisionRef.current !== settingsRevision
+        || analysisRevisionRef.current !== analysisRevisionAtStart
+      ) {
+        setRefineStatus(null);
+        return;
+      }
+      const raster = rasterCanvasRef.current ?? document.createElement("canvas");
+      rasterCanvasRef.current = raster;
+      raster.width = response.width;
+      raster.height = response.height;
+      raster.getContext("2d")?.putImageData(
+        new ImageData(response.data, response.width, response.height),
+        0,
+        0,
+      );
+      setFrameVersion((version) => version + 1);
+      const canvas = canvasRef.current;
+      if (canvas) drawPreviewRaster(canvas, raster, profileARef.current, profileBRef.current);
+      setRefineStatus({ phase: "done", completed: 0, total: 0 });
+    };
+    worker.onerror = (event) => {
+      if (refineWorkerRef.current !== worker) return;
+      console.warn("4K preview worker failed:", event.message);
+      finish();
+      setRefineStatus(null);
+    };
+    // The analysis copy belongs to this pass: hand its buffers over instead
+    // of copying ~250 MB again.
+    const transfer = new Set<ArrayBuffer>();
+    for (const field of Object.values(request.analysisDem ?? {})) {
+      if (ArrayBuffer.isView(field) && field.buffer instanceof ArrayBuffer) transfer.add(field.buffer);
+    }
+    worker.postMessage(
+      { ...request, id, output: "pixels", reuseCameraBandPlans: true, filename: "preview-4k" } satisfies MountainExportRequest,
+      [...transfer],
+    );
+  }
+
+  useEffect(() => {
+    if (!preview4k) {
+      refineWorkerRef.current?.terminate();
+      refineWorkerRef.current = null;
+      setRefineStatus(null);
+      return;
+    }
+    if (fastFrameVersion === 0) return;
+    const settingsRevision = settingsRevisionRef.current;
+    const timer = window.setTimeout(() => {
+      if (settingsRevisionRef.current === settingsRevision)
+        void startPreviewRefine(settingsRevision);
+    }, PREVIEW_4K_IDLE_MS);
+    return () => window.clearTimeout(timer);
+    // startPreviewRefine reads the settings of the render that showed the
+    // fast frame; the revision check drops it if they have changed since.
+  }, [fastFrameVersion, preview4k]);
+
+  /**
+   * Builds an export worker request for the current settings at `size`.
+   * Throws when the vegetation assets the export needs fail to load.
+   */
+  async function buildExportRequest(
+    size: { width: number; height: number },
+    analysisLongEdge: number,
+    reuseAnalysis = false,
+  ): Promise<MountainExportRequest> {
+    if (!rawLuminance) throw new Error("No heightmap is loaded");
 
     // Export must use the exact water surface currently visible in the
     // viewport. Rebuilding pools independently in the worker can classify a
     // river-crossing wetland differently and silently drop a large pocket.
-    const exportWaterDem = await requestPreviewWaterSnapshot();
+    const snapshot = await requestPreviewWaterSnapshot(reuseAnalysis);
+    const exportWaterDem = snapshot?.water;
 
     // The procedural path fallback is intentionally useful while the
     // viewport is still loading, but it would make an export silently differ
@@ -3340,55 +3534,26 @@ export function MountainDetailStudio({
     if (activeLayer === "vegetation_patterns" && !exportVegetationMotifAssets) {
       try {
         exportVegetationMotifAssets = await loadVegetationMotifAssets();
-        setVegetationMotifAssets(exportVegetationMotifAssets);
       } catch (error) {
-        setExportError(
-          error instanceof Error
-            ? error.message
-            : "Failed to load vegetation motifs for export",
-        );
-        return;
+        throw error instanceof Error
+          ? error
+          : new Error("Failed to load vegetation motifs for export");
       }
+      setVegetationMotifAssets(exportVegetationMotifAssets);
     }
     let exportRasterPropAssets = rasterPropAssets;
     if (!exportRasterPropAssets) {
       try {
         exportRasterPropAssets = await loadMountainDetailPropAssets();
-        setRasterPropAssets(exportRasterPropAssets);
       } catch (error) {
-        setExportError(
-          error instanceof Error
-            ? error.message
-            : "Failed to load raster vegetation props for export",
-        );
-        return;
+        throw error instanceof Error
+          ? error
+          : new Error("Failed to load raster vegetation props for export");
       }
+      setRasterPropAssets(exportRasterPropAssets);
     }
 
-    // 16K uses the same export path as 8K. Keep the explicit confirmation because a
-    // full-camera 16K composition can require substantial pixel memory.
-    if (outputLongEdge >= 16384 && !region) {
-      const confirmed = window.confirm(
-        "16K export needs roughly 4× the memory and time of 8K. Continue?",
-      );
-      if (!confirmed) return;
-    }
-
-    setExportError(null);
-    setExportSummary(null);
-
-    // A region preview renders one rectangle of the full-size export, so it
-    // shows exactly the pixels a complete export would contain there.
-    const regionPixels = region
-      ? {
-          colStart: Math.floor(Math.min(region.x0, region.x1) * outputSize.width),
-          colEnd: Math.ceil(Math.max(region.x0, region.x1) * outputSize.width),
-          rowStart: Math.floor(Math.min(region.y0, region.y1) * outputSize.height),
-          rowEnd: Math.ceil(Math.max(region.y0, region.y1) * outputSize.height),
-        }
-      : undefined;
-
-    const request: MountainExportRequest = {
+    return {
       type: "export",
       id: 0,
       sourceRevision: sourceLoadIdRef.current,
@@ -3400,6 +3565,7 @@ export function MountainDetailStudio({
         luminance: rawLuminance.data.slice(),
         oceanMask: rawLuminance.oceanMask?.slice(),
       },
+      analysisDem: snapshot?.analysis,
       waterSurface: exportWaterDem
         ? {
             width: exportWaterDem.width,
@@ -3610,22 +3776,95 @@ export function MountainDetailStudio({
           washShadowGap: vegetationWashShadowGap,
           washShadowGrain: vegetationWashShadowGrain,
           motifAssets: exportVegetationMotifAssets ?? undefined,
+          gpuFields: MOUNTAIN_GPU_RENDER_MODE !== "cpuExact",
         },
       },
-      outputWidth: outputSize.width,
-      outputHeight: outputSize.height,
-      // Export analysis follows the requested output up to the source's
-      // native resolution; the worker clamps this to the available source
-      // samples so a smaller heightmap is never artificially enlarged.
-      analysisLongEdge: Math.max(outputSize.width, outputSize.height),
+      outputWidth: size.width,
+      outputHeight: size.height,
+      analysisLongEdge,
       tileSize: 1024,
       halo: 32,
       profile: MOUNTAIN_PROFILE_ENABLED,
       townStamps: activeLayer === "raw_heightmap" || activeLayer === "eroded_heightmap"
         ? undefined
-        : await structuresEditor.buildTownStamps(Math.max(outputSize.width, outputSize.height)),
+        : await structuresEditor.buildTownStamps(Math.max(size.width, size.height)),
       helperMemoryGb: EXPORT_HELPER_MEMORY_GB,
-      filename: `mountain_detail_${activeLayer}_${activePalette}_${outputSize.width}x${outputSize.height}.png`,
+      filename: `mountain_detail_${activeLayer}_${activePalette}_${size.width}x${size.height}.png`,
+    };
+  }
+
+
+  async function handleExportImage(
+    region?: { x0: number; y0: number; x1: number; y1: number },
+  ) {
+    if (!rawLuminance || !outputSize || isLoading) return;
+    exportActiveRef.current = true;
+    previewReleasedForExportRef.current = false;
+    cancelPreviewRefine();
+    try {
+      await runExportImage(region);
+    } finally {
+      exportActiveRef.current = false;
+      // The preview gave its memory to the export; render it again.
+      if (previewReleasedForExportRef.current) setPreviewEpoch((epoch) => epoch + 1);
+    }
+  }
+
+  async function runExportImage(
+    region?: { x0: number; y0: number; x1: number; y1: number },
+  ) {
+    if (!rawLuminance || !outputSize || isLoading) return;
+
+    // 16K uses the same export path as 8K. Keep the explicit confirmation because a
+    // full-camera 16K composition can require substantial pixel memory.
+    if (outputLongEdge >= 16384 && !region) {
+      const confirmed = window.confirm(
+        "16K export needs roughly 4× the memory and time of 8K. Continue?",
+      );
+      if (!confirmed) return;
+    }
+
+    let baseRequest: MountainExportRequest;
+    try {
+      // Export analysis follows the requested output up to the source's
+      // native resolution; the worker clamps this to the available source
+      // samples so a smaller heightmap is never artificially enlarged.
+      baseRequest = await buildExportRequest(
+        outputSize,
+        Math.max(outputSize.width, outputSize.height),
+      );
+      if (exportWorkerCount > 0) baseRequest.helperCount = exportWorkerCount;
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : String(error));
+      return;
+    }
+
+    setExportError(null);
+    setExportSummary(null);
+
+    // A region preview renders one rectangle of the full-size export, so it
+    // shows exactly the pixels a complete export would contain there.
+    const regionPixels = region
+      ? {
+          colStart: Math.floor(Math.min(region.x0, region.x1) * outputSize.width),
+          colEnd: Math.ceil(Math.max(region.x0, region.x1) * outputSize.width),
+          rowStart: Math.floor(Math.min(region.y0, region.y1) * outputSize.height),
+          rowEnd: Math.ceil(Math.max(region.y0, region.y1) * outputSize.height),
+        }
+      : undefined;
+
+    // A full export gets headroom from the memory the live preview holds
+    // (layer workers, GPU backends, render caches): the preview drops it now,
+    // after the request has its water snapshot, and renders again when the
+    // export ends. The helper budget is NOT raised by it: a 2 GB raise ran an
+    // 8K export out of memory (free RAM 0.44 GB), since the idle worker does
+    // not return dropped caches promptly. Region previews leave it alone.
+    if (!regionPixels && previewWorkerRef.current) {
+      previewWorkerRef.current.postMessage({ type: "releaseForExport" } satisfies MountainPreviewRequest);
+      previewReleasedForExportRef.current = true;
+    }
+    const request: MountainExportRequest = {
+      ...baseRequest,
       ...(regionPixels && {
         ...regionPixels,
         filename: `mountain_detail_${activeLayer}_${activePalette}_${outputSize.width}x${outputSize.height}_region_x${regionPixels.colStart}-${regionPixels.colEnd}_y${regionPixels.rowStart}-${regionPixels.rowEnd}.png`,
@@ -3705,8 +3944,9 @@ export function MountainDetailStudio({
         resolve(false);
         return;
       }
+      if (response.type !== "result") return;
       const url = URL.createObjectURL(response.blob);
-      if (request.colStart !== undefined) {
+      if (regionPixels) {
         setRegionPreview((previous) => {
           if (previous) URL.revokeObjectURL(previous.url);
           return { url, filename: response.filename };
@@ -3744,25 +3984,51 @@ export function MountainDetailStudio({
       await runExportPart(request, regionPixels ? " (region preview)" : "");
       return;
     }
-    // Four full-width horizontal strips of the same image, stacked top to
-    // bottom. Boundaries sit on the 1024px tile grid so every strip renders
-    // exactly the rows of the unsplit export.
-    const stripCount = 4;
-    const stripHeight = Math.ceil(outputSize.height / stripCount / 1024) * 1024;
+    // Four parts of the same image: full-width horizontal strips stacked top
+    // to bottom, or a 2 × 2 grid. Boundaries sit on the 1024px tile grid so
+    // every part renders exactly the pixels of the unsplit export. The camera
+    // spreads the source vertically, so both parts beside a horizontal
+    // boundary render the source tiles under it; the grid has one such
+    // boundary where the strips have three (its vertical one costs little).
+    const partCount = 4;
     const baseName = request.filename.replace(/\.png$/, "");
-    for (let part = 0; part < stripCount; part++) {
-      if (exportStrip !== "all" && part + 1 !== Number(exportStrip)) continue;
-      const rowStart = part * stripHeight;
-      if (rowStart >= outputSize.height) break;
-      const rowEnd = Math.min(outputSize.height, rowStart + stripHeight);
-      const ok = await runExportPart(
-        {
-          ...request,
+    const parts: Array<{ rowStart: number; rowEnd: number; colStart?: number; colEnd?: number; filename: string }> = [];
+    if (exportSplitLayout === "grid") {
+      const rowSplit = Math.ceil(outputSize.height / 2 / 1024) * 1024;
+      const colSplit = Math.ceil(outputSize.width / 2 / 1024) * 1024;
+      for (const [rowStart, rowEnd] of [[0, rowSplit], [rowSplit, outputSize.height]]) {
+        for (const [colStart, colEnd] of [[0, colSplit], [colSplit, outputSize.width]]) {
+          const part = parts.length + 1;
+          parts.push({
+            rowStart,
+            rowEnd: Math.min(outputSize.height, rowEnd),
+            colStart,
+            colEnd: Math.min(outputSize.width, colEnd),
+            filename: `${baseName}_part${part}of${partCount}_x${colStart}-${Math.min(outputSize.width, colEnd)}`
+              + `_y${rowStart}-${Math.min(outputSize.height, rowEnd)}.png`,
+          });
+        }
+      }
+    } else {
+      const stripHeight = Math.ceil(outputSize.height / partCount / 1024) * 1024;
+      for (let part = 0; part < partCount; part++) {
+        const rowStart = part * stripHeight;
+        const rowEnd = Math.min(outputSize.height, rowStart + stripHeight);
+        parts.push({
           rowStart,
           rowEnd,
-          filename: `${baseName}_part${part + 1}of${stripCount}_rows${rowStart}-${rowEnd}.png`,
-        },
-        ` (part ${part + 1}/${stripCount})`,
+          filename: `${baseName}_part${part + 1}of${partCount}_rows${rowStart}-${rowEnd}.png`,
+        });
+      }
+    }
+    for (let part = 0; part < parts.length; part++) {
+      if (exportStrip !== "all" && part + 1 !== Number(exportStrip)) continue;
+      const { rowStart, rowEnd, colStart, colEnd, filename } = parts[part];
+      // A small image leaves some parts empty.
+      if (rowStart >= rowEnd || (colStart !== undefined && colEnd !== undefined && colStart >= colEnd)) continue;
+      const ok = await runExportPart(
+        { ...request, rowStart, rowEnd, colStart, colEnd, filename },
+        ` (part ${part + 1}/${partCount})`,
       );
       if (!ok) return;
     }
@@ -4304,8 +4570,22 @@ export function MountainDetailStudio({
         )}
         <footer className="relative flex h-7 shrink-0 items-center gap-3 border-t border-white/5 bg-[#1b1f26] px-3 text-[11px] text-slate-400">
           <PreviewStatus status={previewStatus} />
+          {!previewStatus && refineStatus && (
+            <span className={`whitespace-nowrap tabular-nums ${refineStatus.phase === "done" ? "text-emerald-400" : "text-sky-300/80"}`}>
+              {refineStatus.phase === "done"
+                ? "4K"
+                : refineStatus.phase === "rendering" && refineStatus.total > 0
+                  ? `Sharpening to 4K · ${refineStatus.completed}/${refineStatus.total} tiles`
+                  : refineStatus.phase === "projecting" && refineStatus.total > 0
+                    ? `Sharpening to 4K · camera ${Math.round(100 * refineStatus.completed / refineStatus.total)}%`
+                    : "Sharpening to 4K…"}
+            </span>
+          )}
           {hoverInfo && <span className="tabular-nums">x {hoverInfo.x} · y {hoverInfo.y}</span>}
           <div className="ml-auto flex items-center gap-0.5">
+            <button type="button" onClick={() => setPreview4k((enabled) => !enabled)} aria-pressed={preview4k}
+              title={preview4k ? "4K preview on: sharpens to 4K once settings are idle" : "4K preview off"}
+              className={`mr-1 rounded px-1.5 py-0.5 hover:bg-white/5 ${preview4k ? "text-emerald-400" : "text-slate-500 hover:text-slate-100"}`}>4K</button>
             <button type="button" onClick={() => setZoom((z) => Math.max(0.4, z * 0.8))} aria-label="Zoom out" title="Zoom out"
               className="rounded p-1 hover:bg-white/5 hover:text-slate-100"><Minus size={12} /></button>
             <span className="w-11 text-center tabular-nums text-slate-200">{(zoom * 100).toFixed(0)}%</span>
@@ -4699,8 +4979,18 @@ export function MountainDetailStudio({
               </div>
               {num("Long edge", outputLongEdge, (next) => setOutputLongEdge(Math.round(next)), MIN_MOUNTAIN_RENDER_RESOLUTION, MAX_MOUNTAIN_RENDER_RESOLUTION, 1,
                 { unit: "px", log: true, limits: [MIN_MOUNTAIN_RENDER_RESOLUTION, MAX_MOUNTAIN_RENDER_RESOLUTION], disabled: Boolean(exportProgress) })}
-              <InspectorToggle label="Split into 4 horizontal strips" checked={splitExportIntoStrips}
+              <InspectorToggle label="Split into 4 parts" checked={splitExportIntoStrips}
                 disabled={Boolean(exportProgress)} onChange={setSplitExportIntoStrips} />
+              {splitExportIntoStrips && (
+                <InspectorSelect
+                  label="Layout"
+                  value={exportSplitLayout}
+                  options={[["grid", "2 × 2 grid"], ["strips", "4 horizontal strips"]] as const}
+                  onChange={setExportSplitLayout}
+                  disabled={Boolean(exportProgress)}
+                  title="The grid renders fewer tiles twice; strips stack top to bottom"
+                />
+              )}
               {splitExportIntoStrips && (
                 <label className="flex flex-col gap-1 text-[12px] text-slate-300">
                   Parts to render
@@ -4711,14 +5001,29 @@ export function MountainDetailStudio({
                     className="rounded border border-white/10 bg-[#292e38] px-2 py-1.5 text-slate-100 disabled:opacity-40"
                   >
                     <option value="all">All 4 parts</option>
-                    <option value="1">Part 1 (top)</option>
-                    <option value="2">Part 2</option>
-                    <option value="3">Part 3</option>
-                    <option value="4">Part 4 (bottom)</option>
+                    {(exportSplitLayout === "grid"
+                      ? ["Part 1 (top left)", "Part 2 (top right)", "Part 3 (bottom left)", "Part 4 (bottom right)"]
+                      : ["Part 1 (top)", "Part 2", "Part 3", "Part 4 (bottom)"]
+                    ).map((text, index) => <option key={text} value={String(index + 1)}>{text}</option>)}
                   </select>
                 </label>
               )}
               <InspectorNote>Exports re-analyze the source at the chosen size; 16K may need a lot of memory.</InspectorNote>
+            </InspectorSection>
+
+            <InspectorSection title="Performance" collapsible={false}>
+              <InspectorSelect
+                label="Parallel workers"
+                value={exportWorkerCount}
+                options={EXPORT_WORKER_COUNT_OPTIONS}
+                onChange={setExportWorkerCount}
+                disabled={Boolean(exportProgress)}
+                title="Tiles rendered at the same time"
+              />
+              <InspectorNote>
+                Auto picks a count that fits your memory. More workers export faster but use more memory:
+                if an export fails or the tab crashes, lower this number.
+              </InspectorNote>
             </InspectorSection>
 
             <div className="flex flex-col gap-2 px-4 py-3">

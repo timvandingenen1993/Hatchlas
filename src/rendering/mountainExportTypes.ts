@@ -1,5 +1,5 @@
 import type { BaseDEMOptions, MountainDEMData } from "../terrain/mountainBaseDEM";
-import type { MountainRenderOptions } from "./mountainDetailRenderer";
+import type { MountainRenderOptions, VegetationWashGrid } from "./mountainDetailRenderer";
 import type { TownStampRaster } from "../structures/townStamp";
 import type { RiverSpline } from "./waterRenderer";
 import type { VegetationGeometry } from "./vegetationRenderer";
@@ -46,6 +46,11 @@ export interface MountainExportRequest extends MountainExportSettings {
   source: MountainExportSource;
   /** Viewport water decisions, resampled to the export analysis grid as needed. */
   waterSurface?: MountainExportWaterSurface;
+  /**
+   * The preview's finished analysis. Used instead of analysing again when it
+   * has the export's analysis size (the live 4K preview sends it).
+   */
+  analysisDem?: MountainDEMData;
   filename: string;
   /**
    * Optional output row range [rowStart, rowEnd). The full output geometry is
@@ -63,10 +68,27 @@ export interface MountainExportRequest extends MountainExportSettings {
    * derives the budget from the machine's reported RAM.
    */
   helperMemoryGb?: number;
+  /**
+   * Camera-tile helper workers chosen in the export dialog. Without it the
+   * count follows the memory budget; with it the budget grows to admit that
+   * many typical tiles, so it can exceed what the machine safely holds.
+   */
+  helperCount?: number;
   /** Internal diagnostic switch used to compare camera export scheduling. */
   debugForceSerialCameraTiles?: boolean;
   /** Towns pre-rendered at export scale, drawn upright over the final image. */
   townStamps?: TownStampRaster[];
+  /**
+   * `pixels` returns the raw RGBA image instead of a PNG, for the live 4K
+   * preview, which draws it straight onto a canvas.
+   */
+  output?: "png" | "pixels";
+  /**
+   * Keep the camera band plans made while planning texture tiles (within
+   * 256 MB) and draw from them instead of rasterizing each band again. The
+   * live 4K preview sets it; exports keep their memory for the helpers.
+   */
+  reuseCameraBandPlans?: boolean;
 }
 
 export interface MountainExportProgress {
@@ -98,6 +120,16 @@ export interface MountainExportResult {
   completedStages?: MountainExportStageTiming[];
 }
 
+/** The finished image of an `output: "pixels"` request. */
+export interface MountainExportPixelsResult {
+  type: "pixels";
+  id: number;
+  width: number;
+  height: number;
+  data: Uint8ClampedArray<ArrayBuffer>;
+  completedStages?: MountainExportStageTiming[];
+}
+
 export interface MountainExportError {
   type: "error";
   id: number;
@@ -114,6 +146,7 @@ export interface MountainExportCancelled {
 export type MountainExportWorkerResponse =
   | MountainExportProgress
   | MountainExportResult
+  | MountainExportPixelsResult
   | MountainExportError
   | MountainExportCancelled;
 
@@ -144,6 +177,12 @@ export interface MountainExportGlobalContext {
   openOceanMask?: Uint8Array;
   /** Smoothed global ocean coverage used for antialiased tile coastlines. */
   oceanMaskCoverage?: Float32Array;
+  /**
+   * The vegetation layer's biome wash grid for the whole output, built once
+   * (buildExportVegetationWashGrid). Tiles take their cells of it, so their
+   * compositor frames need no biome-wash halo.
+   */
+  vegetationWashGrid?: VegetationWashGrid;
   /** Native-resolution snow predictors prepared once for the export snapshot. */
   snowTransport?: MountainSnowTransportFields;
   /**

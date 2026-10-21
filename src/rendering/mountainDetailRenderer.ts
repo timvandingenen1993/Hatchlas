@@ -64,6 +64,7 @@ import type { StructureRenderOptions } from '../structures/types';
 import type { MountainGpuRenderMode } from './mountainGpuRenderer';
 import { forestRenderSettingsSignature } from './forestCanvasRenderer';
 import { mixPaintChannel } from './forestInkRenderer';
+import { composeVegetationLayerGl } from './mountainCompositeGl';
 import {
   getMountainIllustrationFieldDependencySignature,
   isMountainIllustrationPreparedFieldsCompatible,
@@ -83,7 +84,9 @@ import {
 } from './waterRenderer';
 import {
   buildVegetationGeometry,
+  GRASS_GROUND_BIOME_IDS,
   propStandColorPartition,
+  rasterPropSettingsForBiome,
   renderVegetationOverlay,
   sampleAlpineForestTerrainSuitability,
   type RasterPropBiomeSettings,
@@ -328,6 +331,18 @@ export interface MountainRenderOptions {
   /** Preserve tile-independent normalization when a cropped DEM is composited. */
   heightmapLowerLimitMOverride?: number;
   maxErosionDepthMOverride?: number;
+  /**
+   * The flat-ground shade terrain darkness is measured against (water and
+   * prop shading). Exports pass the whole map's (terrainFlatShade on the
+   * global DEM), so every tile shades alike whatever its frame covers.
+   */
+  terrainFlatShadeOverride?: number;
+  /**
+   * The biome wash grid built once for the whole map (export), cropped to
+   * this frame's cells. Without it the frame builds its own, which needs the
+   * biome-wash halo around the composited region.
+   */
+  vegetationWashGridOverride?: VegetationWashGrid;
   /** Output-pixel scale/origin for procedural wetland geometry in tiled exports. */
   wetlandPuddleCoordinateScale?: number;
   wetlandPuddleCoordinateOffsetX?: number;
@@ -378,6 +393,10 @@ export interface MountainRenderStageCache {
   vegetationStages: VegetationOverlayStageCache;
   contourKey?: string;
   contourElevation?: Float32Array;
+  /** The vegetation layer's biome wash field; depends on the DEM and wash colours only. */
+  vegetationWashFieldKey?: string;
+  vegetationWashFieldDem?: MountainDEMData;
+  vegetationWashField?: VegetationWashField;
   stats: MountainRenderStageStats;
 }
 
@@ -496,102 +515,194 @@ function rasterPropBiomeSettingsWithoutColors(settings: RasterPropBiomeSettings 
   }));
 }
 
-export function vegetationGeometryStageKey(options: MountainRenderOptions): string {
+/**
+ * Inputs of the vegetation geometry, by name. The flow and prop halves build
+ * independently (see `buildVegetationGeometry`), so each half keys only the
+ * fields it reads; fields in neither omit list key both halves.
+ */
+function vegetationGeometryStageFields(options: MountainRenderOptions): Record<string, unknown> {
   const vegetation = options.vegetation;
-  return JSON.stringify([
-    options.layer,
+  return {
+    layer: options.layer,
     // Vegetation masks and distance fields sample the resolved visual-water
     // coverage. Keep geometry invalidation tied to water geometry inputs while
     // leaving water paint-only changes cacheable.
-    waterGeometryStageKey(options),
-    vegetation?.preset,
-    vegetation?.seed,
-    vegetation?.density,
-    vegetation?.patternScale,
-    vegetation?.swirlStrength,
-    vegetation?.terrainFollowing,
-    vegetation?.strokeLength,
-    vegetation?.strokeThickness,
-    vegetation?.motifDensity,
-    vegetation?.motifSize,
-    vegetation?.wetlandShrubDensity,
-    vegetation?.wetlandImagePropDrynessBias,
+    water: waterGeometryStageKey(options),
+    preset: vegetation?.preset,
+    seed: vegetation?.seed,
+    density: vegetation?.density,
+    patternScale: vegetation?.patternScale,
+    swirlStrength: vegetation?.swirlStrength,
+    terrainFollowing: vegetation?.terrainFollowing,
+    strokeLength: vegetation?.strokeLength,
+    strokeThickness: vegetation?.strokeThickness,
+    motifDensity: vegetation?.motifDensity,
+    motifSize: vegetation?.motifSize,
+    wetlandShrubDensity: vegetation?.wetlandShrubDensity,
+    wetlandImagePropDrynessBias: vegetation?.wetlandImagePropDrynessBias,
     // Dunes replace sand-desert flow lines, so toggling them changes seeding.
-    vegetation?.desertDunes,
+    desertDunes: vegetation?.desertDunes,
     // Silt edges are inked as grass borders.
-    options.siltReachM,
-    options.siltTopRemoved,
-    vegetationMotifAssetSignature(vegetation?.motifAssets),
-    vegetationRasterPropAssetSignature(vegetation?.rasterPropAssets),
+    siltReachM: options.siltReachM,
+    siltTopRemoved: options.siltTopRemoved,
+    motifAssets: vegetationMotifAssetSignature(vegetation?.motifAssets),
+    rasterPropAssets: vegetationRasterPropAssetSignature(vegetation?.rasterPropAssets),
     // Biome colours only repaint, unless they change which biomes share a stand.
-    rasterPropBiomeSettingsWithoutColors(vegetation?.rasterPropBiomeSettings),
-    propStandColorPartition(vegetation),
-    vegetation?.rasterPropDensity,
-    vegetation?.mountainBoulderDensity,
-    vegetation?.mountainBoulderSize,
-    vegetation?.rasterPropCellSize,
-    vegetation?.rasterPropScale,
-    vegetation?.rasterPropClustering,
-    vegetation?.rasterPropStandSize,
-    vegetation?.rasterPropPlacementNoiseScale,
-    vegetation?.coordinateOffsetX,
-    vegetation?.coordinateOffsetY,
-    vegetation?.coordinateStride,
-    vegetation?.coordinateHeight,
-    vegetation?.coordinateSourceWidth,
-    vegetation?.coordinateSourceHeight,
-    vegetation?.coordinatePatternScale,
+    rasterPropBiomeSettings: rasterPropBiomeSettingsWithoutColors(vegetation?.rasterPropBiomeSettings),
+    propStandColorPartition: propStandColorPartition(vegetation),
+    rasterPropDensity: vegetation?.rasterPropDensity,
+    mountainBoulderDensity: vegetation?.mountainBoulderDensity,
+    mountainBoulderSize: vegetation?.mountainBoulderSize,
+    rasterPropCellSize: vegetation?.rasterPropCellSize,
+    rasterPropScale: vegetation?.rasterPropScale,
+    rasterPropClustering: vegetation?.rasterPropClustering,
+    rasterPropStandSize: vegetation?.rasterPropStandSize,
+    rasterPropPlacementNoiseScale: vegetation?.rasterPropPlacementNoiseScale,
+    coordinateOffsetX: vegetation?.coordinateOffsetX,
+    coordinateOffsetY: vegetation?.coordinateOffsetY,
+    coordinateStride: vegetation?.coordinateStride,
+    coordinateHeight: vegetation?.coordinateHeight,
+    coordinateSourceWidth: vegetation?.coordinateSourceWidth,
+    coordinateSourceHeight: vegetation?.coordinateSourceHeight,
+    coordinatePatternScale: vegetation?.coordinatePatternScale,
     // Forest stand placement lives in the geometry; its paint settings only
     // affect the overlay stage.
-    vegetation?.forestSettings?.seed,
-    vegetation?.forestSettings?.standAccentTrees,
-    vegetation?.forestSettings?.standJoin,
-    vegetation?.forestSettings?.biomeBlend,
-    vegetation?.forestSettings?.inkFillDensity,
-    vegetation?.forestSettings?.inkEdgeDensity,
-    vegetation?.forestSettings?.inkEdgeRows,
-    vegetation?.forestSettings?.inkEdgeDepth,
-    vegetation?.forestSettings?.inkMeadowTrees,
-    vegetation?.forestSettings?.inkGrass,
-    vegetation?.forestSettings?.inkLight,
+    forestSeed: vegetation?.forestSettings?.seed,
+    standAccentTrees: vegetation?.forestSettings?.standAccentTrees,
+    standJoin: vegetation?.forestSettings?.standJoin,
+    biomeBlend: vegetation?.forestSettings?.biomeBlend,
+    inkFillDensity: vegetation?.forestSettings?.inkFillDensity,
+    inkEdgeDensity: vegetation?.forestSettings?.inkEdgeDensity,
+    inkEdgeRows: vegetation?.forestSettings?.inkEdgeRows,
+    inkEdgeDepth: vegetation?.forestSettings?.inkEdgeDepth,
+    inkMeadowTrees: vegetation?.forestSettings?.inkMeadowTrees,
+    inkGrass: vegetation?.forestSettings?.inkGrass,
+    inkLight: vegetation?.forestSettings?.inkLight,
     // The debug view keeps each stand's plants and raw area in the geometry.
-    vegetation?.forestSettings?.showStandDebug,
+    showStandDebug: vegetation?.forestSettings?.showStandDebug,
+  };
+}
+
+/** Geometry fields only the flow lines and their motifs read. */
+const FLOW_ONLY_GEOMETRY_FIELDS: ReadonlySet<string> = new Set([
+  "preset", "density", "swirlStrength", "terrainFollowing", "strokeLength",
+  "motifDensity", "motifSize", "desertDunes", "motifAssets",
+]);
+
+/**
+ * Geometry fields only the props read. The flow half still reads each grass
+ * biome's stand density (which side draws a border), keyed in
+ * `vegetationFlowGeometryStageKey` instead.
+ */
+const PROP_ONLY_GEOMETRY_FIELDS: ReadonlySet<string> = new Set([
+  "wetlandShrubDensity", "rasterPropAssets", "rasterPropBiomeSettings",
+  "propStandColorPartition", "rasterPropDensity", "mountainBoulderDensity",
+  "mountainBoulderSize", "rasterPropCellSize", "rasterPropScale",
+  "rasterPropClustering", "rasterPropStandSize", "rasterPropPlacementNoiseScale",
+  "forestSeed", "standAccentTrees", "standJoin", "biomeBlend", "inkFillDensity",
+  "inkEdgeDensity", "inkEdgeRows", "inkEdgeDepth", "inkMeadowTrees", "inkGrass",
+  "inkLight", "showStandDebug",
+]);
+
+function stageFieldValues(fields: Record<string, unknown>, omit?: ReadonlySet<string>): unknown[] {
+  return Object.entries(fields)
+    .filter(([name]) => !omit?.has(name))
+    .map(([, value]) => value);
+}
+
+export function vegetationGeometryStageKey(options: MountainRenderOptions): string {
+  return JSON.stringify(stageFieldValues(vegetationGeometryStageFields(options)));
+}
+
+/** Key of the flow half of the vegetation geometry. */
+export function vegetationFlowGeometryStageKey(options: MountainRenderOptions): string {
+  // Between two grass biomes the more open one draws the border (ties: the
+  // lower id; see traceGrassBiomeBorders). The flow lines only compare the
+  // grass biomes' tree and shrub densities, so they key on their ranking:
+  // a density edit that keeps the order keeps every flow line.
+  const ranked = [...GRASS_GROUND_BIOME_IDS].map((biomeId) => {
+    const settings = rasterPropSettingsForBiome(options.vegetation, biomeId);
+    return { biomeId, density: settings.treeDensity + settings.shrubDensity };
+  }).sort((a, b) => a.density - b.density || a.biomeId - b.biomeId);
+  const borderOrder = ranked.map((entry, index) =>
+    index > 0 && entry.density === ranked[index - 1].density ? `=${entry.biomeId}` : `${entry.biomeId}`);
+  return JSON.stringify([
+    stageFieldValues(vegetationGeometryStageFields(options), PROP_ONLY_GEOMETRY_FIELDS),
+    borderOrder,
   ]);
 }
+
+/** Key of the prop half (placements and stands) of the vegetation geometry. */
+export function vegetationPropsGeometryStageKey(options: MountainRenderOptions): string {
+  return JSON.stringify(stageFieldValues(vegetationGeometryStageFields(options), FLOW_ONLY_GEOMETRY_FIELDS));
+}
+
+function vegetationOverlayStageFields(options: MountainRenderOptions): Record<string, unknown> {
+  const vegetation = options.vegetation;
+  return {
+    sunAzimuthDeg: options.sunAzimuthDeg,
+    strokeThickness: vegetation?.strokeThickness,
+    strokeOpacity: vegetation?.strokeOpacity,
+    drySkipProbability: vegetation?.drySkipProbability,
+    lineInterruptionProbability: vegetation?.lineInterruptionProbability,
+    flowWashNoiseScale: vegetation?.flowWashNoiseScale,
+    wetlandDryDistanceStart: vegetation?.wetlandDryDistanceStart,
+    wetlandDryDistanceEnd: vegetation?.wetlandDryDistanceEnd,
+    wetlandDryNoiseScale: vegetation?.wetlandDryNoiseScale,
+    wetlandDryNoiseStrength: vegetation?.wetlandDryNoiseStrength,
+    showFlowGuides: vegetation?.showFlowGuides,
+    motifShadowStrength: vegetation?.motifShadowStrength,
+    motifShadowDistance: vegetation?.motifShadowDistance,
+    motifShadowSoftness: vegetation?.motifShadowSoftness,
+    washShadowStrength: vegetation?.washShadowStrength,
+    washShadowDistance: vegetation?.washShadowDistance,
+    washShadowGap: vegetation?.washShadowGap,
+    washShadowGrain: vegetation?.washShadowGrain,
+    forestSettings: forestRenderSettingsSignature(vegetation?.forestSettings),
+    rasterPropBiomeSettings: vegetation?.rasterPropBiomeSettings,
+    forestRenderScale: vegetation?.forestRenderScale,
+    motifAssets: vegetationMotifAssetSignature(vegetation?.motifAssets),
+    rasterPropAssets: vegetationRasterPropAssetSignature(vegetation?.rasterPropAssets),
+    desertDunes: desertDuneSignature(resolveDesertDuneOptions(vegetation)),
+    aridInkColor: vegetation?.aridInkColor,
+    desertSpotColor: vegetation?.desertSpotColor,
+  };
+}
+
+/** Overlay fields only the flow ink, wash, shadows and guides read. */
+const FLOW_ONLY_OVERLAY_FIELDS: ReadonlySet<string> = new Set([
+  "drySkipProbability", "flowWashNoiseScale", "wetlandDryDistanceStart",
+  "wetlandDryDistanceEnd", "wetlandDryNoiseScale", "wetlandDryNoiseStrength",
+  "showFlowGuides", "motifShadowStrength", "washShadowStrength",
+  "washShadowDistance", "washShadowGap", "washShadowGrain", "motifAssets",
+  "desertDunes", "aridInkColor", "desertSpotColor",
+]);
+
+/** Overlay fields only the prop layers read. */
+const PROP_ONLY_OVERLAY_FIELDS: ReadonlySet<string> = new Set([
+  "forestSettings", "rasterPropBiomeSettings", "forestRenderScale", "rasterPropAssets",
+]);
 
 export function vegetationOverlayStageKey(
   options: MountainRenderOptions,
   geometryKey: string,
 ): string {
-  const vegetation = options.vegetation;
+  return JSON.stringify([geometryKey, ...stageFieldValues(vegetationOverlayStageFields(options))]);
+}
+
+/** Key of the flow half of the vegetation overlay. */
+export function vegetationFlowOverlayStageKey(options: MountainRenderOptions): string {
   return JSON.stringify([
-    geometryKey,
-    options.sunAzimuthDeg,
-    vegetation?.strokeThickness,
-    vegetation?.strokeOpacity,
-    vegetation?.drySkipProbability,
-    vegetation?.lineInterruptionProbability,
-    vegetation?.flowWashNoiseScale,
-    vegetation?.wetlandDryDistanceStart,
-    vegetation?.wetlandDryDistanceEnd,
-    vegetation?.wetlandDryNoiseScale,
-    vegetation?.wetlandDryNoiseStrength,
-    vegetation?.showFlowGuides,
-    vegetation?.motifShadowStrength,
-    vegetation?.motifShadowDistance,
-    vegetation?.motifShadowSoftness,
-    vegetation?.washShadowStrength,
-    vegetation?.washShadowDistance,
-    vegetation?.washShadowGap,
-    vegetation?.washShadowGrain,
-    forestRenderSettingsSignature(vegetation?.forestSettings),
-    vegetation?.rasterPropBiomeSettings,
-    vegetation?.forestRenderScale,
-    vegetationMotifAssetSignature(vegetation?.motifAssets),
-    vegetationRasterPropAssetSignature(vegetation?.rasterPropAssets),
-    desertDuneSignature(resolveDesertDuneOptions(vegetation)),
-    vegetation?.aridInkColor,
-    vegetation?.desertSpotColor,
+    vegetationFlowGeometryStageKey(options),
+    stageFieldValues(vegetationOverlayStageFields(options), PROP_ONLY_OVERLAY_FIELDS),
+  ]);
+}
+
+/** Key of the prop half of the vegetation overlay. */
+export function vegetationPropsOverlayStageKey(options: MountainRenderOptions): string {
+  return JSON.stringify([
+    vegetationPropsGeometryStageKey(options),
+    stageFieldValues(vegetationOverlayStageFields(options), FLOW_ONLY_OVERLAY_FIELDS),
   ]);
 }
 
@@ -623,6 +734,7 @@ export function buildMountainWaterStageInputs(
     options.showRivers || hasOcean || hasWetland
   ) && (!isPureHeightmapLayer || options.showHeightmapWater === true);
   const waterOptions: WaterRendererOptions = {
+    gpuWaves: options.gpuRenderMode !== 'cpuExact',
     riverThresholdKm2: options.riverThresholdKm2,
     useEcologicalBiomeWater: true,
     fillSmoothing: options.waterFillSmoothing,
@@ -730,8 +842,6 @@ function createForegroundPropRGBA(
   terrainShade?: Float32Array,
   roadLayer?: RoadLayer | null,
   roadShade?: Float32Array,
-  /** Painted water (0..255) per pixel: the stand's trees stay off it. */
-  standWaterCut?: Uint8Array,
 ): Uint8ClampedArray | undefined {
   const rasterPixels = overlay?.rasterPropRGBA;
   const charcoalAlpha = overlay?.rasterPropCharcoalAlpha;
@@ -740,13 +850,6 @@ function createForegroundPropRGBA(
   const foreground = new Uint8ClampedArray(total * 4);
   if (rasterPixels) foreground.set(rasterPixels);
   const standShare = overlay?.rasterPropStandShare;
-  if (rasterPixels && standShare && standWaterCut?.length === total) {
-    for (let index = 0; index < total; index++) {
-      const water = standWaterCut[index];
-      if (water === 0 || standShare[index] === 0) continue;
-      foreground[index * 4 + 3] *= 1 - (standShare[index] / 255) * (water / 255);
-    }
-  }
   if (rasterPixels && terrainShade) {
     for (let index = 0; index < total; index++) {
       // Forest stands are lit per tree already; only the rest is shaded.
@@ -868,7 +971,7 @@ const MOUNTAIN_BIOME_WASH_COLORS: Readonly<Record<number, RGB>> =
     {},
   );
 
-function resolveMountainBiomeWashColors(
+export function resolveMountainBiomeWashColors(
   overrides?: Readonly<Record<number, string>>,
 ): Readonly<Record<number, RGB>> {
   if (!overrides) return MOUNTAIN_BIOME_WASH_COLORS;
@@ -903,6 +1006,19 @@ interface VegetationWashSample {
 
 interface VegetationWashField {
   sample(index: number): VegetationWashSample;
+  /** The blurred colour grid `sample` interpolates, for the GPU compositor. */
+  grid: VegetationWashGrid;
+}
+
+export interface VegetationWashGrid {
+  /** Blurred colour per grid cell (RGB), alpha 255 where `sample` returns the plain biome colour. */
+  rgba: Uint8Array;
+  width: number;
+  height: number;
+  stride: number;
+  startX: number;
+  startY: number;
+  radiusM: number;
 }
 
 function summedAreaTable(values: Uint32Array, width: number, height: number): void {
@@ -949,42 +1065,109 @@ function createVegetationWashField(
 ): VegetationWashField {
   const noiseScaleM = dem.biomeEdgeNoiseScaleM ?? DEFAULT_BIOME_EDGE_NOISE_SCALE_M;
   const radiusM = Math.max(0, noiseScaleM * 0.25 * transitionStrength);
-  const maxGridCells = 1_000_000;
-  const stride = Math.max(1, Math.ceil(Math.sqrt((coordinateDomainWidth * coordinateDomainHeight) / maxGridCells)));
+  const stride = vegetationWashGridStride(coordinateDomainWidth, coordinateDomainHeight);
   const gridStartX = Math.floor(offsetX / stride);
   const gridStartY = Math.floor(offsetY / stride);
-  const gridWidth = Math.max(1, Math.ceil((offsetX + dem.width) / stride) - gridStartX);
-  const gridHeight = Math.max(1, Math.ceil((offsetY + dem.height) / stride) - gridStartY);
-  const gridSize = gridWidth * gridHeight;
-  const red = new Uint32Array(gridSize);
-  const green = new Uint32Array(gridSize);
-  const blue = new Uint32Array(gridSize);
-  const count = new Uint32Array(gridSize);
-  const barrier = new Uint32Array(gridSize);
-
+  const cells = createVegetationWashCells(
+    stride,
+    gridStartX,
+    gridStartY,
+    Math.max(1, Math.ceil((offsetX + dem.width) / stride) - gridStartX),
+    Math.max(1, Math.ceil((offsetY + dem.height) / stride) - gridStartY),
+  );
   for (let y = 0; y < dem.height; y++) {
-    const globalY = offsetY + y;
-    const gridY = Math.floor(globalY / stride) - gridStartY;
     for (let x = 0; x < dem.width; x++) {
       const index = y * dem.width + x;
-      const biome = dem.biomeType[index];
-      const gridX = Math.floor((offsetX + x) / stride) - gridStartX;
-      const gridIndex = gridY * gridWidth + gridX;
-      if (
-        biome === 0 || biome === 6 || biome === 8 ||
-        dem.isOcean[index] || dem.isRiverChannel[index]
-      ) {
-        barrier[gridIndex] = 1;
-        continue;
-      }
-      const color = getVegetationWashRGB(biome, colors);
-      red[gridIndex] += color[0];
-      green[gridIndex] += color[1];
-      blue[gridIndex] += color[2];
-      count[gridIndex]++;
+      addVegetationWashPixel(
+        cells, colors, offsetX + x, offsetY + y,
+        dem.biomeType[index], Boolean(dem.isOcean[index]), Boolean(dem.isRiverChannel[index]),
+      );
     }
   }
+  const grid = finishVegetationWashGrid(cells, radiusM, noiseScaleM, dem.dxMeters, dem.dyMeters);
+  return vegetationWashFieldFromGrid(dem, colors, offsetX, offsetY, grid);
+}
 
+/** Output pixels per wash grid cell side for an output (texture domain) size. */
+export function vegetationWashGridStride(domainWidth: number, domainHeight: number): number {
+  const maxGridCells = 1_000_000;
+  return Math.max(1, Math.ceil(Math.sqrt((domainWidth * domainHeight) / maxGridCells)));
+}
+
+/** Per-cell colour sums and barrier flags the biome wash grid is built from. */
+export interface VegetationWashCells {
+  width: number;
+  height: number;
+  stride: number;
+  startX: number;
+  startY: number;
+  red: Uint32Array;
+  green: Uint32Array;
+  blue: Uint32Array;
+  count: Uint32Array;
+  barrier: Uint32Array;
+}
+
+export function createVegetationWashCells(
+  stride: number,
+  startX: number,
+  startY: number,
+  width: number,
+  height: number,
+): VegetationWashCells {
+  const size = width * height;
+  return {
+    width, height, stride, startX, startY,
+    red: new Uint32Array(size),
+    green: new Uint32Array(size),
+    blue: new Uint32Array(size),
+    count: new Uint32Array(size),
+    barrier: new Uint32Array(size),
+  };
+}
+
+/**
+ * Adds one pixel, at global output coordinates, to its cell: snow, ocean,
+ * rivers and river biome are barriers; any other biome adds its wash colour.
+ */
+export function addVegetationWashPixel(
+  cells: VegetationWashCells,
+  colors: Readonly<Record<number, RGB>>,
+  globalX: number,
+  globalY: number,
+  biome: number,
+  ocean: boolean,
+  river: boolean,
+): void {
+  const gridIndex = (Math.floor(globalY / cells.stride) - cells.startY) * cells.width
+    + Math.floor(globalX / cells.stride) - cells.startX;
+  if (biome === 0 || biome === 6 || biome === 8 || ocean || river) {
+    cells.barrier[gridIndex] = 1;
+    return;
+  }
+  const color = getVegetationWashRGB(biome, colors);
+  cells.red[gridIndex] += color[0];
+  cells.green[gridIndex] += color[1];
+  cells.blue[gridIndex] += color[2];
+  cells.count[gridIndex]++;
+}
+
+/**
+ * Builds a broad, noise-distorted land-color blend from the cells. A compact
+ * summed-area field keeps the work linear in map size, while the barrier
+ * mask prevents colors from blending across snow, ocean, and routed channels.
+ * The cells' sums are consumed.
+ */
+export function finishVegetationWashGrid(
+  cells: VegetationWashCells,
+  radiusM: number,
+  noiseScaleM: number,
+  dxMeters: number,
+  dyMeters: number,
+): VegetationWashGrid {
+  const { width: gridWidth, height: gridHeight, stride, startX: gridStartX, startY: gridStartY } = cells;
+  const { red, green, blue, count, barrier } = cells;
+  const gridSize = gridWidth * gridHeight;
   const sourceRGB = new Uint8ClampedArray(gridSize * 3);
   for (let index = 0; index < gridSize; index++) {
     const validCount = count[index];
@@ -1007,16 +1190,16 @@ function createVegetationWashField(
   summedAreaTable(barrier, gridWidth, gridHeight);
 
   const blurredRGB = new Uint8ClampedArray(gridSize * 3);
-  const baseRadiusX = radiusM / Math.max(1, dem.dxMeters);
-  const baseRadiusY = radiusM / Math.max(1, dem.dyMeters);
+  const baseRadiusX = radiusM / Math.max(1, dxMeters);
+  const baseRadiusY = radiusM / Math.max(1, dyMeters);
   for (let gridY = 0; gridY < gridHeight; gridY++) {
     const globalY = (gridStartY + gridY) * stride + (stride - 1) * 0.5;
     for (let gridX = 0; gridX < gridWidth; gridX++) {
       const index = gridY * gridWidth + gridX;
       const globalX = (gridStartX + gridX) * stride + (stride - 1) * 0.5;
-      const variation = 1 + biomeEdgeNoise(globalX * dem.dxMeters, globalY * dem.dyMeters, noiseScaleM) * 0.28;
-      const worldX = globalX * dem.dxMeters;
-      const worldY = globalY * dem.dyMeters;
+      const variation = 1 + biomeEdgeNoise(globalX * dxMeters, globalY * dyMeters, noiseScaleM) * 0.28;
+      const worldX = globalX * dxMeters;
+      const worldY = globalY * dyMeters;
       const warp = (seed: number): number => biomeEdgeNoise(worldX, worldY, noiseScaleM, seed);
       const warpX = warp(613) * baseRadiusX;
       const warpY = warp(1297) * baseRadiusY;
@@ -1053,7 +1236,67 @@ function createVegetationWashField(
     }
   }
 
+  // Per cell: the blurred colour, and whether a barrier lies in the 2 x 2
+  // cells `sample` interpolates from there (it then keeps the biome colour).
+  const gridRGBA = new Uint8Array(gridSize * 4);
+  for (let gridY = 0; gridY < gridHeight; gridY++) {
+    const maxY = Math.min(gridHeight - 1, gridY + 1);
+    for (let gridX = 0; gridX < gridWidth; gridX++) {
+      const index = gridY * gridWidth + gridX;
+      gridRGBA[index * 4] = blurredRGB[index * 3];
+      gridRGBA[index * 4 + 1] = blurredRGB[index * 3 + 1];
+      gridRGBA[index * 4 + 2] = blurredRGB[index * 3 + 2];
+      const maxX = Math.min(gridWidth - 1, gridX + 1);
+      gridRGBA[index * 4 + 3] = summedAreaRect(barrier, gridWidth, gridX, gridY, maxX, maxY) > 0 ? 255 : 0;
+    }
+  }
   return {
+    rgba: gridRGBA,
+    width: gridWidth,
+    height: gridHeight,
+    stride,
+    startX: gridStartX,
+    startY: gridStartY,
+    radiusM,
+  };
+}
+
+/**
+ * The cells of `grid` covering global output pixels [x0, x1) x [y0, y1),
+ * plus the next cell each way that bilinear sampling reads.
+ */
+export function cropVegetationWashGrid(
+  grid: VegetationWashGrid,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+): VegetationWashGrid {
+  const startX = Math.max(grid.startX, Math.floor(x0 / grid.stride));
+  const startY = Math.max(grid.startY, Math.floor(y0 / grid.stride));
+  const endX = Math.min(grid.startX + grid.width, Math.ceil(x1 / grid.stride) + 1);
+  const endY = Math.min(grid.startY + grid.height, Math.ceil(y1 / grid.stride) + 1);
+  const width = Math.max(1, endX - startX);
+  const height = Math.max(1, endY - startY);
+  const rgba = new Uint8Array(width * height * 4);
+  for (let row = 0; row < height; row++) {
+    const source = ((startY - grid.startY + row) * grid.width + startX - grid.startX) * 4;
+    rgba.set(grid.rgba.subarray(source, source + width * 4), row * width * 4);
+  }
+  return { ...grid, rgba, width, height, startX, startY };
+}
+
+/** The wash field `sample` over a built grid (see finishVegetationWashGrid). */
+function vegetationWashFieldFromGrid(
+  dem: MountainDEMData,
+  colors: Readonly<Record<number, RGB>>,
+  offsetX: number,
+  offsetY: number,
+  grid: VegetationWashGrid,
+): VegetationWashField {
+  const { rgba, width: gridWidth, height: gridHeight, stride, startX: gridStartX, startY: gridStartY, radiusM } = grid;
+  return {
+    grid,
     sample(index: number): VegetationWashSample {
       const biome = dem.biomeType[index];
       const center = getVegetationWashRGB(biome, colors);
@@ -1067,12 +1310,11 @@ function createVegetationWashField(
       const globalX = offsetX + x;
       const globalY = offsetY + y;
       // Kernels already shrink around barriers. Only protect the interpolation
-      // footprint here; a distant river must not disable the entire transition.
+      // footprint here (the cell's 2 x 2 barrier flag); a distant river must
+      // not disable the entire transition.
       const minX = Math.max(0, Math.floor(globalX / stride) - gridStartX);
-      const maxX = Math.min(gridWidth - 1, minX + 1);
       const minY = Math.max(0, Math.floor(globalY / stride) - gridStartY);
-      const maxY = Math.min(gridHeight - 1, minY + 1);
-      if (summedAreaRect(barrier, gridWidth, minX, minY, maxX, maxY) > 0) {
+      if (rgba[(minY * gridWidth + minX) * 4 + 3] > 0) {
         return { color: center, transition: 0 };
       }
 
@@ -1084,13 +1326,13 @@ function createVegetationWashField(
       const y1 = Math.min(gridHeight - 1, y0 + 1);
       const tx = sampleX - x0;
       const ty = sampleY - y0;
-      const topLeft = (y0 * gridWidth + x0) * 3;
-      const topRight = (y0 * gridWidth + x1) * 3;
-      const bottomLeft = (y1 * gridWidth + x0) * 3;
-      const bottomRight = (y1 * gridWidth + x1) * 3;
+      const topLeft = (y0 * gridWidth + x0) * 4;
+      const topRight = (y0 * gridWidth + x1) * 4;
+      const bottomLeft = (y1 * gridWidth + x0) * 4;
+      const bottomRight = (y1 * gridWidth + x1) * 4;
       const sampleChannel = (channel: number): number => {
-        const top = blurredRGB[topLeft + channel] * (1 - tx) + blurredRGB[topRight + channel] * tx;
-        const bottom = blurredRGB[bottomLeft + channel] * (1 - tx) + blurredRGB[bottomRight + channel] * tx;
+        const top = rgba[topLeft + channel] * (1 - tx) + rgba[topRight + channel] * tx;
+        const bottom = rgba[bottomLeft + channel] * (1 - tx) + rgba[bottomRight + channel] * tx;
         return top * (1 - ty) + bottom * ty;
       };
       const color: RGB = [sampleChannel(0), sampleChannel(1), sampleChannel(2)];
@@ -1102,6 +1344,41 @@ function createVegetationWashField(
       return { color, transition: Math.min(1, difference / 36) };
     },
   };
+}
+
+/**
+ * The silt crease ink the CPU compositor blends per pixel (coverage, pen
+ * opacity and water already applied), for the GPU compositor. Silt is
+ * sparse, so this stays cheap.
+ */
+function buildSiltCreaseLayer(
+  dem: MountainDEMData,
+  waterOverlay: WaterOverlay,
+  siltLayers: number,
+  opacity: number,
+  style: RiverSiltLineStyle,
+  offsetX: number,
+  offsetY: number,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+): Float32Array {
+  const { width, height } = dem;
+  const crease = new Float32Array(width * height);
+  const depth = dem.siltDepth!;
+  const creaseDepth = dem.siltCreaseDepth!;
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const i = y * width + x;
+      const coverage = riverSiltCoverage(depth[i], siltLayers);
+      if (!(coverage > 0)) continue;
+      const waterCover = waterOverlay.waterAlpha[i] / 255;
+      crease[i] = riverSiltCreaseAlpha(creaseDepth, width, height, x, y, offsetX, offsetY, style)
+        * coverage * opacity * (1 - waterCover);
+    }
+  }
+  return crease;
 }
 
 function blendContourColor(base: number, contour: number, alpha: number): number {
@@ -1521,6 +1798,26 @@ export function validateMountainRenderStageCache(
   cache.contourElevation = undefined;
 }
 
+/**
+ * Mean shade of flat dry land (slope under 3 degrees, not ocean), the level
+ * terrain darkness is measured from. Over a whole map it is the same for
+ * every part of it; over one tile's frame it would vary from tile to tile.
+ */
+export function terrainFlatShade(
+  dem: Pick<MountainDEMData, 'slopeDeg' | 'isOcean' | 'hillshade' | 'ambientOcclusion'>,
+  hillshadeStrength: number,
+  aoStrength: number,
+): number {
+  let flatSum = 0;
+  let flatCount = 0;
+  for (let i = 0; i < dem.hillshade.length; i++) {
+    if (dem.slopeDeg[i] >= 3 || dem.isOcean?.[i] === 1) continue;
+    flatSum += 1 - hillshadeStrength * (1 - dem.hillshade[i] * (1.0 - aoStrength + aoStrength * dem.ambientOcclusion[i]));
+    flatCount++;
+  }
+  return flatCount > 0 ? flatSum / flatCount : 1 - hillshadeStrength * 0.3;
+}
+
 /** Whether the detail compositor will consume the mountain illustration stage. */
 export function needsMountainIllustrationStage(
   options: MountainRenderOptions,
@@ -1771,6 +2068,7 @@ function renderMountainIllustrationStageFromInputsInternal(
           preparedFields: preparedFieldSetMatches(inputs, prepared)
             ? prepared!.fields
             : undefined,
+          gpuShading: inputs.options.gpuRenderMode !== 'cpuExact',
         },
         profiler,
         inputs.fieldCache,
@@ -1791,6 +2089,7 @@ function renderMountainIllustrationStageFromInputsInternal(
           preparedFields: preparedFieldSetMatches(inputs, prepared)
             ? prepared!.fields
             : undefined,
+          gpuShading: inputs.options.gpuRenderMode !== 'cpuExact',
         },
         profiler,
         inputs.fieldCache,
@@ -1953,17 +2252,33 @@ export function renderMountainDetailDEMWithCache(
   const siltColor = getVegetationWashRGB(9, vegetationBiomeColors);
   const siltLayers = options.siltLayers ?? DEFAULT_SILT_LAYERS;
   const vegetationBiomeTransitionStrength = Math.max(0, options.vegetationBiomeTransitionStrength ?? 1);
-  const vegetationWashField = layer === 'vegetation_patterns'
-    ? createVegetationWashField(
-        dem,
-        vegetationBiomeColors,
-        vegetationBiomeTransitionStrength,
-        Math.floor(options.textureCoordinateOffsetX ?? 0),
-        Math.floor(options.textureCoordinateOffsetY ?? 0),
-        Math.max(1, Math.floor(options.textureCoordinateDomainWidth ?? dem.width)),
-        Math.max(1, Math.floor(options.textureCoordinateDomainHeight ?? dem.height)),
-      )
-    : undefined;
+  let vegetationWashField: VegetationWashField | undefined;
+  if (layer === 'vegetation_patterns') {
+    const washArguments = [
+      Math.floor(options.textureCoordinateOffsetX ?? 0),
+      Math.floor(options.textureCoordinateOffsetY ?? 0),
+      Math.max(1, Math.floor(options.textureCoordinateDomainWidth ?? dem.width)),
+      Math.max(1, Math.floor(options.textureCoordinateDomainHeight ?? dem.height)),
+    ] as const;
+    // Only the DEM and the wash colours shape it: vegetation edits reuse it.
+    const washKey = JSON.stringify([vegetationBiomeColors, vegetationBiomeTransitionStrength, washArguments]);
+    const canReuseWash = Boolean(
+      cache?.vegetationWashField && cache.vegetationWashFieldDem === dem && cache.vegetationWashFieldKey === washKey,
+    );
+    profiler?.recordCache('vegetation wash field', canReuseWash);
+    const washStop = profiler?.begin('vegetation wash field');
+    vegetationWashField = options.vegetationWashGridOverride
+      ? vegetationWashFieldFromGrid(dem, vegetationBiomeColors, washArguments[0], washArguments[1], options.vegetationWashGridOverride)
+      : canReuseWash
+        ? cache!.vegetationWashField
+        : createVegetationWashField(dem, vegetationBiomeColors, vegetationBiomeTransitionStrength, ...washArguments);
+    washStop?.();
+    if (cache && !canReuseWash && !options.vegetationWashGridOverride) {
+      cache.vegetationWashField = vegetationWashField;
+      cache.vegetationWashFieldDem = dem;
+      cache.vegetationWashFieldKey = washKey;
+    }
+  }
   const waterShallowColor = parseHexColor(
     options.waterShallowColor,
     DEFAULT_WATER_SHALLOW_RGB,
@@ -2215,11 +2530,6 @@ export function renderMountainDetailDEMWithCache(
   const standWash = vegetationOverlay?.rasterPropStandWash?.length === totalCells * 4
     ? vegetationOverlay.rasterPropStandWash
     : undefined;
-  // Painted water per pixel, for the camera's foreground stand trees.
-  const standWaterCut = options.fullTerrainCameraElevationDeg !== undefined
-    && vegetationOverlay?.rasterPropStandShare?.length === totalCells
-    ? new Uint8Array(totalCells)
-    : undefined;
   const vegetationTransitionWashRGB =
     layer === 'vegetation_patterns' && mountainIllustrationRGBA
       ? new Uint8ClampedArray(totalCells * 3)
@@ -2241,30 +2551,10 @@ export function renderMountainDetailDEMWithCache(
     options.waterTerrainShadeStrength ?? 0.7,
   ));
   const needsPropShade = propTerrainShadeStrength > 0 && !!vegetationOverlay?.rasterPropRGBA;
-  let propTerrainShade: Float32Array | undefined;
-  let terrainDarkness: Float32Array | undefined;
   const hasRoads = !isPureHeightmapLayer && (options.structures?.roads.length ?? 0) > 0;
-  if (needsPropShade || waterTerrainShadeStrength > 0 || hasRoads) {
-    let flatSum = 0;
-    let flatCount = 0;
-    for (let i = 0; i < totalCells; i++) {
-      if (dem.slopeDeg[i] >= 3 || dem.isOcean?.[i] === 1) continue;
-      flatSum += 1 - hillshadeStrength * (1 - dem.hillshade[i] * (1.0 - aoStrength + aoStrength * dem.ambientOcclusion[i]));
-      flatCount++;
-    }
-    const flatShade = flatCount > 0 ? flatSum / flatCount : 1 - hillshadeStrength * 0.3;
-    terrainDarkness = new Float32Array(totalCells);
-    for (let i = 0; i < totalCells; i++) {
-      const terrainShade = 1 - hillshadeStrength * (1 - dem.hillshade[i] * (1.0 - aoStrength + aoStrength * dem.ambientOcclusion[i]));
-      terrainDarkness[i] = Math.max(0, Math.min(1, (flatShade - terrainShade) / Math.max(0.01, flatShade)));
-    }
-    if (needsPropShade) {
-      propTerrainShade = new Float32Array(totalCells);
-      for (let i = 0; i < totalCells; i++) {
-        propTerrainShade[i] = 1 - propTerrainShadeStrength * terrainDarkness[i];
-      }
-    }
-  }
+  const needsTerrainDarkness = needsPropShade || waterTerrainShadeStrength > 0 || hasRoads;
+  const flatShade = options.terrainFlatShadeOverride
+    ?? (needsTerrainDarkness ? terrainFlatShade(dem, hillshadeStrength, aoStrength) : 1 - hillshadeStrength * 0.3);
   const showWaterDetails = (options.showWaterDetails ?? true) &&
     options.showOceanDetails !== false;
   const siltLayerActive = layer === 'vegetation_patterns';
@@ -2285,6 +2575,11 @@ export function renderMountainDetailDEMWithCache(
     layers: siltLayers,
   };
   const siltLineOffsetX = options.textureCoordinateOffsetX ?? 0;
+  // The charcoal tooth of water marks follows the map, not the frame: export
+  // tiles and the preview grain the same pixel alike, whatever frame holds it.
+  const grainStride = Math.max(1, Math.floor(options.textureCoordinateDomainWidth ?? width));
+  const grainOffset = Math.floor(options.textureCoordinateOffsetY ?? 0) * grainStride
+    + Math.floor(options.textureCoordinateOffsetX ?? 0);
   const siltLineOffsetY = options.textureCoordinateOffsetY ?? 0;
   const roadLayer = !isPureHeightmapLayer && options.structures?.roads.length
     ? rasterizeRoadLayer(options.structures.roads, {
@@ -2297,6 +2592,151 @@ export function renderMountainDetailDEMWithCache(
       }, options.structures.style)
     : null;
   const roadsInForeground = options.fullTerrainCameraElevationDeg !== undefined;
+  const compositionWindow = options.compositionWindow;
+  const x0 = Math.max(0, Math.floor(compositionWindow?.x0 ?? 0));
+  const y0 = Math.max(0, Math.floor(compositionWindow?.y0 ?? 0));
+  const x1 = Math.min(width, Math.ceil(compositionWindow?.x1 ?? width));
+  const y1 = Math.min(height, Math.ceil(compositionWindow?.y1 ?? height));
+
+  // The vegetation layer composes on the GPU unless a diagnostic overlay
+  // or a road (kept on the CPU loop only) is on; null runs the CPU loop below.
+  const gpuPixels = layer === 'vegetation_patterns'
+    && (options.vegetation?.gpuFields ?? true)
+    && waterOverlay
+    && vegetationWashField
+    && !options.vegetation?.showWetlandDrynessOverlay
+    && !options.vegetation?.showAlpineTreeSuitabilityOverlay
+    && !(erosionOverlayOpacity > 0 && maxErosionDepthM > 0)
+    && !(rainOpacity > 0)
+    && !roadLayer
+    ? composeVegetationLayerGl({
+        width,
+        height,
+        window: { x0, y0, x1, y1 },
+        u8: {
+          biome: dem.biomeType,
+          ocean: dem.isOcean,
+          river: dem.isRiverChannel,
+          waterAlpha: waterOverlay.waterAlpha,
+          wetlandPriority: waterOverlay.wetlandPuddlePriorityAlpha,
+          waterTone: waterOverlay.waterTone,
+          waveShadow: waterOverlay.oceanWaveShadowAlpha,
+          waveLight: waterOverlay.oceanWaveLightAlpha,
+          turbulence: waterOverlay.oceanTurbulenceAlpha,
+          outlineBank: waterOverlay.outlineBankAlpha ?? waterOverlay.bankAlpha,
+          flowAlpha: waterOverlay.flowAlpha,
+          flowTone: waterOverlay.flowTone,
+          oceanFlowAlpha: waterOverlay.oceanFlowAlpha,
+          oceanFlowTone: waterOverlay.oceanFlowTone,
+          crest: waterOverlay.crestAlpha,
+          washShadow: vegetationOverlay?.washShadowAlpha,
+          flowGuide: vegetationOverlay?.flowGuideAlpha,
+          vegetationShadow: vegetationOverlay?.shadowAlpha,
+          vegetationAlpha: vegetationOverlay?.alpha,
+          standCover: vegetationOverlay?.rasterPropStandCover,
+          propShadow: vegetationOverlay?.rasterPropShadowAlpha,
+          standShare: vegetationOverlay?.rasterPropStandShare,
+          propCharcoal: vegetationOverlay?.rasterPropCharcoalAlpha,
+          mountainInk: mountainInkAlpha,
+        },
+        f32: {
+          normElev: dem.normalizedElevation,
+          hillshade: dem.hillshade,
+          ambientOcclusion: dem.ambientOcclusion,
+          slope: dem.slopeDeg,
+          tpi: dem.tpi,
+          insolation: dem.solarInsolation,
+          siltDepth: dem.siltDepth,
+          contourElevation: showContours ? contourElevation : undefined,
+          backgroundTone: vegetationOverlay?.backgroundTone,
+          backgroundNoise: vegetationOverlay?.backgroundNoise,
+          backgroundDryness: vegetationOverlay?.backgroundDryness,
+          siltCrease: siltLayerActive && dem.siltCreaseDepth && dem.siltDepth
+            ? buildSiltCreaseLayer(dem, waterOverlay, siltLayers, siltLineOpacity, siltLineStyle,
+                siltLineOffsetX, siltLineOffsetY, x0, y0, x1, y1)
+            : undefined,
+        },
+        rgba: {
+          prop: vegetationOverlay?.rasterPropRGBA,
+          standWash,
+          illustration: mountainIllustrationRGBA,
+          material: mountainMaterialRGBA,
+        },
+        washGrid: vegetationWashField.grid,
+        biomeColors: Float32Array.from({ length: 256 * 3 }, (_, index) =>
+          getVegetationWashRGB(Math.floor(index / 3), vegetationBiomeColors)[index % 3]),
+        textureOffset: [
+          Math.floor(options.textureCoordinateOffsetX ?? 0),
+          Math.floor(options.textureCoordinateOffsetY ?? 0),
+        ],
+        grainStride,
+        hillshadeStrength,
+        aoStrength,
+        flatShade,
+        hasTerrainDarkness: needsTerrainDarkness,
+        waterTerrainShadeStrength,
+        propTerrainShadeStrength,
+        hasPropTerrainShade: needsPropShade,
+        showWaterDetails,
+        silt: { color: siltColor, layers: siltLayers },
+        wash: {
+          flowStrength: options.vegetation?.flowWashStrength ?? 0.24,
+          darkStrength: Math.max(0, Math.min(1, options.vegetation?.flowWashDarkStrength ?? 0.22)),
+          lightStrength: Math.max(0, Math.min(1, options.vegetation?.flowWashLightStrength ?? 0.12)),
+          noiseStrength: options.vegetation?.flowWashNoiseStrength ?? 0.45,
+        },
+        dune: {
+          enabled: desertDuneOptions.enabled,
+          colorVariation: desertDuneOptions.colorVariation,
+          highlight: desertDuneOptions.highlight,
+          washShadow: desertDuneOptions.washShadow,
+          spot: desertSpotColor,
+        },
+        contours: {
+          show: showContours,
+          interval: contourInt,
+          thickness: contourThicknessM,
+          indexThickness: contourIndexThicknessM,
+          showIndex: showIndexContours,
+          indexEvery: contourIndexEvery,
+          opacity: contourOpacity,
+          color: contourColor,
+          indexColor: contourIndexColor,
+        },
+        colors: {
+          waterShallow: waterShallowColor,
+          waterDeep: waterDeepColor,
+          waterOutline: waterOutlineColor,
+          waterFlow: waterFlowColor,
+          vegetationInk: vegetationInkColor,
+          aridInk: aridInkColor,
+          propOutline: propOutlineColor,
+          flowGuide: vegetationFlowGuideColor,
+          meadow: getVegetationWashRGB(20, vegetationBiomeColors),
+          dry: getVegetationWashRGB(4, vegetationBiomeColors),
+        },
+        biomeTransitionStrength: vegetationBiomeTransitionStrength,
+        motifShadowStrength: options.vegetation?.motifShadowStrength ?? 0,
+      })
+    : null;
+  profiler?.recordMetric('final composition on GPU', gpuPixels ? 1 : 0, 'gpu');
+
+  let propTerrainShade: Float32Array | undefined;
+  let terrainDarkness: Float32Array | undefined;
+  // The CPU loop and the camera's foreground props read these per pixel.
+  if (needsTerrainDarkness && (!gpuPixels || options.fullTerrainCameraElevationDeg !== undefined)) {
+    terrainDarkness = new Float32Array(totalCells);
+    for (let i = 0; i < totalCells; i++) {
+      const terrainShade = 1 - hillshadeStrength * (1 - dem.hillshade[i] * (1.0 - aoStrength + aoStrength * dem.ambientOcclusion[i]));
+      terrainDarkness[i] = Math.max(0, Math.min(1, (flatShade - terrainShade) / Math.max(0.01, flatShade)));
+    }
+    if (needsPropShade) {
+      propTerrainShade = new Float32Array(totalCells);
+      for (let i = 0; i < totalCells; i++) {
+        propTerrainShade[i] = 1 - propTerrainShadeStrength * terrainDarkness[i];
+      }
+    }
+  }
   // Roads take the terrain's hillshade like the props standing beside them:
   // shadow-side slopes darken the ink, bridge decks and fills.
   let roadShade: Float32Array | undefined;
@@ -2306,12 +2746,10 @@ export function renderMountainDetailDEMWithCache(
       roadShade[index] = 1 - propTerrainShadeStrength * terrainDarkness[index];
     }
   }
-  const compositionWindow = options.compositionWindow;
-  const x0 = Math.max(0, Math.floor(compositionWindow?.x0 ?? 0));
-  const y0 = Math.max(0, Math.floor(compositionWindow?.y0 ?? 0));
-  const x1 = Math.min(width, Math.ceil(compositionWindow?.x1 ?? width));
-  const y1 = Math.min(height, Math.ceil(compositionWindow?.y1 ?? height));
-  for (let y = y0; y < y1; y++) for (let i = y * width + x0; i < y * width + x1; i++) {
+  if (gpuPixels) {
+    pixels.set(gpuPixels);
+  }
+  if (!gpuPixels) for (let y = y0; y < y1; y++) for (let i = y * width + x0; i < y * width + x1; i++) {
     const idx4 = i * 4;
     // Props are the foreground surface of the map. Keep this coverage value
     // available before the water detail pass so shoreline/river ink cannot
@@ -2738,14 +3176,17 @@ export function renderMountainDetailDEMWithCache(
       ? waterOverlay.waterAlpha[i] > 0 || wetlandPriorityAlpha > 0
       : isOriginalWater;
 
-    // Painted water at this pixel: forest stands stay off it.
-    let paintedWater = 0;
+    // The ground before its water wash: a stand crown rising over the water
+    // hides the water beneath it as it hides the ground.
+    const landR = r;
+    const landG = g;
+    const landB = b;
+    let paintedWater = false;
     if (hasWaterWash && (!isPureHeightmapLayer || options.showHeightmapWater) && layer !== 'slope' && layer !== 'aspect' && layer !== 'wave_patterns') {
       const waterAlpha = waterOverlay
         ? Math.max(waterOverlay.waterAlpha[i], wetlandPriorityAlpha) / 255
         : 1.0;
-      paintedWater = waterAlpha;
-      if (standWaterCut) standWaterCut[i] = Math.round(waterAlpha * 255);
+      paintedWater = true;
       const toneValue = waterOverlay?.waterTone?.[i] ?? 128;
       const toneNorm = toneValue / 255;
       const [baseWaterR, baseWaterG, baseWaterB] = getWaterWashRGB(
@@ -2891,13 +3332,12 @@ export function renderMountainDetailDEMWithCache(
     }
 
     // The ground's colours and washes before any linework, shown under
-    // forest stands (see rasterPropStandCover).
-    // Stand areas are cut back from the water cells, but rivers are painted
-    // wider than those on a regional map: keep stands off painted water too.
-    const standCover = (vegetationOverlay?.rasterPropStandCover?.[i] ?? 0) / 255 * (1 - paintedWater);
-    let groundR = r;
-    let groundG = g;
-    let groundB = b;
+    // forest stands (see rasterPropStandCover). Stand areas already keep off
+    // the painted water; only crowns rise over it.
+    const standCover = (vegetationOverlay?.rasterPropStandCover?.[i] ?? 0) / 255;
+    let groundR = paintedWater ? landR : r;
+    let groundG = paintedWater ? landG : g;
+    let groundB = paintedWater ? landB : b;
 
     // Contour Lines Generator
     if (!hasWaterWash && showContours && contourOpacity > 0) {
@@ -3015,7 +3455,7 @@ export function renderMountainDetailDEMWithCache(
         : 0;
       if (charcoalFlowAlpha > 0) {
         const flowTone = waterOverlay.flowTone[i] / 255;
-        const tooth = 0.85 + 0.30 * hash01(i, 991);
+        const tooth = 0.85 + 0.30 * hash01(grainOffset + y * grainStride + i - y * width, 991);
         const finalAlpha = Math.min(1.0, charcoalFlowAlpha * tooth);
         r = blendContourColor(r, Math.min(255, Math.round(waterFlowColor[0] + flowTone * 18)), finalAlpha);
         g = blendContourColor(g, Math.min(255, Math.round(waterFlowColor[1] + flowTone * 16)), finalAlpha);
@@ -3026,7 +3466,7 @@ export function renderMountainDetailDEMWithCache(
       // palette; broken charcoal strokes and foam follow the same paths.
       if (oceanWaveAlpha > 0) {
         const waveTone = (waterOverlay.oceanFlowTone?.[i] ?? 0) / 255;
-        const tooth = 0.85 + 0.30 * hash01(i, 991);
+        const tooth = 0.85 + 0.30 * hash01(grainOffset + y * grainStride + i - y * width, 991);
         const finalAlpha = Math.min(1.0, oceanWaveAlpha * tooth);
         const waveColor = mixRGB(
           waterDeepColor,
@@ -3117,7 +3557,7 @@ export function renderMountainDetailDEMWithCache(
     }
     // The stand wash mixes its tree colour into the washed ground beneath
     // as paint mixes, from the ground at 0 to the tree colour at 1.
-    const standWashAmount = (standWash?.[idx4 + 3] ?? 0) / 255 * (1 - paintedWater);
+    const standWashAmount = (standWash?.[idx4 + 3] ?? 0) / 255;
     if (standWashAmount > 0) {
       r = mixPaintChannel(r, standWash![idx4], standWashAmount);
       g = mixPaintChannel(g, standWash![idx4 + 1], standWashAmount);
@@ -3169,10 +3609,8 @@ export function renderMountainDetailDEMWithCache(
 
     const rasterPropPixelIndex = i * 4;
     const standShare = (vegetationOverlay?.rasterPropStandShare?.[i] ?? 0) / 255;
-    // The stand's trees stay off painted water; other props keep their place.
     const rasterPropAlpha =
-      (vegetationOverlay?.rasterPropRGBA?.[rasterPropPixelIndex + 3] ?? 0) / 255 * roadPropKeep
-      * (1 - standShare * paintedWater);
+      (vegetationOverlay?.rasterPropRGBA?.[rasterPropPixelIndex + 3] ?? 0) / 255 * roadPropKeep;
     if (rasterPropAlpha > 0) {
       const rasterPropPixels = vegetationOverlay!.rasterPropRGBA!;
       // Forest stands are lit per tree already; only the rest is shaded.
@@ -3260,7 +3698,7 @@ export function renderMountainDetailDEMWithCache(
     ? new ImageData(pixels, width, height)
     : { width, height, data: pixels } as unknown as ImageData;
   const foregroundPropsRGBA = options.fullTerrainCameraElevationDeg !== undefined
-    ? createForegroundPropRGBA(vegetationOverlay, width, height, propOutlineColor, propTerrainShade, roadLayer, roadShade, standWaterCut)
+    ? createForegroundPropRGBA(vegetationOverlay, width, height, propOutlineColor, propTerrainShade, roadLayer, roadShade)
     : undefined;
   if (foregroundPropsRGBA) {
     (image as MountainDetailImageData).foregroundPropsRGBA = foregroundPropsRGBA;
@@ -3311,7 +3749,7 @@ export function renderMountainDetailDEMWithCache(
     ridgeThicknessScale: 0.75,
     charcoalRidges: true,
     ridgeCover: standCover
-      ? (x, y) => sampleScalarField(standCover, width, height, x, y) / 255
+      ? (x: number, y: number) => sampleScalarField(standCover, width, height, x, y) / 255
       : undefined,
     cameraType: options.fullTerrainCameraType ?? 'orthographic',
     elevationDeg: options.fullTerrainCameraElevationDeg,

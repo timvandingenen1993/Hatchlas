@@ -30,8 +30,12 @@ import {
 import { buildCameraGrid } from "../structures/viewProjection";
 import type { VegetationCoverGrid } from "../structures/roadRouting";
 import {
+  vegetationFlowGeometryStageKey,
+  vegetationFlowOverlayStageKey,
   vegetationGeometryStageKey,
   vegetationOverlayStageKey,
+  vegetationPropsGeometryStageKey,
+  vegetationPropsOverlayStageKey,
 } from "./mountainDetailRenderer";
 import {
   asPreparedFieldSet,
@@ -60,7 +64,9 @@ import {
 } from "./mountainPatternRenderer";
 import { buildVisualWaterSurfaceDEM } from "./waterRenderer";
 import type {
+  VegetationGeometry,
   VegetationMotifAsset,
+  VegetationOverlay,
   VegetationRasterPropAsset,
 } from "./vegetationRenderer";
 import { mergeVegetationGeometry, mergeVegetationOverlay } from "./vegetationRenderer";
@@ -72,6 +78,7 @@ import {
   type MountainProfiler,
 } from "./mountainProfiler";
 import { createRenderExecution } from "./renderExecution";
+import { releaseCompositeTextures } from "./mountainCompositeGl";
 import {
   MountainLayerWorkerCancelledError,
   MountainLayerWorkerPool,
@@ -182,6 +189,7 @@ function warmLayerWorker(): void {
   if (!layerWorkerPool) layerWorkerPool = new MountainLayerWorkerPool(PREVIEW_LAYER_POOL_OPTIONS);
   if (!layerWorkerPool.available) return;
   void layerWorkerPool.warmup().catch(() => undefined);
+  layerWorkerPool.warmPlacement();
 }
 
 let mountainGpuSessionPromise: Promise<MountainGpuSession | null> | undefined;
@@ -578,7 +586,22 @@ function startParallelLayerPreparation(
     return {
       mode,
       pool: layerWorkerPool,
-      promise: prepareWaterAndVegetationSideBySide(layerWorkerPool, dem, options, control),
+      promise: prepareWaterAndVegetationSideBySide(layerWorkerPool, dem, options, cache, control),
+    };
+  }
+  if (mode === "vegetationGeometry" && layerWorkerPool.workerCount >= 3) {
+    return {
+      mode,
+      pool: layerWorkerPool,
+      promise: prepareVegetationHalves(
+        layerWorkerPool,
+        dem,
+        options,
+        cache,
+        control,
+        "vegetationGeometry",
+        cachedWaterCoverageOverride(dem, cache),
+      ),
     };
   }
   return {
@@ -601,6 +624,109 @@ function startParallelLayerPreparation(
       },
       mode,
     ),
+  };
+}
+
+interface CachedVegetationHalf {
+  geometryKey: string;
+  overlayKey: string;
+  geometry: VegetationGeometry;
+  overlay: VegetationOverlay;
+}
+
+/**
+ * The last flow and prop halves built for a render cache. The halves read
+ * disjoint settings, so an edit to one (a forest setting, say) reuses the
+ * other instead of tracing every flow line again.
+ */
+interface VegetationHalfCache {
+  dem: MountainDEMData;
+  flow?: CachedVegetationHalf;
+  props?: CachedVegetationHalf;
+}
+
+const vegetationHalfCaches = new WeakMap<MountainRenderStageCache, VegetationHalfCache>();
+
+/**
+ * Builds the stale vegetation halves side by side on two workers and joins
+ * them with the cached ones. A half whose geometry is still current only
+ * repaints its overlay. "vegetationGeometry" jobs take the cached water
+ * coverage; "split" jobs derive it from water geometry next to a water job.
+ */
+function prepareVegetationHalves(
+  pool: MountainLayerWorkerPool,
+  dem: MountainDEMData,
+  options: MountainRenderOptions,
+  cache: MountainRenderStageCache,
+  control: { isCancelled: () => boolean; checkpoint: () => Promise<void>; profile?: boolean },
+  jobMode: "vegetationGeometry" | "split",
+  waterCoverageOverride?: Float32Array,
+): Promise<MountainLayerPreparationResult | null> {
+  let halves = vegetationHalfCaches.get(cache);
+  if (!halves || halves.dem !== dem) {
+    halves = { dem };
+    vegetationHalfCaches.set(cache, halves);
+  }
+  const cachedHalves = halves;
+  const prepareHalf = (part: "flow" | "props"): Promise<{
+    half: CachedVegetationHalf;
+    result?: MountainLayerPreparationResult;
+  } | null> => {
+    const geometryKey = part === "flow"
+      ? vegetationFlowGeometryStageKey(options)
+      : vegetationPropsGeometryStageKey(options);
+    const overlayKey = part === "flow"
+      ? vegetationFlowOverlayStageKey(options)
+      : vegetationPropsOverlayStageKey(options);
+    const cached = cachedHalves[part];
+    if (cached?.geometryKey === geometryKey && cached.overlayKey === overlayKey) {
+      return Promise.resolve({ half: cached });
+    }
+    const geometryOverride = cached?.geometryKey === geometryKey ? cached.geometry : undefined;
+    const mode = jobMode === "vegetationGeometry"
+      ? "vegetationGeometry"
+      : part === "flow" ? "vegetationFlow" : "vegetationProps";
+    return pool.prepare(dem, options, {
+      ...control,
+      waterCoverageOverride,
+      vegetationGeometryOverride: geometryOverride,
+      vegetationPart: part,
+    }, mode).then((result) => {
+      const geometry = result?.vegetationGeometry ?? geometryOverride;
+      if (!result || !geometry || !result.vegetationOverlay) return null;
+      const half = { geometryKey, overlayKey, geometry, overlay: result.vegetationOverlay };
+      cachedHalves[part] = half;
+      return { half, result };
+    });
+  };
+  return Promise.all([prepareHalf("flow"), prepareHalf("props")]).then(([flow, props]) => {
+    if (!flow || !props) return null;
+    const ran = flow.result && props.result
+      ? mergeVegetationJobs(flow.result, props.result)
+      : flow.result ?? props.result ?? emptyLayerPreparationResult();
+    return {
+      ...ran,
+      mode: jobMode === "vegetationGeometry" ? "vegetationGeometry" : "vegetation",
+      vegetationGeometry: mergeVegetationGeometry(flow.half.geometry, props.half.geometry),
+      vegetationOverlay: mergeVegetationOverlay(flow.half.overlay, props.half.overlay),
+    };
+  });
+}
+
+function emptyLayerPreparationResult(): MountainLayerPreparationResult {
+  return {
+    mode: "vegetation",
+    waterGeometry: null,
+    waterOverlay: null,
+    vegetationGeometry: null,
+    vegetationOverlay: null,
+    timings: {
+      totalMs: 0,
+      waterGeometryMs: 0,
+      waterOverlayMs: 0,
+      vegetationGeometryMs: 0,
+      vegetationOverlayMs: 0,
+    },
   };
 }
 
@@ -654,14 +780,12 @@ function prepareWaterAndVegetationSideBySide(
   pool: MountainLayerWorkerPool,
   dem: MountainDEMData,
   options: MountainRenderOptions,
+  cache: MountainRenderStageCache,
   control: { isCancelled: () => boolean; checkpoint: () => Promise<void>; profile?: boolean },
 ): Promise<MountainLayerPreparationResult | null> {
   const waterJob = pool.prepare(dem, options, control, "water");
   const vegetationJob = pool.workerCount >= 3
-    ? Promise.all([
-        pool.prepare(dem, options, control, "vegetationFlow"),
-        pool.prepare(dem, options, control, "vegetationProps"),
-      ]).then(([flow, props]) => (flow && props ? mergeVegetationJobs(flow, props) : null))
+    ? prepareVegetationHalves(pool, dem, options, cache, control, "split")
     : pool.prepare(dem, options, control, "vegetation");
   return Promise.all([waterJob, vegetationJob]).then(([water, vegetation]) => {
     // A skipped job (memory budget) leaves its stage to the compositor.
@@ -2125,6 +2249,41 @@ const renderCoordinator = new LatestRequestCoordinator<
   }
 });
 
+/**
+ * Frees what the next render rebuilds on its own: the layer workers (and
+ * their placement helpers), the GPU field backend and session, the render
+ * caches and the derived DEMs. The analysis stays, so the preview only
+ * renders cold afterwards instead of analysing again.
+ */
+function releaseForExport(): void {
+  renderCoordinator.cancel();
+  layerWorkerPool?.dispose();
+  layerWorkerPool = null;
+  mountainFieldBackend?.dispose();
+  mountainFieldBackend = null;
+  mountainFieldBackendMode = undefined;
+  warmedFieldBackend?.dispose();
+  warmedFieldBackend = null;
+  if (mountainGpuSession) {
+    mountainGpuSessionGeneration += 1;
+    mountainGpuSession.dispose();
+    mountainGpuSession = null;
+    mountainGpuSessionMode = undefined;
+    mountainGpuSessionPromise = undefined;
+  }
+  visualWaterDem = null;
+  visualWaterKey = "";
+  draftDemSource = null;
+  draftDem = null;
+  finalPreviewDemSource = null;
+  finalPreviewDem = null;
+  renderCache = createMountainRenderStageCache();
+  draftRenderCache = createMountainRenderStageCache();
+  retainedPreparedCache = null;
+  previewWindFields = null;
+  releaseCompositeTextures();
+}
+
 self.onmessage = (event: MessageEvent<MountainPreviewRequest>) => {
   const request = event.data;
   try {
@@ -2153,6 +2312,9 @@ self.onmessage = (event: MessageEvent<MountainPreviewRequest>) => {
         draftRenderCache = createMountainRenderStageCache();
         retainedPreparedCache = null;
         previewWindFields = null;
+        return;
+      case "releaseForExport":
+        releaseForExport();
         return;
       case "assets":
         if (request.vegetationMotifs !== undefined)
@@ -2227,6 +2389,8 @@ self.onmessage = (event: MessageEvent<MountainPreviewRequest>) => {
           requestId: request.requestId,
           analysisRevision,
           value,
+          // Structured-cloned: the worker keeps its own DEM.
+          analysis: request.includeAnalysis ? dem : undefined,
         });
         return;
       }

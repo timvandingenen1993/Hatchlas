@@ -75,9 +75,11 @@ export const MOUNTAIN_VALLEY_SUPPORT_PIXELS = 160;
 export const MOUNTAIN_PROJECTION_SUPPORT_PADDING_PIXELS = 96;
 /**
  * Filter padding without lift (camera exports); see mountainProjectionSupportPixels.
- * Measured by comparing split tiles with one full render: seams appear at 40
- * and below at both 4.5x and 6x pixel scale, none above 44. 56 keeps a margin
- * while camera tiles render ~27% fewer pixels than with the lift padding (96).
+ * Measured by comparing split tiles with one full render at 4.5x and 6x pixel
+ * scale. A single smooth ridge showed no seams above 44, but two rough ridges
+ * crossing the seam still mismatched at 48 (~550 channels) and 52 (9 at 6x),
+ * and were clean only from 54. So 56 is a thin margin, not a generous one:
+ * do not lower it without a rougher test than that.
  */
 export const MOUNTAIN_LIFT_FREE_SUPPORT_PADDING_PIXELS = 56;
 
