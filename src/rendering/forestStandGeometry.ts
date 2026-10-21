@@ -856,14 +856,20 @@ export function clusterLight(mask: Float32Array, light: Float32Array, width: num
   }
   for (let step = 1; step <= reach && frontier.length; step++) {
     const next: number[] = [];
+    // Left, right, up, down: the first to reach a cell gives it its tone.
+    const visit = (neighbour: number, tone: number) => {
+      if (neighbour < 0 || neighbour >= result.length || distance[neighbour] >= 0) return;
+      distance[neighbour] = step;
+      result[neighbour] = tone;
+      next.push(neighbour);
+    };
     for (const index of frontier) {
       const x = index % width;
-      for (const neighbour of [x > 0 ? index - 1 : -1, x < width - 1 ? index + 1 : -1, index - width, index + width]) {
-        if (neighbour < 0 || neighbour >= result.length || distance[neighbour] >= 0) continue;
-        distance[neighbour] = step;
-        result[neighbour] = result[index];
-        next.push(neighbour);
-      }
+      const tone = result[index];
+      if (x > 0) visit(index - 1, tone);
+      if (x < width - 1) visit(index + 1, tone);
+      visit(index - width, tone);
+      visit(index + width, tone);
     }
     frontier = next;
   }

@@ -273,18 +273,33 @@ export function formatMountainProfileSummary(report: MountainProfileReport, limi
     // A first render lists every setting; a change lists just what moved.
     `  changed: ${changed.length === 0 ? "none" : changed.length > 12
       ? `${changed.length} settings (first render)` : changed.join(", ")}`,
-    "   self s    total s  calls  stage",
   ];
-  const stages = [...report.stages].sort((a, b) => b.selfMs - a.selfMs).slice(0, limit);
-  for (const stage of stages) {
-    lines.push(
-      `${(stage.selfMs / 1000).toFixed(1).padStart(9)} ${(stage.durationMs / 1000).toFixed(1).padStart(10)} `
-        + `${String(stage.calls).padStart(6)}  ${stage.stage}`,
-    );
+  const pushStages = (stages: readonly MountainProfileStage[], count: number) => {
+    lines.push("   self s    total s  calls  stage");
+    for (const stage of [...stages].sort((a, b) => b.selfMs - a.selfMs).slice(0, count)) {
+      lines.push(
+        `${(stage.selfMs / 1000).toFixed(1).padStart(9)} ${(stage.durationMs / 1000).toFixed(1).padStart(10)} `
+          + `${String(stage.calls).padStart(6)}  ${stage.stage}`,
+      );
+    }
+  };
+  // Helper and layer worker stages ("parallel …") are summed over workers and
+  // calls, so they crowd out the stages that run one after another on this
+  // worker. List the two apart.
+  const helperStages = report.stages.filter(stage => stage.stage.startsWith("parallel "));
+  const ownStages = report.stages.filter(stage => !stage.stage.startsWith("parallel "));
+  if (helperStages.length > 0 && ownStages.length > 0) {
+    lines.push("  this worker, in wall time:");
+    pushStages(ownStages, Math.ceil(limit * 0.6));
+    lines.push("  helper and layer workers, summed over workers and calls:");
+    // Helper work is split over many stages (illustration, water, vegetation): show enough of them.
+    pushStages(helperStages, Math.max(40, Math.ceil(limit * 0.6)));
+  } else {
+    pushStages(report.stages, limit);
   }
   // Scheduling and memory events explain wall time the stages alone do not.
   const keyMetrics = report.metrics.filter(metric =>
-    /helper count|memory budget|memory pressure|helper failed|budget recoveries|tile sampling/i.test(metric.metric));
+    /helper count|helper idle|memory budget|memory pressure|helper failed|budget recoveries|tile sampling|on GPU|plans reused|tile halo|tile expanded pixels|tile interior pixels/i.test(metric.metric));
   for (const metric of keyMetrics) {
     lines.push(`  ${metric.metric}: total ${Number(metric.total.toFixed(2))} ${metric.unit} (${metric.samples}x)`);
   }

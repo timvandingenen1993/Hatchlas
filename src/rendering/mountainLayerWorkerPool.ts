@@ -82,6 +82,8 @@ export interface MountainLayerWorkerControl {
   waterCoverageOverride?: Float32Array;
   /** Reuse primary-worker geometry when only its painted overlay is stale. */
   vegetationGeometryOverride?: VegetationGeometry;
+  /** Build one half of a "vegetationGeometry" job; the other half is cached. */
+  vegetationPart?: "flow" | "props";
 }
 
 /** "vegetation" derives water coverage from geometry and skips water paint,
@@ -183,6 +185,7 @@ interface Pending {
   snapshot: MountainDEMData;
   options: MountainRenderOptions;
   vegetationGeometryOverride?: VegetationGeometry;
+  vegetationPart?: "flow" | "props";
   mode: MountainLayerPreparationMode;
   profile: boolean;
   postedAt?: number;
@@ -429,6 +432,16 @@ export class MountainLayerWorkerPool {
     return Promise.all([...this.workerStates.values()].map(state => state.ready)).then(() => undefined);
   }
 
+  /**
+   * Prop placement runs on the last worker (the props half, or the whole
+   * vegetation job), which spreads it over helper workers of its own. Start
+   * those now so their module loading overlaps analysis on a cold load.
+   */
+  warmPlacement(): void {
+    if (!this.available) return;
+    this.workers[this.workers.length - 1].postMessage({ type: "warmPlacement" });
+  }
+
   get retainedBytes(): number {
     return this.inFlightBytes;
   }
@@ -488,6 +501,7 @@ export class MountainLayerWorkerPool {
         snapshot,
         options,
         vegetationGeometryOverride: control.vegetationGeometryOverride,
+        vegetationPart: control.vegetationPart,
         mode,
         profile: control.profile === true,
       });
@@ -555,6 +569,7 @@ export class MountainLayerWorkerPool {
         dem: pending.snapshot,
         options: pending.options,
         vegetationGeometryOverride: pending.vegetationGeometryOverride,
+        vegetationPart: pending.vegetationPart,
         mode: pending.mode,
         profile: pending.profile,
       }, transfers);
@@ -569,6 +584,9 @@ export class MountainLayerWorkerPool {
 
   private preferredWorker(pending: Pending): Worker {
     const last = this.workers.length - 1;
+    if (pending.mode === "vegetationGeometry" && pending.vegetationPart) {
+      return this.workers[Math.min(pending.vegetationPart === "flow" ? 1 : 2, last)];
+    }
     switch (pending.mode) {
       case "water": return this.workers[0];
       case "vegetationFlow": return this.workers[Math.min(1, last)];

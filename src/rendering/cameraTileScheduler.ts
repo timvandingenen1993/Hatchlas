@@ -37,6 +37,12 @@ export interface CameraTileSchedulerOptions<Prepared, Result> {
   /** Bytes the cache holds right now. */
   cachedBytes(): number;
   helperBudgetBytes: number;
+  /**
+   * Prepared tiles that may wait for a helper (default 1). More keep this
+   * worker preparing while the memory budget holds a tile back, so several
+   * helpers that free up together each find a tile ready.
+   */
+  stagingDepth?: number;
   /** Cache bytes that tiles rendered ahead of need may fill. */
   lookaheadBudgetBytes: number;
   cancelled(): boolean;
@@ -84,8 +90,11 @@ export class CameraTileScheduler<Prepared, Result> {
   private readonly required = new Set<string>();
   private readonly waiters = new Map<string, Waiter>();
   private readonly running = new Map<string, number>();
-  private staged: { key: string; prepared: Prepared; transfer: Transferable[] } | undefined;
+  /** Prepared tiles waiting for a helper, oldest first. */
+  private readonly staged: { key: string; prepared: Prepared; transfer: Transferable[] }[] = [];
   private runningHelperBytes = 0;
+  /** The most estimated helper memory admitted at once. */
+  private peakRunningHelperBytes = 0;
   /** Starts at the configured budget and halves on every helper failure. */
   private helperBudgetBytes: number;
   private pumping = false;
@@ -99,6 +108,9 @@ export class CameraTileScheduler<Prepared, Result> {
   /** Keys whose preparation already restarted the idle helpers once. */
   private readonly restartedFor = new Set<string>();
   private failure: unknown;
+  /** Helper idle time, by what the idle helpers were waiting for (see accountIdle). */
+  private readonly idleMs = { preparation: 0, memory: 0, nothingQueued: 0 };
+  private idleClock = performance.now();
 
   constructor(options: CameraTileSchedulerOptions<Prepared, Result>) {
     this.options = options;
@@ -109,6 +121,34 @@ export class CameraTileScheduler<Prepared, Result> {
 
   get helperCount(): number {
     return this.helpers.length;
+  }
+
+  /**
+   * Helper-milliseconds spent idle so far: waiting for this worker to prepare
+   * a tile, holding back a prepared tile for the memory budget, or with no
+   * tile to start (bands not asking yet, the look-ahead budget, or this worker
+   * busy with other export work).
+   */
+  idleTimes(): { preparation: number; memory: number; nothingQueued: number } {
+    this.accountIdle();
+    return { ...this.idleMs };
+  }
+
+  /** Charges the time since the last change to what the idle helpers wait for. */
+  private accountIdle(): void {
+    const now = performance.now();
+    const elapsed = now - this.idleClock;
+    this.idleClock = now;
+    if (elapsed <= 0 || this.idle.length === 0) return;
+    const helperMs = elapsed * this.idle.length;
+    if (this.staged.length > 0) this.idleMs.memory += helperMs;
+    else if (this.preparingKey !== undefined) this.idleMs.preparation += helperMs;
+    else this.idleMs.nothingQueued += helperMs;
+  }
+
+  /** The most estimated helper memory admitted at once, for comparing with measured memory. */
+  peakHelperBytes(): number {
+    return this.peakRunningHelperBytes;
   }
 
   /** Queues tiles to render ahead of need, in the order given. */
@@ -132,7 +172,7 @@ export class CameraTileScheduler<Prepared, Result> {
     const front: string[] = [];
     for (const key of new Set(keys)) {
       if (this.options.isAvailable(key)) continue;
-      if (!this.running.has(key) && this.staged?.key !== key && this.preparingKey !== key) {
+      if (!this.running.has(key) && !this.isStaged(key) && this.preparingKey !== key) {
         const queuedAt = this.queue.indexOf(key);
         if (queuedAt >= 0) this.queue.splice(queuedAt, 1);
         front.push(key);
@@ -150,14 +190,18 @@ export class CameraTileScheduler<Prepared, Result> {
   abort(error: unknown): void {
     this.failure = error;
     this.queue.length = 0;
-    this.staged = undefined;
+    this.staged.length = 0;
     for (const waiter of this.waiters.values()) waiter.reject(error);
     this.waiters.clear();
   }
 
+  private isStaged(key: string): boolean {
+    return this.staged.some(staged => staged.key === key);
+  }
+
   private isScheduled(key: string): boolean {
     return this.running.has(key)
-      || this.staged?.key === key
+      || this.isStaged(key)
       || this.preparingKey === key
       || this.queue.includes(key);
   }
@@ -198,7 +242,7 @@ export class CameraTileScheduler<Prepared, Result> {
   private inFlightOutputBytes(): number {
     let bytes = 0;
     for (const key of this.running.keys()) bytes += this.options.outputBytes(key);
-    if (this.staged) bytes += this.options.outputBytes(this.staged.key);
+    for (const staged of this.staged) bytes += this.options.outputBytes(staged.key);
     return bytes;
   }
 
@@ -233,7 +277,7 @@ export class CameraTileScheduler<Prepared, Result> {
         continue;
       }
       // Already on its way: its waiters settle when it is stored.
-      if (this.running.has(key) || this.staged?.key === key || this.preparingKey === key) {
+      if (this.running.has(key) || this.isStaged(key) || this.preparingKey === key) {
         this.queue.splice(index, 1);
         continue;
       }
@@ -280,21 +324,24 @@ export class CameraTileScheduler<Prepared, Result> {
         await this.renderRequiredLocally();
         return;
       }
-      if (this.staged) {
-        if (!this.canRunOnHelper(this.staged.key)) return;
-        const staged = this.staged;
-        this.staged = undefined;
+      this.accountIdle();
+      // The oldest prepared tile a helper can take now, if any.
+      const ready = this.staged.findIndex(staged => this.canRunOnHelper(staged.key));
+      if (ready >= 0) {
+        const [staged] = this.staged.splice(ready, 1);
         this.dispatch(staged.key, staged.prepared, staged.transfer);
         continue;
       }
-      const key = this.nextKey();
-      if (key === undefined || !this.withinLookahead(key)) return;
+      if (this.staged.length >= Math.max(1, this.options.stagingDepth ?? 1)) return;
       // After running out of memory, prepare only what a helper can take
       // right away instead of holding another prepared tile in reserve.
+      if (this.lowMemory && this.staged.length > 0) return;
+      const key = this.nextKey();
+      if (key === undefined || !this.withinLookahead(key)) return;
       if (this.lowMemory && !this.canRunOnHelper(key)) return;
       // Prepare now if a helper can take the tile, or ahead of time while
-      // every helper is busy, so a finishing helper never waits for this
-      // worker. At most one prepared tile waits at a time.
+      // every helper is busy (or the budget is full), so a finishing helper
+      // never waits for this worker. At most stagingDepth tiles wait.
       this.queue.shift();
       // While an asynchronous preparation runs, the key counts as scheduled
       // so a band that needs it waits for it instead of queueing it again.
@@ -303,6 +350,7 @@ export class CameraTileScheduler<Prepared, Result> {
       try {
         preparation = await this.options.prepare(key);
       } catch (error) {
+        this.accountIdle();
         this.preparingKey = undefined;
         if (!this.options.isOutOfMemory?.(error)) throw error;
         // Out of memory while helpers still hold tiles: retry this tile once
@@ -326,10 +374,11 @@ export class CameraTileScheduler<Prepared, Result> {
         await this.restartIdleHelpers();
         continue;
       } finally {
+        this.accountIdle();
         this.preparingKey = undefined;
       }
       if (this.failure !== undefined) return;
-      this.staged = { key, prepared: preparation.prepared, transfer: preparation.transfer };
+      this.staged.push({ key, prepared: preparation.prepared, transfer: preparation.transfer });
       await this.options.yieldToEvents();
     }
   }
@@ -356,10 +405,12 @@ export class CameraTileScheduler<Prepared, Result> {
   }
 
   private dispatch(key: string, prepared: Prepared, transfer: Transferable[]): void {
+    this.accountIdle();
     const helper = this.idle.pop()!;
     const helperBytes = this.options.helperBytes(key);
     this.running.set(key, helperBytes);
     this.runningHelperBytes += helperBytes;
+    this.peakRunningHelperBytes = Math.max(this.peakRunningHelperBytes, this.runningHelperBytes);
     this.options.onDispatch?.(key, this.running.size - 1, this.queue.length);
     const startedAt = performance.now();
     const finish = (): void => {
@@ -367,6 +418,7 @@ export class CameraTileScheduler<Prepared, Result> {
       this.runningHelperBytes -= helperBytes;
     };
     helper.render(prepared, transfer).then(result => {
+      this.accountIdle();
       finish();
       this.idle.push(helper);
       if (this.failure !== undefined) return;
@@ -381,6 +433,7 @@ export class CameraTileScheduler<Prepared, Result> {
       }
       void this.pump();
     }, error => {
+      this.accountIdle();
       finish();
       if (this.failure !== undefined) return;
       if (this.options.cancelled()) {
@@ -412,10 +465,8 @@ export class CameraTileScheduler<Prepared, Result> {
 
   /** Without helpers, required tiles render here; lookahead is dropped. */
   private async renderRequiredLocally(): Promise<void> {
-    if (this.staged) {
-      this.queue.unshift(this.staged.key);
-      this.staged = undefined;
-    }
+    this.queue.unshift(...this.staged.map(staged => staged.key));
+    this.staged.length = 0;
     while (this.queue.length > 0) {
       const key = this.queue.shift()!;
       if (!this.required.has(key)) {

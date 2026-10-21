@@ -484,6 +484,8 @@ function traceOutlines(mask: Float32Array, width: number, height: number): Point
       const b = mask[y * width + x + 1] >= level;
       const c = mask[(y + 1) * width + x + 1] >= level;
       const d = mask[(y + 1) * width + x] >= level;
+      // Most cells lie wholly inside or outside a stand: no crossing.
+      if (a === b && b === c && c === d) continue;
       const top = a !== b ? horizontal(x, y) : -1;
       const right = b !== c ? vertical(x + 1, y) : -1;
       const bottom = d !== c ? horizontal(x, y + 1) : -1;
@@ -678,6 +680,13 @@ export function buildForestInkGeometry(input: ForestInkInput): ForestInkGeometry
     sample(ground, width, height, x + halfWidth, y) >= 0.5
   );
   const groundAt = (x: number, y: number) => !ground || sample(ground, width, height, x, y) >= 0.5;
+  /**
+   * True when a whole tree stands on ground: its foot, and its lower half
+   * above the foot. Only its top may rise over the water behind it; a tree
+   * on a thin strip of bank would otherwise stand in the river.
+   */
+  const treeOnGround = (tree: ForestInkMark, halfWidth: number) => onGround(tree.x, tree.y, halfWidth) &&
+    groundAt(tree.x, tree.y - tree.height * 0.25) && groundAt(tree.x, tree.y - tree.height * 0.5);
   const sparse = input.sparse?.length === width * height ? input.sparse : undefined;
   const sparseAt = (x: number, y: number) => sparse ? clamp01(sample(sparse, width, height, x, y)) : 0;
   const field = new MarkField(size, width);
@@ -722,7 +731,7 @@ export function buildForestInkGeometry(input: ForestInkInput): ForestInkGeometry
           const depth = edgeDepth * (rng() < 0.12 ? size * (0.5 + rng() * 0.3) : size * (rng() * 0.55 - 0.2));
           tree.x = point.x + normal.x * (reach - depth);
           tree.y = point.y + normal.y * (reach - depth) + tree.height / 2 + size * 0.04;
-          if (!onGround(tree.x, tree.y, w * 0.35) || !field.tryAdd(tree, 0.5)) return size * 0.15;
+          if (!treeOnGround(tree, w * 0.35) || !field.tryAdd(tree, 0.5)) return size * 0.15;
           frontRow.push(tree);
           return (w + nextFrontWidth) / 2 * (0.8 + rng() * 0.1) / edgeDensity;
         }
@@ -755,7 +764,7 @@ export function buildForestInkGeometry(input: ForestInkInput): ForestInkGeometry
     tree.x = (front.x + next.x) / 2 + normal.x * lift;
     tree.y = Math.min(front.y, next.y) + normal.y * lift;
     if (sample(mask, width, height, tree.x, tree.y - tree.height * 0.5) < 0.5) return;
-    if (!onGround(tree.x, tree.y, tree.width * 0.35)) return;
+    if (!treeOnGround(tree, tree.width * 0.35)) return;
     field.tryAdd(tree, 0.45);
   });
 
@@ -816,7 +825,7 @@ export function buildForestInkGeometry(input: ForestInkInput): ForestInkGeometry
   for (const plant of input.loneTrees ?? []) {
     const w = crown * (0.5 + rng() * 0.22);
     const tree = treeMark(plant.x, plant.y, w, PEN.lone * (0.9 + rng() * 0.2), rng, "lone", plantKind());
-    if (sample(mask, width, height, plant.x, plant.y) < 0.3 && onGround(tree.x, tree.y, w * 0.35)) field.tryAdd(tree, 0.1);
+    if (sample(mask, width, height, plant.x, plant.y) < 0.3 && treeOnGround(tree, w * 0.35)) field.tryAdd(tree, 0.1);
   }
   const treeAttempts = Math.round(width * height / (size * size) * 0.3 * settings.meadowTrees);
   for (let attempt = 0; attempt < treeAttempts; attempt++) {
@@ -842,7 +851,7 @@ export function buildForestInkGeometry(input: ForestInkInput): ForestInkGeometry
       cursor += w * (0.95 + rng() * 0.25);
     }
     if (!group.every((mark) => field.fits(mark.x, mark.y, mark.width, mark.height, 0) &&
-      sample(mask, width, height, mark.x, mark.y) < 0.3 && onGround(mark.x, mark.y, mark.width * 0.35))) continue;
+      sample(mask, width, height, mark.x, mark.y) < 0.3 && treeOnGround(mark, mark.width * 0.35))) continue;
     for (const mark of group) field.add(mark);
     if (rng() < 0.45 * settings.grass) {
       const left = rng() < 0.5;

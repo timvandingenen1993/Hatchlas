@@ -1,6 +1,7 @@
 import { charcoalStrokePressureAt, createCharcoalStrokeRuns, hash01 } from "./cartographicStrokeRenderer";
+import type { MountainProfiler } from "./mountainProfiler";
 import { mulberry, type ForestStandGeometry, type Point } from "./forestStandGeometry";
-import { forestStandWashCells, type ForestStandPaint } from "./forestStandRenderer";
+import { forestStandWashCells, forestStandWashCellsGl, type ForestStandPaint } from "./forestStandRenderer";
 import {
   INK_WASH_TREE_SIZE_PER_MARK,
   inkMarkOutline,
@@ -48,6 +49,8 @@ export interface ForestInkPaint {
   interruptions?: number;
   /** Line weight per kind of tree (defaults: DEFAULT_FOREST_INK_PENS). */
   thickness?: Partial<ForestInkPens>;
+  /** Paint the wash textures on the GPU (WebGL2) when available. */
+  gpu?: boolean;
 }
 
 /** Wash colours on a coarse grid in the geometry's map pixels. */
@@ -315,19 +318,31 @@ function standWash(geometry: ForestInkGeometry, paint: ForestInkPaint, width: nu
   } satisfies ForestStandGeometry;
   const cellWidth = gx1 - gx0;
   const cellHeight = gy1 - gy0;
-  const washCells = new Uint8ClampedArray(cellWidth * cellHeight * 4);
+  const base = paint.washField ? washBaseRgb(standPaint.washColor) : null;
+  const shift = paint.washField && base ? { ...paint.washField, base } : undefined;
   // The amount of paint mixed in is the strength itself inside the patch,
   // so the whole slider range stays usable.
-  const fillCells = forestStandWashCells(stands, standPaint, gx0, gy0, gx1, gy1, true, washCells, 1);
-  const base = paint.washField ? washBaseRgb(standPaint.washColor) : null;
-  if (paint.washField && base) {
-    shiftWashCells(washCells, cellWidth, gx0, gy0, base, paint.washField);
-    shiftWashCells(fillCells, cellWidth, gx0, gy0, base, paint.washField);
+  const gpu = paint.gpu
+    ? forestStandWashCellsGl(stands, standPaint, gx0, gy0, gx1, gy1, 1, shift)
+    : null;
+  let washCells: Uint8ClampedArray<ArrayBuffer>;
+  let fillCells: Uint8ClampedArray<ArrayBuffer>;
+  if (gpu) {
+    washCells = gpu.wash;
+    fillCells = gpu.fill;
+  } else {
+    washCells = new Uint8ClampedArray(cellWidth * cellHeight * 4);
+    fillCells = forestStandWashCells(stands, standPaint, gx0, gy0, gx1, gy1, true, washCells, 1);
+    if (shift) {
+      shiftWashCells(washCells, cellWidth, gx0, gy0, shift.base, shift);
+      shiftWashCells(fillCells, cellWidth, gx0, gy0, shift.base, shift);
+    }
   }
   const wash = new OffscreenCanvas(cellWidth, cellHeight);
   const fill = new OffscreenCanvas(cellWidth, cellHeight);
-  wash.getContext("2d", { willReadFrequently: true })!.putImageData(new ImageData(washCells, cellWidth, cellHeight), 0, 0);
-  fill.getContext("2d", { willReadFrequently: true })!.putImageData(new ImageData(fillCells, cellWidth, cellHeight), 0, 0);
+  // Only drawn from, never read back: GPU canvases keep them on the GPU.
+  wash.getContext("2d")!.putImageData(new ImageData(washCells, cellWidth, cellHeight), 0, 0);
+  fill.getContext("2d")!.putImageData(new ImageData(fillCells, cellWidth, cellHeight), 0, 0);
   const result = { key, wash, fill, gx0, gy0 };
   standWashes.set(geometry.mask, result);
   return result;
@@ -384,6 +399,7 @@ export function renderForestInkCanvas(
   paint: ForestInkPaint,
   target?: Ctx,
   layers: ForestInkLayers = {},
+  profiler?: MountainProfiler,
 ): OffscreenCanvas | null {
   const { cover } = layers;
   if (width <= 0 || height <= 0 || typeof OffscreenCanvas === "undefined") return null;
@@ -404,7 +420,10 @@ export function renderForestInkCanvas(
   // wash under it with the opaque wash colour at the wash's interior
   // strength, so a crown matches the wash around it and tops above the
   // stand edge look the same.
+  const washStop = profiler?.begin("vegetation forest stand wash texture");
   const washTexture = washAlpha > 0 ? standWash(geometry, paint, width, height) : null;
+  washStop?.();
+  const inkStop = profiler?.begin("vegetation forest stand ink");
   const tint = washTexture ? contexts.tint : null;
   let crownFill: CanvasPattern | null = null;
   const crownAlpha = washAlpha;
@@ -528,8 +547,10 @@ export function renderForestInkCanvas(
     ctx.fillRect(0, 0, width, height);
     ctx.restore();
   }
+  inkStop?.();
   const output = target ?? new OffscreenCanvas(width, height).getContext("2d");
   if (!output) return null;
+  const compositeStop = profiler?.begin("vegetation forest stand compositing");
   output.save();
   output.setTransform(1, 0, 0, 1, 0, 0);
   output.globalAlpha = 1;
@@ -548,6 +569,7 @@ export function renderForestInkCanvas(
   }
   output.drawImage(ctx.canvas, 0, 0);
   output.restore();
+  compositeStop?.();
   return output.canvas as OffscreenCanvas;
 }
 
@@ -626,12 +648,13 @@ function absorption(reflectance: number): number {
   return (1 - r) * (1 - r) / (2 * r);
 }
 
-const SRGB_TO_ABSORPTION = Float32Array.from(SRGB_TO_LINEAR, absorption);
+/** K/S per sRGB byte; exported for the GPU compositor's copy of mixPaintChannel. */
+export const SRGB_TO_ABSORPTION = Float32Array.from(SRGB_TO_LINEAR, absorption);
 
 // Linear light back to sRGB through a table: a power per channel and pixel
 // made the stand wash cost more than the rest of the compositor.
-const LINEAR_TO_SRGB_STEPS = 8191;
-const LINEAR_TO_SRGB = Uint8Array.from({ length: LINEAR_TO_SRGB_STEPS + 1 }, (_, step) => {
+export const LINEAR_TO_SRGB_STEPS = 8191;
+export const LINEAR_TO_SRGB = Uint8Array.from({ length: LINEAR_TO_SRGB_STEPS + 1 }, (_, step) => {
   const value = step / LINEAR_TO_SRGB_STEPS;
   const unit = value <= 0.0031308 ? value * 12.92 : 1.055 * value ** (1 / 2.4) - 0.055;
   return Math.round(Math.max(0, Math.min(1, unit)) * 255);
