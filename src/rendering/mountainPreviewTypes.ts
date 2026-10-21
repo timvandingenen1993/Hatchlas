@@ -87,6 +87,14 @@ export type MountainPreviewRequest =
       source: MountainPreviewSource;
     }
   | {
+      /**
+       * An export is starting: drop everything a render can rebuild (layer
+       * workers, GPU backends, render caches) and keep the analysis, so the
+       * export's tile helpers get that memory.
+       */
+      type: "releaseForExport";
+    }
+  | {
       type: "assets";
       vegetationMotifs?: VegetationMotifAsset[] | null;
       rasterProps?: VegetationRasterPropAsset[] | null;
@@ -130,6 +138,8 @@ export type MountainPreviewRequest =
       type: "waterSnapshot";
       requestId: number;
       analysisRevision: number;
+      /** Also return a copy of the analysed DEM (for the 4K pass). */
+      includeAnalysis?: boolean;
       options: Pick<
         MountainRenderOptions,
         | "wetlandPuddleContours"
@@ -218,6 +228,7 @@ export type MountainPreviewResponse =
         | "wetlandPoolCoverage"
         | "visualWaterCoverage"
       >;
+      analysis?: MountainDEMData;
     }
   | {
       type: "heightmapResult";

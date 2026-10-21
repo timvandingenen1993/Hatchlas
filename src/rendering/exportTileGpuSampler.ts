@@ -27,7 +27,10 @@ const PARAMS_BYTES = 48;
 const WORKGROUP = 16;
 /**
  * Output (and readback) bytes per batch. The readback is mapped into this
- * worker's memory, so it stays small and is reused for every batch.
+ * worker's memory, so it stays small and is reused for every batch. 256 MB
+ * batches were measured on 8K (6 helpers): the GPU wait fell only from 25.5
+ * to 21.4 s (it follows the bytes, not the batch count) while the tab peaked
+ * 2.4 GB higher.
  */
 const BATCH_BYTES = 64 * 1024 * 1024;
 
@@ -92,6 +95,19 @@ function toRequestedType(values: Float32Array, request: ExportFieldSampleRequest
   return new Float32Array(values);
 }
 
+interface BatchBuffers {
+  output?: GPUBuffer;
+  readback?: GPUBuffer;
+  uniforms?: GPUBuffer;
+}
+
+interface Batch {
+  start: number;
+  end: number;
+  slots: number[];
+  bytes: number;
+}
+
 interface AxisOffsets {
   index: number;
   weight: number;
@@ -103,10 +119,14 @@ export class ExportTileGpuSampler {
   /** One upload per global raster, reused by every tile of the export. */
   private readonly sourceBuffers = new Map<ArrayLike<number>, GPUBuffer>();
   private lost = false;
-  private batchOutput?: GPUBuffer;
-  private batchReadback?: GPUBuffer;
-  private batchUniforms?: GPUBuffer;
+  /**
+   * Two sets of batch buffers: the GPU fills one while this worker copies the
+   * other out, instead of waiting for each batch's readback in turn.
+   */
+  private readonly batchSets: BatchBuffers[] = [{}, {}];
   uploadedBytes = 0;
+  /** Milliseconds spent per phase, summed over every `sample` call. */
+  readonly timings = { prepareMs: 0, encodeMs: 0, waitMs: 0, copyMs: 0, readbackBytes: 0, batches: 0 };
 
   private constructor(device: GPUDevice, pipeline: GPUComputePipeline) {
     this.device = device;
@@ -157,6 +177,7 @@ export class ExportTileGpuSampler {
   ): Promise<ExportFieldSample[]> {
     if (this.lost) throw new Error("GPU device was lost");
     const device = this.device;
+    const prepareStarted = performance.now();
     // Sample positions per distinct axis, packed into two shared buffers.
     const indexChunks: Uint32Array[] = [];
     const weightChunks: Float32Array[] = [];
@@ -203,127 +224,172 @@ export class ExportTileGpuSampler {
 
     const results: ExportFieldSample[] = new Array(requests.length);
     const batchLimit = Math.min(BATCH_BYTES, device.limits.maxBufferSize, device.limits.maxStorageBufferBindingSize);
-    let batchStart = 0;
+    // Requests whose aligned output slots fit one batch.
+    const batches: Batch[] = [];
+    for (let start = 0; start < requests.length;) {
+      const slots: number[] = [];
+      let bytes = 0;
+      let end = start;
+      while (end < requests.length) {
+        const requestBytes = alignUp(Math.max(4, requests[end].width * requests[end].height * 4), SLOT_ALIGNMENT);
+        if (end > start && bytes + requestBytes > batchLimit) break;
+        slots.push(bytes);
+        bytes += requestBytes;
+        end++;
+      }
+      batches.push({ start, end, slots, bytes });
+      start = end;
+    }
+    this.timings.prepareMs += performance.now() - prepareStarted;
+    // Batch i uses buffer set i % 2. The next batch is submitted before this
+    // one is copied out, so the GPU and its readback run while this worker
+    // copies; a set is reused only after its earlier batch was read.
+    const pending: Array<{ batch: Batch; set: Required<BatchBuffers>; mapped: Promise<void> }> = [];
     try {
-      while (batchStart < requests.length) {
-        // Requests whose aligned output slots fit one batch.
-        const slots: number[] = [];
-        let batchBytes = 0;
-        let end = batchStart;
-        while (end < requests.length) {
-          const bytes = alignUp(Math.max(4, requests[end].width * requests[end].height * 4), SLOT_ALIGNMENT);
-          if (end > batchStart && batchBytes + bytes > batchLimit) break;
-          slots.push(batchBytes);
-          batchBytes += bytes;
-          end++;
+      for (let index = 0; index <= batches.length; index++) {
+        if (index < batches.length) {
+          const batch = batches[index];
+          const set = this.submitBatch(requests, layouts, batch, indexBuffer, weightBuffer, this.batchSets[index % 2]);
+          const mapped = set.readback.mapAsync(MAP_READ_MODE, 0, batch.bytes);
+          // A failure surfaces when this batch is read below; never unhandled.
+          mapped.catch(() => undefined);
+          pending.push({ batch, set, mapped });
         }
-        await this.sampleBatch(requests, layouts, batchStart, end, slots, batchBytes, indexBuffer, weightBuffer, results);
-        batchStart = end;
+        // Keep one batch in flight: read the older one once the next is queued.
+        if (pending.length > 1 || (index === batches.length && pending.length > 0)) {
+          await this.readBatch(requests, pending.shift()!, results);
+        }
       }
     } finally {
+      // After a failure, let batches still in flight land before unmapping,
+      // so the next call never finds a buffer mapped or mid-mapping.
+      for (const entry of pending) {
+        await entry.mapped.catch(() => undefined);
+      }
+      for (const set of this.batchSets) {
+        if (set.readback?.mapState === "mapped") set.readback.unmap();
+      }
       indexBuffer.destroy();
       weightBuffer.destroy();
     }
     return results;
   }
 
-  private async sampleBatch(
+  /** Encodes and submits one batch into `set` (grown as needed). */
+  private submitBatch(
     requests: readonly ExportFieldSampleRequest[],
     layouts: ReadonlyArray<{ x: AxisOffsets; y: AxisOffsets }>,
-    start: number,
-    end: number,
-    slots: readonly number[],
-    batchBytes: number,
+    batch: Batch,
     indexBuffer: GPUBuffer,
     weightBuffer: GPUBuffer,
-    results: ExportFieldSample[],
-  ): Promise<void> {
+    set: BatchBuffers,
+  ): Required<BatchBuffers> {
+    const encodeStarted = performance.now();
     const device = this.device;
+    const { start, end, slots } = batch;
     const count = end - start;
-    const { output, readback, uniforms } = this.batchBuffers(batchBytes, count * SLOT_ALIGNMENT);
-    try {
-      const params = new ArrayBuffer(count * SLOT_ALIGNMENT);
-      const words = new Uint32Array(params);
-      const floats = new Float32Array(params);
-      for (let slot = 0; slot < count; slot++) {
-        const request = requests[start + slot];
-        const layout = layouts[start + slot];
-        const base = (slot * SLOT_ALIGNMENT) / 4;
-        words[base] = request.width;
-        words[base + 1] = request.height;
-        words[base + 2] = request.sourceWidth;
-        words[base + 3] = request.nearest ? 1 : 0;
-        words[base + 4] = layout.x.index;
-        words[base + 5] = layout.y.index;
-        words[base + 6] = layout.x.weight;
-        words[base + 7] = layout.y.weight;
-        floats[base + 8] = request.scale ?? 1;
-      }
-      device.queue.writeBuffer(uniforms, 0, params);
-      const encoder = device.createCommandEncoder();
-      const pass = encoder.beginComputePass();
-      pass.setPipeline(this.pipeline);
-      for (let slot = 0; slot < count; slot++) {
-        const request = requests[start + slot];
-        const cells = request.width * request.height;
-        if (cells === 0) continue;
-        pass.setBindGroup(0, device.createBindGroup({
-          layout: this.pipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: { buffer: this.sourceBuffer(request.source) } },
-            { binding: 1, resource: { buffer: indexBuffer } },
-            { binding: 2, resource: { buffer: weightBuffer } },
-            { binding: 3, resource: { buffer: output, offset: slots[slot], size: cells * 4 } },
-            { binding: 4, resource: { buffer: uniforms, offset: slot * SLOT_ALIGNMENT, size: PARAMS_BYTES } },
-          ],
-        }));
-        pass.dispatchWorkgroups(Math.ceil(request.width / WORKGROUP), Math.ceil(request.height / WORKGROUP));
-      }
-      pass.end();
-      encoder.copyBufferToBuffer(output, 0, readback, 0, batchBytes);
-      device.queue.submit([encoder.finish()]);
-      await readback.mapAsync(MAP_READ_MODE, 0, batchBytes);
-      const mapped = readback.getMappedRange(0, batchBytes);
-      for (let slot = 0; slot < count; slot++) {
-        const request = requests[start + slot];
-        const values = new Float32Array(mapped, slots[slot], request.width * request.height);
-        results[start + slot] = toRequestedType(values, request);
-      }
-      readback.unmap();
-    } finally {
-      if (readback.mapState === "mapped") readback.unmap();
+    const { output, readback, uniforms } = this.growBatchBuffers(set, batch.bytes, count * SLOT_ALIGNMENT);
+    const params = new ArrayBuffer(count * SLOT_ALIGNMENT);
+    const words = new Uint32Array(params);
+    const floats = new Float32Array(params);
+    for (let slot = 0; slot < count; slot++) {
+      const request = requests[start + slot];
+      const layout = layouts[start + slot];
+      const base = (slot * SLOT_ALIGNMENT) / 4;
+      words[base] = request.width;
+      words[base + 1] = request.height;
+      words[base + 2] = request.sourceWidth;
+      words[base + 3] = request.nearest ? 1 : 0;
+      words[base + 4] = layout.x.index;
+      words[base + 5] = layout.y.index;
+      words[base + 6] = layout.x.weight;
+      words[base + 7] = layout.y.weight;
+      floats[base + 8] = request.scale ?? 1;
     }
+    device.queue.writeBuffer(uniforms, 0, params);
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipeline);
+    for (let slot = 0; slot < count; slot++) {
+      const request = requests[start + slot];
+      const cells = request.width * request.height;
+      if (cells === 0) continue;
+      pass.setBindGroup(0, device.createBindGroup({
+        layout: this.pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.sourceBuffer(request.source) } },
+          { binding: 1, resource: { buffer: indexBuffer } },
+          { binding: 2, resource: { buffer: weightBuffer } },
+          { binding: 3, resource: { buffer: output, offset: slots[slot], size: cells * 4 } },
+          { binding: 4, resource: { buffer: uniforms, offset: slot * SLOT_ALIGNMENT, size: PARAMS_BYTES } },
+        ],
+      }));
+      pass.dispatchWorkgroups(Math.ceil(request.width / WORKGROUP), Math.ceil(request.height / WORKGROUP));
+    }
+    pass.end();
+    encoder.copyBufferToBuffer(output, 0, readback, 0, batch.bytes);
+    device.queue.submit([encoder.finish()]);
+    this.timings.encodeMs += performance.now() - encodeStarted;
+    return { output, readback, uniforms };
   }
 
-  /** Output, readback and uniform buffers shared by all batches, grown on demand. */
-  private batchBuffers(bytes: number, uniformBytes: number): {
-    output: GPUBuffer;
-    readback: GPUBuffer;
-    uniforms: GPUBuffer;
-  } {
-    if (!this.batchOutput || !this.batchReadback || bytes > this.batchOutput.size) {
-      this.batchOutput?.destroy();
-      this.batchReadback?.destroy();
-      const size = Math.max(bytes, BATCH_BYTES);
-      this.batchOutput = this.device.createBuffer({ size, usage: STORAGE | COPY_SRC });
-      this.batchReadback = this.device.createBuffer({ size, usage: MAP_READ | COPY_DST });
+  /** Waits for a submitted batch's readback and copies its samples out. */
+  private async readBatch(
+    requests: readonly ExportFieldSampleRequest[],
+    { batch, set, mapped }: { batch: Batch; set: Required<BatchBuffers>; mapped: Promise<void> },
+    results: ExportFieldSample[],
+  ): Promise<void> {
+    const waitStarted = performance.now();
+    await mapped;
+    const copyStarted = performance.now();
+    this.timings.waitMs += copyStarted - waitStarted;
+    try {
+      const range = set.readback.getMappedRange(0, batch.bytes);
+      for (let slot = 0; slot < batch.end - batch.start; slot++) {
+        const request = requests[batch.start + slot];
+        const cells = request.width * request.height;
+        const offset = batch.slots[slot];
+        // Float samples leave as one block copy of the mapped range; a typed
+        // array copy of the view went element by element at half the speed.
+        results[batch.start + slot] = request.output === "u8" || request.output === "i8"
+          ? toRequestedType(new Float32Array(range, offset, cells), request)
+          : new Float32Array(range.slice(offset, offset + cells * 4));
+      }
+    } finally {
+      set.readback.unmap();
     }
-    if (!this.batchUniforms || uniformBytes > this.batchUniforms.size) {
-      this.batchUniforms?.destroy();
-      this.batchUniforms = this.device.createBuffer({
+    this.timings.copyMs += performance.now() - copyStarted;
+    this.timings.readbackBytes += batch.bytes;
+    this.timings.batches += 1;
+  }
+
+  /** A set's output, readback and uniform buffers, grown on demand. */
+  private growBatchBuffers(set: BatchBuffers, bytes: number, uniformBytes: number): Required<BatchBuffers> {
+    if (!set.output || !set.readback || bytes > set.output.size) {
+      set.output?.destroy();
+      set.readback?.destroy();
+      const size = Math.max(bytes, BATCH_BYTES);
+      set.output = this.device.createBuffer({ size, usage: STORAGE | COPY_SRC });
+      set.readback = this.device.createBuffer({ size, usage: MAP_READ | COPY_DST });
+    }
+    if (!set.uniforms || uniformBytes > set.uniforms.size) {
+      set.uniforms?.destroy();
+      set.uniforms = this.device.createBuffer({
         size: Math.max(uniformBytes, 64 * SLOT_ALIGNMENT),
         usage: UNIFORM | COPY_DST,
       });
     }
-    return { output: this.batchOutput, readback: this.batchReadback, uniforms: this.batchUniforms };
+    return set as Required<BatchBuffers>;
   }
 
   dispose(): void {
     for (const buffer of this.sourceBuffers.values()) buffer.destroy();
     this.sourceBuffers.clear();
-    this.batchOutput?.destroy();
-    this.batchReadback?.destroy();
-    this.batchUniforms?.destroy();
+    for (const set of this.batchSets) {
+      set.output?.destroy();
+      set.readback?.destroy();
+      set.uniforms?.destroy();
+    }
     this.device.destroy();
   }
 }

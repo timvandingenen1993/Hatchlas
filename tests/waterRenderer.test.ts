@@ -105,8 +105,8 @@ describe('water renderer', () => {
 
     expect(first.waterAlpha.some((value) => value > 0)).toBe(true);
     expect(first.bankAlpha.some((value) => value > 0)).toBe(true);
-    // Narrow rivers keep only fill and outline; no centreline charcoal dashes.
-    expect(first.flowAlpha.some((value) => value > 0)).toBe(false);
+    // Rivers too narrow for a line along each bank get one down the middle.
+    expect(first.flowAlpha.some((value) => value > 0)).toBe(true);
     expect(first.riverContourAlpha?.some((value) => value > 0)).toBe(true);
 
     const bankValues = new Set(first.bankAlpha.filter((value) => value > 0));

@@ -1,5 +1,6 @@
 import { SimplexNoise } from "../core/noise";
 import type { MountainProfiler } from "./mountainProfiler";
+import { renderStandWashGl } from "./vegetationFieldGl";
 import {
   FOREST_STAND_REFERENCE_TREE_SIZE,
   boxBlur,
@@ -37,9 +38,125 @@ function lightTone(light: number, strength: number): number {
 }
 
 
+/** A coarse colour grid the wash is shifted toward (see shiftWashCells in forestInkRenderer). */
+export interface ForestStandWashShift {
+  step: number;
+  columns: number;
+  rows: number;
+  /** RGB per cell; NaN red where the grid has no colour. */
+  rgb: Float32Array;
+  /** The wash colour the shift is measured from. */
+  base: readonly number[];
+}
+
+/**
+ * The opaque tree fill and the stand wash of forestStandWashCells(…, true,
+ * washCells, washCellStrength) on the GPU, both shifted toward `shift` when
+ * given. Null when the GPU is unavailable.
+ */
+export function forestStandWashCellsGl(
+  stands: ForestStandGeometry,
+  paint: ForestStandPaint,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  washCellStrength: number,
+  shift?: ForestStandWashShift,
+): { fill: Uint8ClampedArray<ArrayBuffer>; wash: Uint8ClampedArray<ArrayBuffer> } | null {
+  const width = Math.max(0, x1 - x0);
+  const height = Math.max(0, y1 - y0);
+  if (width === 0 || height === 0 || x0 < 0 || y0 < 0 || x1 > stands.maskWidth || y1 > stands.maskHeight) return null;
+  let shade: Float32Array | undefined;
+  if (stands.shade) {
+    shade = new Float32Array(width * height);
+    for (let y = 0; y < height; y++) {
+      const row = (y0 + y) * stands.maskWidth;
+      shade.set(stands.shade.subarray(row + x0, row + x1), y * width);
+    }
+  }
+  return renderStandWashGl({
+    ...forestStandWashSetup(stands, paint, x0, y0, x1, y1),
+    x0,
+    y0,
+    width,
+    height,
+    seed: stands.seed,
+    shade,
+    lightStrength: paint.lightStrength,
+    washStrength: paint.washStrength,
+    washCellStrength,
+    shift,
+  });
+}
+
 function hexToRgb(hex: string): [number, number, number] {
   const value = Number.parseInt(hex.replace("#", ""), 16);
   return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+}
+
+/**
+ * What the stand wash of mask cells [x0, x1) × [y0, y1) reads besides the
+ * noise: the stand mask around them (blurred for soft edges), the edge and
+ * bloom ramps and the two wash colours. Shared by the CPU and GPU painters.
+ */
+export interface ForestStandWashSetup {
+  unit: number;
+  /** Stand mask over [mx0, mx0 + mw) × [my0, my0 + mh). */
+  local: Float32Array;
+  mx0: number;
+  my0: number;
+  mw: number;
+  mh: number;
+  edgeFrom: number;
+  edgeTo: number;
+  bloomEdge: number;
+  variation: number;
+  wash: [number, number, number];
+  warm: [number, number, number];
+}
+
+export function forestStandWashSetup(
+  stands: ForestStandGeometry,
+  paint: ForestStandPaint,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+): ForestStandWashSetup {
+  const { maskWidth, maskHeight } = stands;
+  const unit = stands.treeSize / FOREST_STAND_REFERENCE_TREE_SIZE;
+  // Softness beyond the default blurs the patch edge further; the alpha
+  // ramp widens with it, so low values give a crisper edge.
+  const extraBlur = Math.round(Math.max(0, paint.washSoftness - 0.25) * 12 * unit);
+  const mx0 = Math.max(0, x0 - extraBlur);
+  const my0 = Math.max(0, y0 - extraBlur);
+  const mx1 = Math.min(maskWidth, x1 + extraBlur);
+  const my1 = Math.min(maskHeight, y1 + extraBlur);
+  const mw = mx1 - mx0;
+  const mh = my1 - my0;
+  let local: Float32Array = new Float32Array(Math.max(0, mw * mh));
+  for (let y = 0; y < mh; y++) {
+    local.set(stands.mask.subarray((my0 + y) * maskWidth + mx0, (my0 + y) * maskWidth + mx1), y * mw);
+  }
+  if (extraBlur > 0 && mw > 0 && mh > 0) local = boxBlur(local, mw, mh, extraBlur);
+  const edgeSpan = 0.1 + paint.washSoftness * 1.6;
+  const wash = hexToRgb(paint.washColor);
+  return {
+    unit,
+    local,
+    mx0,
+    my0,
+    mw,
+    mh,
+    edgeFrom: Math.max(0, 0.5 - edgeSpan),
+    edgeTo: Math.min(1, 0.5 + edgeSpan * 0.6),
+    // Splotch edges: the default 0.25 gives the original crisp blooms.
+    bloomEdge: 0.05 + paint.washSoftness * 0.4,
+    variation: paint.washVariation,
+    wash,
+    warm: [wash[0] * 1.25, wash[1] * 1.12, wash[2] * 0.85],
+  };
 }
 
 /**
@@ -66,29 +183,9 @@ export function forestStandWashCells(
   const height = Math.max(0, y1 - y0);
   const out = new Uint8ClampedArray(width * height * 4);
   if (width === 0 || height === 0) return out;
-  const unit = stands.treeSize / FOREST_STAND_REFERENCE_TREE_SIZE;
-  // Softness beyond the default blurs the patch edge further; the alpha
-  // ramp widens with it, so low values give a crisper edge.
-  const extraBlur = Math.round(Math.max(0, paint.washSoftness - 0.25) * 12 * unit);
-  const mx0 = Math.max(0, x0 - extraBlur);
-  const my0 = Math.max(0, y0 - extraBlur);
-  const mx1 = Math.min(maskWidth, x1 + extraBlur);
-  const my1 = Math.min(maskHeight, y1 + extraBlur);
-  const mw = mx1 - mx0;
-  const mh = my1 - my0;
-  let local: Float32Array = new Float32Array(Math.max(0, mw * mh));
-  for (let y = 0; y < mh; y++) {
-    local.set(stands.mask.subarray((my0 + y) * maskWidth + mx0, (my0 + y) * maskWidth + mx1), y * mw);
-  }
-  if (extraBlur > 0 && mw > 0 && mh > 0) local = boxBlur(local, mw, mh, extraBlur);
-  const edgeSpan = 0.1 + paint.washSoftness * 1.6;
-  const edgeFrom = Math.max(0, 0.5 - edgeSpan);
-  const edgeTo = Math.min(1, 0.5 + edgeSpan * 0.6);
-  // Splotch edges: the default 0.25 gives the original crisp blooms.
-  const bloomEdge = 0.05 + paint.washSoftness * 0.4;
-  const variation = paint.washVariation;
-  const wash = hexToRgb(paint.washColor);
-  const warm: [number, number, number] = [wash[0] * 1.25, wash[1] * 1.12, wash[2] * 0.85];
+  const {
+    unit, local, mx0, my0, mw, edgeFrom, edgeTo, bloomEdge, variation, wash, warm,
+  } = forestStandWashSetup(stands, paint, x0, y0, x1, y1);
   const mottle = new SimplexNoise(stands.seed + 505);
   const blooms = new SimplexNoise(stands.seed + 515);
   for (let y = y0; y < y1; y++) {

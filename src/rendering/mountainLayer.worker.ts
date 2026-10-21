@@ -27,7 +27,11 @@ import {
 } from "./mountainProfiler";
 
 import type { MountainLayerPreparationMode } from "./mountainLayerWorkerPool";
-import { placeRasterPropsInParallel } from "./parallelPropPlacement";
+import {
+  buildPropStandsInParallel,
+  placeRasterPropsInParallel,
+  warmPlacementHelpers,
+} from "./parallelPropPlacement";
 
 interface PrepareMessage {
   type: "prepare";
@@ -35,6 +39,8 @@ interface PrepareMessage {
   dem: MountainDEMData;
   options: MountainRenderOptions;
   vegetationGeometryOverride?: VegetationGeometry;
+  /** One half of a "vegetationGeometry" job. */
+  vegetationPart?: "flow" | "props";
   mode?: MountainLayerPreparationMode;
   profile?: boolean;
 }
@@ -42,6 +48,11 @@ interface PrepareMessage {
 interface CancelMessage {
   type: "cancel";
   id: number;
+}
+
+/** Start the prop placement helpers before the first props job. */
+interface WarmPlacementMessage {
+  type: "warmPlacement";
 }
 
 interface PreparationResult {
@@ -166,7 +177,9 @@ async function prepare(message: PrepareMessage): Promise<void> {
     // of a "vegetation" job, run on separate workers and merged afterwards.
     const vegetationPart: VegetationLayerPart = mode === "vegetationFlow" || mode === "vegetationGeometryFlow"
       ? "flow"
-      : mode === "vegetationProps" || mode === "vegetationGeometryProps" ? "props" : "all";
+      : mode === "vegetationProps" || mode === "vegetationGeometryProps"
+        ? "props"
+        : mode === "vegetationGeometry" ? message.vegetationPart ?? "all" : "all";
     const waterOverlay = waterGeometry && !vegetationJob
       ? renderWaterOverlayFromGeometry(dem, stage.options, waterGeometry, profiler)
       : null;
@@ -212,6 +225,8 @@ async function prepare(message: PrepareMessage): Promise<void> {
       postCancellation(id);
       return;
     }
+    // With placements from the helpers, the stands are built on them too.
+    const deferStands = Boolean(rasterPropPlacements);
     const vegetationGeometry = shouldBuildVegetation
       ? message.vegetationGeometryOverride ??
         buildVegetationGeometry(
@@ -221,8 +236,12 @@ async function prepare(message: PrepareMessage): Promise<void> {
           undefined,
           vegetationPart,
           rasterPropPlacements,
+          deferStands,
         )
       : null;
+    if (vegetationGeometry && !message.vegetationGeometryOverride && deferStands) {
+      await buildPropStandsInParallel(vegetationGeometry, vegetationDem, options.vegetation, profiler);
+    }
     const vegetationGeometryMs = performance.now() - vegetationGeometryStarted;
     if (isCancelled(id)) {
       postCancellation(id);
@@ -287,10 +306,14 @@ async function prepare(message: PrepareMessage): Promise<void> {
 
 self.postMessage({ type: "ready", readyAt: absoluteNow() });
 
-self.onmessage = (event: MessageEvent<PrepareMessage | CancelMessage>) => {
+self.onmessage = (event: MessageEvent<PrepareMessage | CancelMessage | WarmPlacementMessage>) => {
   const message = event.data;
   if (message.type === "cancel") {
     cancelled.add(message.id);
+    return;
+  }
+  if (message.type === "warmPlacement") {
+    warmPlacementHelpers();
     return;
   }
   void Promise.resolve().then(() => prepare(message));

@@ -33,6 +33,7 @@ export type {
   WaterStrokePathPoint,
 } from "./waterStrokeGeometry";
 export { getContourTangentAt, hash01 } from "./cartographicStrokeRenderer";
+import { OCEAN_WAVE_SEGMENT_FLOATS, renderOceanWaveSegmentsGl } from "./oceanWaveGl";
 
 export interface WaterPaintWindow {
   x0: number;
@@ -87,6 +88,8 @@ export interface WaterRendererOptions {
   /** Local pixels the caller keeps (export tile core). Ocean waves are still
    * placed over the whole region but only painted near this window. */
   paintWindow?: WaterPaintWindow;
+  /** Paint the deep-ocean wave paths on the GPU (WebGL2) when available. */
+  gpuWaves?: boolean;
   /** Procedural wetland geometry scale in output pixels (1 for preview). */
   wetlandPuddleCoordinateScale?: number;
   /** Output pixels per source DEM cell (1 for preview); sizes the river fallback smoothing. */
@@ -3013,7 +3016,8 @@ export function buildVisualWaterSurfaceDEM(
  * Draw broken charcoal contours inside the final inland-water union, in the
  * style of a hand-inked pool: pools get up to four concentric rings of short,
  * tapered, slightly bowed arcs that thin out toward the centre; rivers get one
- * inset line along each bank where they are wide enough to hold it. Depth
+ * inset line along each bank where they are wide enough to hold it, and one
+ * line down the middle where they are not. Depth
  * comes from the sub-pixel shore distance, so the arcs are smooth.
  */
 function buildUnifiedInlandWaterContours(
@@ -3086,8 +3090,12 @@ function buildUnifiedInlandWaterContours(
   // Length changes the size of correlated uninterrupted chunks along the
   // contour; it must not turn curved chunks into straight tangent chords.
   const lengthScale = (value: number) => Math.max(0.2, value);
-  // Density only shortens or lengthens the gaps between arcs.
-  const densityShift = (Math.min(2, Math.max(0, options.density)) - 0.5) * 0.2;
+  // Density only shortens or lengthens the gaps between arcs. The control
+  // arrives divided by the output pixel scale (scaleWaterPresentationOptions),
+  // but arc spacing below already scales with coordinateScale, so undo that
+  // division; the break threshold clamp bounds high values.
+  const densityShift =
+    (Math.max(0, options.density) * coordinateScale - 0.5) * 0.2;
   const bandBreakBase = [0.5, 0.57, 0.63, 0.68];
   // Pool rings start clear of the outline so they never read as a second
   // shoreline, then repeat inward.
@@ -3153,6 +3161,50 @@ function buildUnifiedInlandWaterContours(
   const minPoolFirstDepth = halfWidth + 1.5 * coordinateScale;
   const minPoolRingSpacing = 2 * halfWidth + 1.5 * coordinateScale;
 
+  // Rivers narrower than the two-bank layout get one line down the middle.
+  // Their half-width is the deepest river pixel nearby: a square max filter
+  // over river pixels only (pools and ocean read as zero), wide enough to
+  // reach the middle of any channel that still takes the single line.
+  // Thinner channels than minCentreHalfWidth stay clear so the line never
+  // merges with the outline.
+  const twinBankHalfWidth = targetDepth * 1.6;
+  const minCentreHalfWidth = halfWidth + 1.5 * coordinateScale;
+  const ridgeRadius = Math.ceil(twinBankHalfWidth) + 1;
+  const riverPixels: number[] = [];
+  for (let index = 0; index < waterMask.length; index++) {
+    if (
+      waterMask[index] === 1 &&
+      options.poolMask[index] !== 1 &&
+      oceanCoverage[index] < 128 &&
+      shoreSignedDistance[index] < 0
+    ) {
+      riverPixels.push(index);
+    }
+  }
+  const rowRidge = new Float32Array(waterMask.length);
+  for (const index of riverPixels) {
+    const depth = -shoreSignedDistance[index];
+    const x = index % width;
+    const rowStart = index - x;
+    const x0 = Math.max(0, x - ridgeRadius);
+    const x1 = Math.min(width - 1, x + ridgeRadius);
+    for (let sx = x0; sx <= x1; sx++) {
+      if (depth > rowRidge[rowStart + sx]) rowRidge[rowStart + sx] = depth;
+    }
+  }
+  const riverHalfWidth = new Float32Array(waterMask.length);
+  for (const index of riverPixels) {
+    const x = index % width;
+    const y = (index - x) / width;
+    const y0 = Math.max(0, y - ridgeRadius);
+    const y1 = Math.min(height - 1, y + ridgeRadius);
+    let ridge = 0;
+    for (let sy = y0; sy <= y1; sy++) {
+      ridge = Math.max(ridge, rowRidge[sy * width + x]);
+    }
+    riverHalfWidth[index] = ridge;
+  }
+
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const index = y * width + x;
@@ -3179,12 +3231,25 @@ function buildUnifiedInlandWaterContours(
       const gx = depthAt(x + 1, y) - depthAt(x - 1, y);
       const gy = depthAt(x, y + 1) - depthAt(x, y - 1);
       const gradient = Math.hypot(gx, gy);
-      if (gradient < 1.2) continue;
+      const channelHalfWidth = isPool ? 0 : riverHalfWidth[index];
+      const centreLine = !isPool && channelHalfWidth < twinBankHalfWidth;
+      // The centre line sits on the medial axis, where the gradient is
+      // expected to collapse.
+      if (gradient < 1.2 && !centreLine) continue;
 
       let band = 0;
       let bandCenter = targetDepth;
+      let narrowFade = 1;
       const fit = isPool ? Math.max(0.05, poolFit[index]) : 1;
-      if (isPool) {
+      if (centreLine) {
+        if (channelHalfWidth < minCentreHalfWidth) continue;
+        bandCenter = channelHalfWidth;
+        narrowFade = smoothstep(
+          minCentreHalfWidth,
+          minCentreHalfWidth + coordinateScale,
+          channelHalfWidth,
+        );
+      } else if (isPool) {
         // Pools: several concentric rings of short bowed arcs, sparser
         // toward the centre, like hand-drawn ripple contours. A slow wobble
         // bends each arc slightly off the shoreline curve.
@@ -3207,8 +3272,8 @@ function buildUnifiedInlandWaterContours(
         if (band > 3) continue;
         bandCenter = firstDepth + band * ringSpacing + wobble;
       } else {
-        // Rivers: one line along each bank, only where the channel is at
-        // least ~1.6x as wide as the inset (depth there is 2W - 2d).
+        // Wider rivers: one line along each bank, only where the channel is
+        // at least ~1.6x as wide as the inset (depth there is 2W - 2d).
         const inward = depthAt(
           x + (gx / gradient) * targetDepth,
           y + (gy / gradient) * targetDepth,
@@ -3244,7 +3309,8 @@ function buildUnifiedInlandWaterContours(
       const tooth =
         1 - toothVariation + toothVariation * hash01(globalIndex, 469);
       const ringFade =
-        thinLineInk * 0.82 * Math.pow(0.88, band) * (0.55 + 0.45 * strength);
+        thinLineInk * 0.82 * Math.pow(0.88, band) * (0.55 + 0.45 * strength) *
+        narrowFade;
       alpha[index] = Math.round(edgeCoverage * tooth * ringFade * 255);
       tone[index] = Math.round(60 + hash01(globalIndex, 477) * 50);
     }
@@ -3808,6 +3874,8 @@ export interface OceanLineRenderParams {
   distanceNormalizationMax?: number;
   /** Only pixels inside this window are painted by the offshore wave pass. */
   paintWindow?: WaterPaintWindow;
+  /** Paint the wave paths' segments on the GPU when available. */
+  gpuWaves?: boolean;
   /** Number of coastal bands before offshore orientation begins to relax. */
   coastalTransitionBands?: number;
   deepOceanWaveShadingScale?: number;
@@ -4090,6 +4158,143 @@ function paintOceanWaveInkDot(
   }
 }
 
+/** Per-path constants of the wave painter, shared by the CPU and GPU painters. */
+export interface OceanWavePaint {
+  softScale: number;
+  pathStart: number;
+  pathEnd: number;
+  shadingFadeLength: number;
+  ridgeWidth: number;
+  inkWidth: number;
+  shadowBase: number;
+  lightBase: number;
+  bandScale: number;
+  maxReach: number;
+  acrossLimit: number;
+  marksReach: number;
+}
+
+export function oceanWavePaint(
+  path: readonly OceanWavePathPoint[],
+  markScale: number,
+  waveThickness: number,
+  shadingScale: number,
+  smoothing: number,
+): OceanWavePaint {
+  const pathLength = Math.max(0, path[path.length - 1].along - path[0].along);
+  const shadowBase = Math.max(2.5 * markScale, waveThickness * 2.7);
+  const lightBase = Math.max(2.2 * markScale, waveThickness * 2.2);
+  const bandScale = Math.max(0.25, shadingScale * 1.9);
+  const ridgeWidth = Math.max(0.45 * markScale, waveThickness * 0.52);
+  const inkWidth = Math.max(0.65 * markScale, waveThickness * 0.5);
+  return {
+    softScale: 1 / (1 + Math.max(0, smoothing) * 0.2),
+    pathStart: path[0].along,
+    pathEnd: path[path.length - 1].along,
+    shadingFadeLength: Math.min(
+      pathLength * 0.48,
+      Math.max(12 * markScale, pathLength * 0.34),
+    ),
+    ridgeWidth,
+    inkWidth,
+    shadowBase,
+    lightBase,
+    bandScale,
+    maxReach: Math.max(
+      shadowBase * bandScale + 3.2 * markScale * bandScale,
+      lightBase * bandScale + 2.8 * markScale * bandScale,
+    ) + 1.15 * markScale * bandScale,
+    // Nothing is painted beyond the widest band a pixel's turbulence can reach
+    // (|texture| <= 1, broad noise in [-1, 1]); skip those before sampling noise.
+    acrossLimit: Math.max(
+      shadowBase * bandScale + 3.3 * markScale * bandScale,
+      lightBase * bandScale + 2.7 * markScale * bandScale,
+    ) + 1.15 * markScale * bandScale,
+    marksReach: Math.max(ridgeWidth, inkWidth, 0.5 * markScale, waveThickness * 1.02),
+  };
+}
+
+/** One painted segment of a wave path and the pixel rectangle it may touch. */
+export interface OceanWaveSegment {
+  a: OceanWavePathPoint;
+  b: OceanWavePathPoint;
+  shading: boolean;
+  marks: boolean;
+  /** Pixels at least this far across the ridge are left alone. */
+  limit: number;
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
+
+/**
+ * Visits every segment the painter draws, with its pixel rectangle clipped to
+ * the paint window. Samples are 0.45px apart while each segment shades
+ * 1×markScale past its ends, so at export scale every pixel of the wide
+ * shading bands was shaded ~19 times. Shade those bands from every
+ * floor(markScale)-th sample (the preview's overlap), and draw the thin
+ * ridge/ink/foam marks from every sample in a separate narrow pass so their
+ * edges stay exactly as before.
+ */
+export function forEachOceanWaveSegment(
+  path: readonly OceanWavePathPoint[],
+  paint: OceanWavePaint,
+  markScale: number,
+  width: number,
+  height: number,
+  window: WaterPaintWindow | undefined,
+  visit: (segment: OceanWaveSegment) => void,
+): void {
+  const windowX0 = Math.max(0, window?.x0 ?? 0);
+  const windowY0 = Math.max(0, window?.y0 ?? 0);
+  const windowX1 = Math.min(width, window?.x1 ?? width);
+  const windowY1 = Math.min(height, window?.y1 ?? height);
+  const shadingStride = Math.max(1, Math.floor(markScale));
+  const passes = shadingStride === 1
+    ? [{ points: path, shading: true, marks: true, limit: paint.acrossLimit }]
+    : [
+        {
+          points: path.filter((_, index) => index % shadingStride === 0 || index === path.length - 1),
+          shading: true, marks: false, limit: paint.acrossLimit,
+        },
+        // Keep the full reach: `across` follows the interpolated shore normal,
+        // which can be rotated against the segment, so a mark pixel is not
+        // necessarily geometrically near it.
+        { points: path, shading: false, marks: true, limit: paint.marksReach },
+      ];
+  for (const pass of passes) for (let segment = 0; segment < pass.points.length - 1; segment++) {
+    const a = pass.points[segment];
+    const b = pass.points[segment + 1];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    // A stalled sample has no direction; its neighbours cover the point, and
+    // painting it would sweep a strip along the shore normal.
+    if (dx === 0 && dy === 0) continue;
+    const segmentLength = Math.sqrt(dx * dx + dy * dy);
+    let reach = paint.maxReach + 1.5 * markScale;
+    if (!pass.shading) {
+      // Bound the thin marks even when the shore normal is tilted against
+      // the segment. Same-sign endpoint cross products bound every normalized
+      // interpolated normal; add the end-cap allowance before dividing.
+      const crossA = (dx * a.shoreNormalY - dy * a.shoreNormalX) / segmentLength;
+      const crossB = (dx * b.shoreNormalY - dy * b.shoreNormalX) / segmentLength;
+      if (crossA * crossB > 0) {
+        const normalMax = Math.max(Math.hypot(a.shoreNormalX, a.shoreNormalY),
+          Math.hypot(b.shoreNormalX, b.shoreNormalY));
+        const alignment = Math.min(Math.abs(crossA), Math.abs(crossB)) / normalMax;
+        reach = Math.min(reach, (pass.limit + markScale) / alignment + markScale + 1);
+      }
+    }
+    const minX = Math.max(windowX0, Math.floor(Math.min(a.x, b.x) - reach));
+    const maxX = Math.min(windowX1 - 1, Math.ceil(Math.max(a.x, b.x) + reach));
+    const minY = Math.max(windowY0, Math.floor(Math.min(a.y, b.y) - reach));
+    const maxY = Math.min(windowY1 - 1, Math.ceil(Math.max(a.y, b.y) + reach));
+    if (maxX < minX || maxY < minY) continue;
+    visit({ a, b, shading: pass.shading, marks: pass.marks, limit: pass.limit, minX, maxX, minY, maxY });
+  }
+}
+
 export function paintOceanWavePath(
   path: OceanWavePathPoint[],
   alpha: Uint8Array,
@@ -4113,83 +4318,52 @@ export function paintOceanWavePath(
   window?: WaterPaintWindow,
 ): void {
   if (path.length < 2) return;
-  const windowX0 = Math.max(0, window?.x0 ?? 0);
-  const windowY0 = Math.max(0, window?.y0 ?? 0);
-  const windowX1 = Math.min(width, window?.x1 ?? width);
-  const windowY1 = Math.min(height, window?.y1 ?? height);
-  const softScale = 1 / (1 + Math.max(0, smoothing) * 0.2);
-  const pathLength = Math.max(0, path[path.length - 1].along - path[0].along);
-  const shadingFadeLength = Math.min(
-    pathLength * 0.48,
-    Math.max(12 * markScale, pathLength * 0.34),
+  paintOceanWaveSegments(
+    path, alpha, tone, lightAlpha, shadowAlpha, foamAlpha, inkAlpha, oceanClip, width, height, seed,
+    markScale, waveThickness, shadingScale, shadingIntensity, smoothing, coordinateOffsetX, coordinateOffsetY, window,
   );
-  const ridgeWidth = Math.max(0.45 * markScale, waveThickness * 0.52);
-  const inkWidth = Math.max(0.65 * markScale, waveThickness * 0.5);
-  const shadowBase = Math.max(2.5 * markScale, waveThickness * 2.7);
-  const lightBase = Math.max(2.2 * markScale, waveThickness * 2.2);
-  const bandScale = Math.max(0.25, shadingScale * 1.9);
-  const maxReach = Math.max(
-    shadowBase * bandScale + 3.2 * markScale * bandScale,
-    lightBase * bandScale + 2.8 * markScale * bandScale,
-  ) + 1.15 * markScale * bandScale;
-  // Nothing is painted beyond the widest band a pixel's turbulence can reach
-  // (|texture| <= 1, broad noise in [-1, 1]); skip those before sampling noise.
-  const acrossLimit = Math.max(
-    shadowBase * bandScale + 3.3 * markScale * bandScale,
-    lightBase * bandScale + 2.7 * markScale * bandScale,
-  ) + 1.15 * markScale * bandScale;
-  // Samples are 0.45px apart while each segment shades 1×markScale past its
-  // ends, so at export scale every pixel of the wide shading bands was shaded
-  // ~19 times. Shade those bands from every floor(markScale)-th sample (the
-  // preview's overlap), and draw the thin ridge/ink/foam marks from every
-  // sample in a separate narrow pass so their edges stay exactly as before.
-  const shadingStride = Math.max(1, Math.floor(markScale));
-  const marksReach = Math.max(ridgeWidth, inkWidth, 0.5 * markScale, waveThickness * 1.02);
-  const passes = shadingStride === 1
-    ? [{ points: path, shading: true, marks: true, limit: acrossLimit, reach: maxReach }]
-    : [
-        {
-          points: path.filter((_, index) => index % shadingStride === 0 || index === path.length - 1),
-          shading: true, marks: false, limit: acrossLimit, reach: maxReach,
-        },
-        // Keep the full reach: `across` follows the interpolated shore normal,
-        // which can be rotated against the segment, so a mark pixel is not
-        // necessarily geometrically near it.
-        { points: path, shading: false, marks: true, limit: marksReach, reach: maxReach },
-      ];
+  paintOceanWaveAccents(
+    path, foamAlpha, inkAlpha, oceanClip, width, height, seed, markScale,
+    coordinateOffsetX, coordinateOffsetY, coordinateStride,
+  );
+}
 
-  for (const pass of passes) for (let segment = 0; segment < pass.points.length - 1; segment++) {
-    const a = pass.points[segment];
-    const b = pass.points[segment + 1];
+/** The ridge, ink, foam and shading bands of a wave path, segment by segment. */
+function paintOceanWaveSegments(
+  path: OceanWavePathPoint[],
+  alpha: Uint8Array,
+  tone: Uint8Array,
+  lightAlpha: Uint8Array,
+  shadowAlpha: Uint8Array,
+  foamAlpha: Uint8Array,
+  inkAlpha: Uint8Array,
+  oceanClip: Uint8Array,
+  width: number,
+  height: number,
+  seed: number,
+  markScale: number,
+  waveThickness: number,
+  shadingScale: number,
+  shadingIntensity: number,
+  smoothing: number,
+  coordinateOffsetX: number,
+  coordinateOffsetY: number,
+  window?: WaterPaintWindow,
+): void {
+  const paint = oceanWavePaint(path, markScale, waveThickness, shadingScale, smoothing);
+  const {
+    softScale, shadingFadeLength, ridgeWidth, inkWidth, shadowBase, lightBase, bandScale, marksReach,
+  } = paint;
+  forEachOceanWaveSegment(path, paint, markScale, width, height, window, (pass) => {
+    const { a, b, minX, maxX } = pass;
     const dx = b.x - a.x;
     const dy = b.y - a.y;
-    // A stalled sample has no direction; its neighbours cover the point, and
-    // painting it would sweep a strip along the shore normal.
-    if (dx === 0 && dy === 0) continue;
     const lengthSquared = dx * dx + dy * dy;
     const segmentLength = Math.sqrt(lengthSquared);
     const segmentNormalX = -dy / segmentLength;
     const segmentNormalY = dx / segmentLength;
-    let reach = pass.reach + 1.5 * markScale;
-    if (!pass.shading) {
-      // Bound the thin marks even when the shore normal is tilted against
-      // the segment. Same-sign endpoint cross products bound every normalized
-      // interpolated normal; add the end-cap allowance before dividing.
-      const crossA = (dx * a.shoreNormalY - dy * a.shoreNormalX) / segmentLength;
-      const crossB = (dx * b.shoreNormalY - dy * b.shoreNormalX) / segmentLength;
-      if (crossA * crossB > 0) {
-        const normalMax = Math.max(Math.hypot(a.shoreNormalX, a.shoreNormalY),
-          Math.hypot(b.shoreNormalX, b.shoreNormalY));
-        const alignment = Math.min(Math.abs(crossA), Math.abs(crossB)) / normalMax;
-        reach = Math.min(reach, (pass.limit + markScale) / alignment + markScale + 1);
-      }
-    }
     const capProjection = markScale * segmentLength;
-    const minX = Math.max(windowX0, Math.floor(Math.min(a.x, b.x) - reach));
-    const maxX = Math.min(windowX1 - 1, Math.ceil(Math.max(a.x, b.x) + reach));
-    if (maxX < minX) continue;
-    for (let y = Math.max(windowY0, Math.floor(Math.min(a.y, b.y) - reach));
-      y <= Math.min(windowY1 - 1, Math.ceil(Math.max(a.y, b.y) + reach)); y++) {
+    for (let y = pass.minY; y <= pass.maxY; y++) {
       // Intersect each scanline with the segment's short end caps before
       // visiting pixels. Most of the expanded rectangle lies beyond them.
       const rowProjection = (y - a.y) * dy;
@@ -4339,8 +4513,123 @@ export function paintOceanWavePath(
         if (foam > 0.015) foamAlpha[index] = Math.max(foamAlpha[index], Math.round(foam * 255));
       }
     }
-  }
+  });
+}
 
+/**
+ * Paints the segments of `waves` on the GPU and merges them into the layers
+ * with max, as the CPU painter composites. False when the GPU is unavailable.
+ */
+function paintOceanWavesGl(
+  waves: readonly { path: OceanWavePathPoint[]; seed: number }[],
+  alpha: Uint8Array,
+  tone: Uint8Array,
+  lightAlpha: Uint8Array,
+  shadowAlpha: Uint8Array,
+  foamAlpha: Uint8Array,
+  inkAlpha: Uint8Array,
+  oceanClip: Uint8Array,
+  width: number,
+  height: number,
+  markScale: number,
+  waveThickness: number,
+  shadingScale: number,
+  shadingIntensity: number,
+  smoothing: number,
+  coordinateOffsetX: number,
+  coordinateOffsetY: number,
+  window: WaterPaintWindow | undefined,
+): boolean {
+  let capacity = 0;
+  for (const wave of waves) capacity += wave.path.length * 2;
+  const floats = new Float32Array(Math.max(1, capacity) * OCEAN_WAVE_SEGMENT_FLOATS);
+  const seeds = new Int32Array(Math.max(1, capacity));
+  let count = 0;
+  let shared: OceanWavePaint | undefined;
+  for (const wave of waves) {
+    const paint = oceanWavePaint(wave.path, markScale, waveThickness, shadingScale, smoothing);
+    shared ??= paint;
+    forEachOceanWaveSegment(wave.path, paint, markScale, width, height, window, (segment) => {
+      const { a, b } = segment;
+      const offset = count * OCEAN_WAVE_SEGMENT_FLOATS;
+      floats[offset] = a.x;
+      floats[offset + 1] = a.y;
+      floats[offset + 2] = a.along;
+      floats[offset + 3] = a.shoreNormalX;
+      floats[offset + 4] = a.shoreNormalY;
+      floats[offset + 5] = b.x;
+      floats[offset + 6] = b.y;
+      floats[offset + 7] = b.along;
+      floats[offset + 8] = b.shoreNormalX;
+      floats[offset + 9] = b.shoreNormalY;
+      floats[offset + 10] = paint.pathStart;
+      floats[offset + 11] = paint.pathEnd;
+      floats[offset + 12] = segment.minX;
+      floats[offset + 13] = segment.minY;
+      floats[offset + 14] = segment.maxX;
+      floats[offset + 15] = segment.maxY;
+      floats[offset + 16] = segment.limit;
+      floats[offset + 17] = paint.shadingFadeLength;
+      floats[offset + 18] = (segment.shading ? 1 : 0) + (segment.marks ? 2 : 0);
+      // The rectangle's reach around the segment, for the quad's extent.
+      floats[offset + 19] = Math.max(
+        Math.min(a.x, b.x) - segment.minX,
+        segment.maxX - Math.max(a.x, b.x),
+        Math.min(a.y, b.y) - segment.minY,
+        segment.maxY - Math.max(a.y, b.y),
+        0,
+      ) + 1;
+      seeds[count] = wave.seed | 0;
+      count++;
+    });
+  }
+  if (count === 0 || !shared) return true;
+  const painted = renderOceanWaveSegmentsGl({
+    width,
+    height,
+    oceanClip,
+    segments: { floats, seeds, count },
+    markScale,
+    waveThickness,
+    shadingIntensity,
+    softScale: shared.softScale,
+    ridgeWidth: shared.ridgeWidth,
+    inkWidth: shared.inkWidth,
+    shadowBase: shared.shadowBase,
+    lightBase: shared.lightBase,
+    bandScale: shared.bandScale,
+    marksReach: shared.marksReach,
+    offsetX: coordinateOffsetX,
+    offsetY: coordinateOffsetY,
+  });
+  if (!painted) return false;
+  const { bands, marks } = painted;
+  for (let index = 0; index < alpha.length; index++) {
+    const offset = index * 4;
+    if (bands[offset] > shadowAlpha[index]) shadowAlpha[index] = bands[offset];
+    if (bands[offset + 1] > lightAlpha[index]) lightAlpha[index] = bands[offset + 1];
+    if (bands[offset + 2] > alpha[index]) alpha[index] = bands[offset + 2];
+    if (bands[offset + 3] > tone[index]) tone[index] = bands[offset + 3];
+    if (marks[offset] > inkAlpha[index]) inkAlpha[index] = marks[offset];
+    if (marks[offset + 1] > foamAlpha[index]) foamAlpha[index] = marks[offset + 1];
+  }
+  return true;
+}
+
+/** Sparse foam fragments and ink dots beside a wave path's ridge. */
+function paintOceanWaveAccents(
+  path: OceanWavePathPoint[],
+  foamAlpha: Uint8Array,
+  inkAlpha: Uint8Array,
+  oceanClip: Uint8Array,
+  width: number,
+  height: number,
+  seed: number,
+  markScale: number,
+  coordinateOffsetX: number,
+  coordinateOffsetY: number,
+  coordinateStride: number,
+): void {
   // Sparse, nearby fragments share the ridge direction and global slot seed.
   const spacing = 5.5 * markScale;
   for (let slot = Math.ceil(path[0].along / spacing);
@@ -5090,6 +5379,10 @@ function paintOceanLineMarks(
   // -------------------------------------------------------------------------
   // 2. Feature-Aligned Offshore Contour Hatching (Poisson-Disc Sampled)
   // -------------------------------------------------------------------------
+  // With the GPU, wave segments are collected and painted together after
+  // the placement pass (max-compositing does not depend on order).
+  const gpuWaves: Array<{ path: OceanWavePathPoint[]; seed: number }> | undefined =
+    params.gpuWaves && deepOceanEnabled ? [] : undefined;
   if (deepOceanEnabled && deepOceanDensity > 0) {
     const wavelength = 28.0 * Math.max(0.6 * markScale, coastalLength);
     const deepSpacing = Math.max(
@@ -5308,23 +5601,45 @@ function paintOceanLineMarks(
         const ridgePath = prepareOceanWavePath(
           rawPath, distanceToCoast, width, height, cellSeed, markScale, smoothing,
         );
-        paintOceanWavePath(
-          ridgePath, alpha, tone, lightAlpha!, shadowAlpha!, foamAlpha!, inkAlpha!,
-          oceanClip, width, height, cellSeed, markScale, inkRad,
-          deepOceanWaveShadingScale, deepOceanWaveShadingIntensity, smoothing,
-          coordinateOffsetX, coordinateOffsetY, stride, waveWindow,
-        );
+        const paintWave = (wave: OceanWavePathPoint[], waveSeed: number): void => {
+          if (!gpuWaves) {
+            paintOceanWavePath(
+              wave, alpha, tone, lightAlpha!, shadowAlpha!, foamAlpha!, inkAlpha!,
+              oceanClip, width, height, waveSeed, markScale, inkRad,
+              deepOceanWaveShadingScale, deepOceanWaveShadingIntensity, smoothing,
+              coordinateOffsetX, coordinateOffsetY, stride, waveWindow,
+            );
+            return;
+          }
+          if (wave.length < 2) return;
+          gpuWaves.push({ path: wave, seed: waveSeed });
+          paintOceanWaveAccents(
+            wave, foamAlpha!, inkAlpha!, oceanClip, width, height, waveSeed, markScale,
+            coordinateOffsetX, coordinateOffsetY, stride,
+          );
+        };
+        paintWave(ridgePath, cellSeed);
         const fork = makeOceanWaveFork(
           ridgePath, cellSeed, distanceToCoast, width, height, markScale,
         );
-        if (fork) {
-          paintOceanWavePath(
-            fork, alpha, tone, lightAlpha!, shadowAlpha!, foamAlpha!, inkAlpha!,
-            oceanClip, width, height, cellSeed + 1709, markScale, inkRad,
-            deepOceanWaveShadingScale, deepOceanWaveShadingIntensity, smoothing,
-            coordinateOffsetX, coordinateOffsetY, stride, waveWindow,
-          );
-        }
+        if (fork) paintWave(fork, cellSeed + 1709);
+      }
+    }
+  }
+
+  if (gpuWaves && gpuWaves.length > 0 && lightAlpha && shadowAlpha && foamAlpha && inkAlpha) {
+    const thickness = Math.max(0.35, 0.85 * Math.max(0.1, waveThickness));
+    if (!paintOceanWavesGl(
+      gpuWaves, alpha, tone, lightAlpha, shadowAlpha, foamAlpha, inkAlpha, isOcean, width, height,
+      markScale, thickness, deepOceanWaveShadingScale, deepOceanWaveShadingIntensity, smoothing,
+      coordinateOffsetX, coordinateOffsetY, waveWindow,
+    )) {
+      for (const wave of gpuWaves) {
+        paintOceanWaveSegments(
+          wave.path, alpha, tone, lightAlpha, shadowAlpha, foamAlpha, inkAlpha, isOcean, width, height,
+          wave.seed, markScale, thickness, deepOceanWaveShadingScale, deepOceanWaveShadingIntensity,
+          smoothing, coordinateOffsetX, coordinateOffsetY, waveWindow,
+        );
       }
     }
   }
@@ -6327,7 +6642,9 @@ function renderWaterOverlayInternal(
   const riverGuideStop = geometryOverride
     ? undefined
     : profiler?.begin("water river width guide");
-  const riverGuide = geometryOverride
+  // Only buildRiverSplines reads the guide: supplied splines (export tiles)
+  // skip it.
+  const riverGuide = geometryOverride || options.riverSplinesOverride
     ? undefined
     : buildWaterWidthGuide(dem, ecological);
   riverGuideStop?.();
@@ -7319,6 +7636,7 @@ function renderWaterOverlayInternal(
         coordinateStride: options.oceanCoordinateStride,
         distanceNormalizationMax: options.oceanDistanceNormalizationMax,
         paintWindow: options.paintWindow,
+        gpuWaves: options.gpuWaves,
       },
     );
     wavePathStop?.();

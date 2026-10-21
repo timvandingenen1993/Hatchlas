@@ -34,6 +34,7 @@ import {
   normalizeMountainSnowfallSettings,
 } from './mountainProjection';
 import type { MountainProfiler } from './mountainProfiler';
+import { renderMountainMaterialGl } from './mountainIllustrationGl';
 import { stylizeMountainLight, type MountainLightingMode } from './mountainLighting';
 import {
   type MountainIllustrationFieldInputs,
@@ -143,6 +144,11 @@ export interface MountainIllustrationOptions {
   landGreenColor?: readonly number[];
   /** Optional fields prepared by the benchmark WebGPU experiment. */
   preparedFields?: MountainIllustrationPreparedFields;
+  /**
+   * Run the per-pixel material shading pass on the GPU (WebGL2) when
+   * available; the CPU loop stays as the fallback.
+   */
+  gpuShading?: boolean;
 }
 
 type Point = { x: number; y: number };
@@ -1695,7 +1701,41 @@ function renderMountainIllustrationInternal(
     options.verticalHatchOpacity ?? options.hatchOpacity ?? options.strokeOpacity,
   );
   const materialShadingStop = profiler?.begin('mountain illustration material shading');
-  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+  const materialGpu = options.gpuShading
+    ? renderMountainMaterialGl({
+        width,
+        height,
+        projectedMaterial,
+        sourceY,
+        slopeDeg: dem.slopeDeg,
+        normalizedElevation,
+        tpi,
+        solarInsolation,
+        edgeDistance,
+        rgba,
+        biomeType: dem.biomeType,
+        offsetX: options.offsetX,
+        offsetY: options.offsetY,
+        scale,
+        stride: materialStride,
+        seed: options.seed,
+        washNoiseScale: options.washNoiseScale ?? 1,
+        washNoiseStrength: options.washNoiseStrength ?? 0.45,
+        hillshadeStrength,
+        lightingMode,
+        rockStops,
+        snowStops,
+        snowToneAtMidpoint,
+        landGreen,
+      })
+    : null;
+  if (materialGpu) {
+    rgba.set(materialGpu.rgba);
+    snowCoverageAlpha.set(materialGpu.snowCoverageAlpha);
+    inkInterior.set(materialGpu.inkInterior);
+    grassFade.set(materialGpu.grassFade);
+  }
+  for (let y = 0; y < height && !materialGpu; y++) for (let x = 0; x < width; x++) {
     const i = y * width + x;
     if (!rgba[i * 4 + 3]) continue;
     const gx = materialWorldX[x], gy = materialWorldY[y];

@@ -9,9 +9,14 @@
 import type { MountainDEMData } from "../terrain/mountainBaseDEM";
 import type { MountainProfiler } from "./mountainProfiler";
 import {
+  buildPropStandsForBuckets,
+  finishPropStands,
   placeRasterPropsInBiomes,
+  propStandSizes,
   rasterPropPlacementBiomes,
+  type VegetationGeometry,
   type VegetationPatternOptions,
+  type VegetationPropStand,
   type VegetationRasterPropPlacement,
 } from "./vegetationRenderer";
 
@@ -20,11 +25,17 @@ const MAX_PLACEMENT_HELPERS = 3;
 interface PlacementReply {
   id: number;
   lists?: VegetationRasterPropPlacement[][];
+  stands?: VegetationPropStand[];
   error?: string;
 }
 
 let helpers: Worker[] | undefined;
 let nextId = 1;
+/**
+ * The DEM each helper last received. A helper keeps it for the stand step of
+ * the same render, so the ~150 MB snapshot is not copied to it twice.
+ */
+const demOnHelper = new WeakMap<Worker, MountainDEMData>();
 
 function placementHelpers(): Worker[] {
   if (helpers) return helpers;
@@ -43,20 +54,25 @@ function placementHelpers(): Worker[] {
   return helpers;
 }
 
-function placeOnHelper(
-  worker: Worker,
-  dem: MountainDEMData,
-  options: VegetationPatternOptions | undefined,
-  biomes: number[],
-): Promise<VegetationRasterPropPlacement[][]> {
+/**
+ * Starts the helpers ahead of the first placement: each loads the whole
+ * vegetation module, which on a cold load otherwise lands on the props
+ * critical path.
+ */
+export function warmPlacementHelpers(): void {
+  placementHelpers();
+}
+
+/** Sends one job to a helper; resolves with its reply. */
+function askHelper(worker: Worker, message: Record<string, unknown>): Promise<PlacementReply> {
   const id = nextId++;
   return new Promise((resolve, reject) => {
     const onMessage = (event: MessageEvent<PlacementReply>): void => {
       if (event.data?.id !== id) return;
       worker.removeEventListener("message", onMessage);
       worker.removeEventListener("error", onError);
-      if (event.data.lists) resolve(event.data.lists);
-      else reject(new Error(event.data.error ?? "Prop placement helper failed"));
+      if (event.data.error === undefined) resolve(event.data);
+      else reject(new Error(event.data.error));
     };
     const onError = (event: ErrorEvent): void => {
       worker.removeEventListener("message", onMessage);
@@ -65,8 +81,20 @@ function placeOnHelper(
     };
     worker.addEventListener("message", onMessage);
     worker.addEventListener("error", onError);
-    worker.postMessage({ id, dem, options, biomes });
+    worker.postMessage({ ...message, id });
   });
+}
+
+async function placeOnHelper(
+  worker: Worker,
+  dem: MountainDEMData,
+  options: VegetationPatternOptions | undefined,
+  biomes: number[],
+): Promise<VegetationRasterPropPlacement[][]> {
+  demOnHelper.set(worker, dem);
+  const reply = await askHelper(worker, { dem, options, biomes, keepDem: true });
+  if (!reply.lists) throw new Error("Prop placement helper failed");
+  return reply.lists;
 }
 
 /**
@@ -132,6 +160,61 @@ export async function placeRasterPropsInParallel(
       for (const placement of byBiome.get(biome) ?? []) placements.push(placement);
     }
     return placements;
+  } finally {
+    stop?.();
+  }
+}
+
+/**
+ * Turns the stand placements of a geometry built with `deferStands` into
+ * stands, building them on the helpers and here side by side. Each stand
+ * depends only on the placements and the DEM, so the result equals one
+ * sequential pass.
+ */
+export async function buildPropStandsInParallel(
+  geometry: VegetationGeometry,
+  dem: MountainDEMData,
+  options: VegetationPatternOptions | undefined,
+  profiler?: MountainProfiler,
+): Promise<void> {
+  const stop = profiler?.begin("vegetation forest stand geometry");
+  try {
+    const rasterProps = geometry.rasterProps ?? [];
+    const sizes = propStandSizes(rasterProps, options);
+    const pool = placementHelpers();
+    const prebuilt = new Map<number, VegetationPropStand>();
+    if (sizes.length > 1 && pool.length > 0) {
+      // Largest stands first, each onto the lightest set; set 0 stays here.
+      const sets = Array.from({ length: Math.min(sizes.length, pool.length + 1) }, () => ({ indices: [] as number[], work: 0 }));
+      [...sizes.keys()].sort((a, b) => sizes[b] - sizes[a]).forEach((index) => {
+        const lightest = sets.reduce((best, set) => (set.work < best.work ? set : best));
+        lightest.indices.push(index);
+        lightest.work += sizes[index] + 1;
+      });
+      profiler?.recordMetric("vegetation stand worker sets", sets.length, "sets");
+      const remote = sets.slice(1).map((set, helper) => {
+        // Placement already sent this DEM to the helper; it reuses that copy
+        // once and then lets it go.
+        const reuse = demOnHelper.get(pool[helper]) === dem;
+        demOnHelper.delete(pool[helper]);
+        return askHelper(pool[helper], {
+          kind: "stands",
+          dem: reuse ? undefined : dem,
+          options,
+          rasterProps,
+          bucketIndices: set.indices,
+        })
+          .then((reply) => {
+            reply.stands?.forEach((stand, position) => prebuilt.set(set.indices[position], stand));
+          })
+          // A failed helper's stands are built here by finishPropStands.
+          .catch(() => undefined);
+      });
+      buildPropStandsForBuckets(dem, options, rasterProps, sets[0].indices, profiler)
+        .forEach((stand, position) => prebuilt.set(sets[0].indices[position], stand));
+      await Promise.all(remote);
+    }
+    finishPropStands(geometry, dem, options, prebuilt, profiler);
   } finally {
     stop?.();
   }
