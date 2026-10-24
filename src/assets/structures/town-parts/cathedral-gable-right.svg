@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="331.47" height="299.43" viewBox="0 0 110.49 99.81" data-footprint="8 4" data-origin="35.63 37.2" fill="none" stroke="#2a1e16" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" data-edited="true">
+<defs><filter id="hand" x="-4%" y="-4%" width="108%" height="108%"><feTurbulence type="fractalNoise" baseFrequency="0.07" numOctaves="2" seed="4" result="warp"/><feDisplacementMap in="SourceGraphic" in2="warp" scale="1.3" xChannelSelector="R" yChannelSelector="G" result="wobble"/><feTurbulence type="fractalNoise" baseFrequency="1.2" numOctaves="2" seed="9" result="grain"/><feColorMatrix in="grain" type="matrix" values="0 0 0 0 0.16 0 0 0 0 0.11 0 0 0 0 0.07 2.2 0 0 0 -1.18" result="specks"/><feComposite in="specks" in2="wobble" operator="in" result="speckled"/><feMerge><feMergeNode in="wobble"/><feMergeNode in="speckled"/></feMerge></filter></defs>
+<g class="part" filter="url(#hand)">
+<path data-layer="far aisle walls" fill="#e4d8bd" d="M31.3 42.7L83.26 72.7L83.26 57.2L31.3 27.2Z"/>
+<path data-layer="far aisle walls" fill="#b9a684" d="M88.46 69.7L83.26 72.7L83.26 57.2L85.86 50.7L88.46 54.2Z"/>
+<path data-layer="far aisle roof" class="roof-lit" fill="#a07f5f" d="M32.17 19.7L87.59 51.7L83.61 61.67L28.19 29.67Z"/>
+<path data-layer="far belfry windows" fill="#2a1e16" d="M94.48 70.83L93.27 71.53L93.27 67.33L94.48 66.63Z"/>
+<path data-layer="far belfry windows" fill="#2a1e16" d="M81.58 70.83L82.79 71.53L82.79 67.33L81.58 66.63Z"/>
+<path data-layer="far belfry windows" fill="#2a1e16" d="M94.48 51.93L93.27 52.63L93.27 48.43L94.48 47.72Z"/>
+<path data-layer="far belfry windows" fill="#2a1e16" d="M81.58 51.93L82.79 52.63L82.79 48.43L81.58 47.73Z"/>
+<path data-layer="far belfry walls" transform="translate(4.54 1.56)" fill="#b9a684" d="M99.72 76.2L88.03 82.95L88.03 40.95L99.72 34.2Z"/>
+<path data-layer="far belfry walls" transform="translate(4.54 1.56)" fill="#e4d8bd" d="M88.03 82.95L76.34 76.2L76.34 34.2L88.03 40.95Z"/>
+<path data-layer="far belfry eaves" transform="translate(4.83 -0.28)" class="roof-shade" fill="#7b5e45" d="M99.84 35.72L88.03 43.61L88.03 44.61L99.84 36.72Z"/>
+<path data-layer="far belfry eaves" transform="translate(4.83 -0.28)" class="roof-shade" fill="#7b5e45" d="M88.03 43.61L76.05 36.04L76.05 37.04L88.03 44.61Z"/>
+<path data-layer="far belfry roof" transform="translate(4.4 -0.43)" class="roof-shade" fill="#7b5e45" d="M99.84 35.72L88.03 43.61L88.03 15.2Z"/>
+<path data-layer="far belfry roof" transform="translate(4.4 -0.43)" class="roof-lit" fill="#a07f5f" d="M88.03 43.61L76.05 36.04L88.03 15.2Z"/>
+<path data-layer="nave walls" fill="#e4d8bd" d="M10.52 54.7L74.6 91.7L74.6 62.7L10.52 25.7Z"/>
+<path data-layer="nave walls" fill="#b9a684" d="M90.74 82.62L74.6 91.7L74.6 62.7L85 40.2L90.91 50.48Z"/>
+<path data-layer="nave roof" class="roof-lit" fill="#a07f5f" d="M19.18 2.2L85.05 38.98L74.95 66.7L7.4 27.7Z"/>
+<path data-layer="near aisle walls" fill="#e4d8bd" d="M5.32 57.7L57.28 87.7L57.28 72.2L5.32 42.2Z"/>
+<path data-layer="near aisle walls" fill="#b9a684" d="M62.48 84.7L57.28 87.7L57.28 72.2L59.88 65.7L62.48 69.2Z"/>
+<path data-layer="near aisle roof" class="roof-lit" fill="#a07f5f" d="M10.43 33.94L61.87 63.88L57.89 73.85L2.46 41.85Z"/>
+<path data-layer="portal" fill="#e4d8bd" d="M90.11 82.75L90.11 72.25L89.72 70.22L88.61 68.94L86.95 68.62L85 69.3L83.04 70.88L81.38 73.11L80.28 75.67L79.89 78.15L79.89 88.65Z"/>
+<path data-layer="portal" fill="#7a4b2c" d="M88.67 83.6L88.67 73.1L88.38 71.55L87.53 70.58L86.27 70.33L84.78 70.85L83.28 72.05L82.02 73.76L81.18 75.71L80.88 77.6L80.88 88.1Z"/>
+<path data-layer="portal" d="M85 85.1L85 71.5"/>
+<path data-layer="rose window" fill="#2a1e16" d="M81.88 61L82.12 59.49L82.79 57.93L83.8 56.56L85 55.6L86.19 55.19L87.2 55.38L87.88 56.16L88.11 57.4L87.88 58.91L87.2 60.47L86.19 61.84L85 62.8L83.8 63.21L82.79 63.02L82.12 62.24Z"/>
+<path data-layer="windows 5" transform="translate(-33.19 -7)" fill="#2a1e16" d="M85.54 88.55L85.41 85.98L85.27 83.41L85.13 80.87L85.19 80.49L85.38 80.25L85.68 80.2L86.05 80.35L86.42 80.66L86.74 81.1L86.97 81.6L87.06 82.09L87.19 84.67L87.31 87.24L87.4 89.78Z"/>
+<path data-layer="windows 5 copy 4" transform="translate(-35.19 -5)" fill="#2a1e16" d="M62.51 72.09L62.38 69.52L62.24 66.95L62.1 64.41L62.16 64.03L62.35 63.79L62.65 63.74L63.02 63.89L63.39 64.2L63.71 64.64L63.94 65.14L64.03 65.63L64.16 68.21L64.28 70.78L64.37 73.32Z"/>
+<path data-layer="windows 5 copy copy" transform="translate(-37.19 -3)" fill="#2a1e16" d="M58.09 66.73L57.96 64.16L57.82 61.59L57.68 59.05L57.74 58.67L57.93 58.43L58.23 58.38L58.6 58.53L58.97 58.84L59.29 59.28L59.52 59.78L59.61 60.27L59.74 62.85L59.86 65.42L59.95 67.96Z"/>
+<path data-layer="windows 5 copy 2 copy" transform="translate(-39.19 -1)" fill="#2a1e16" d="M54.2 61.11L54.07 58.54L53.93 55.97L53.79 53.43L53.85 53.05L54.04 52.81L54.34 52.76L54.71 52.91L55.08 53.22L55.4 53.66L55.63 54.16L55.72 54.65L55.85 57.23L55.97 59.8L56.06 62.34Z"/>
+<path data-layer="windows 5 copy 3 copy" transform="translate(-41.19 1)" fill="#2a1e16" d="M49.87 55.57L49.74 53L49.6 50.43L49.46 47.89L49.52 47.51L49.71 47.27L50.01 47.22L50.38 47.37L50.75 47.68L51.07 48.12L51.3 48.62L51.39 49.11L51.52 51.69L51.64 54.26L51.73 56.8Z"/>
+<path data-layer="windows 5 copy" transform="translate(-35.19 -5)" fill="#2a1e16" d="M81.12 83.19L80.99 80.62L80.85 78.05L80.71 75.51L80.77 75.13L80.96 74.89L81.26 74.84L81.63 74.99L82 75.3L82.32 75.74L82.55 76.24L82.64 76.73L82.77 79.31L82.89 81.88L82.98 84.42Z"/>
+<path data-layer="windows 5 copy 2" transform="translate(-37.19 -3)" fill="#2a1e16" d="M77.23 77.57L77.1 75L76.96 72.43L76.82 69.89L76.88 69.51L77.07 69.27L77.37 69.22L77.74 69.37L78.11 69.68L78.43 70.12L78.66 70.62L78.75 71.11L78.88 73.69L79 76.26L79.09 78.8Z"/>
+<path data-layer="windows 5 copy 3" transform="translate(-39.19 -1)" fill="#2a1e16" d="M72.9 72.03L72.77 69.46L72.63 66.89L72.49 64.35L72.55 63.97L72.74 63.73L73.04 63.68L73.41 63.83L73.78 64.14L74.1 64.58L74.33 65.08L74.42 65.57L74.55 68.15L74.67 70.72L74.76 73.26Z"/>
+<path data-layer="near belfry walls" transform="translate(0.28 3.41)" fill="#b9a684" d="M80.23 87.45L68.54 94.2L68.54 52.2L80.23 45.45Z"/>
+<path data-layer="near belfry walls" transform="translate(0.28 3.41)" fill="#e4d8bd" d="M68.54 94.2L56.85 87.45L56.85 45.45L68.54 52.2Z"/>
+<path data-layer="near belfry windows" fill="#2a1e16" d="M74.99 63.18L73.78 63.88L73.78 59.68L74.99 58.97Z"/>
+<path data-layer="near belfry windows" fill="#2a1e16" d="M62.09 63.18L63.3 63.88L63.3 59.68L62.09 58.98Z"/>
+<path data-layer="near belfry windows copy" transform="translate(-2 2)" fill="#2a1e16" d="M100.94 50.14L99.73 50.84L99.73 46.64L100.94 45.93Z"/>
+<path data-layer="near belfry eaves" class="roof-shade" fill="#7b5e45" d="M80.32 48L68.54 54.86L68.54 55.86L80.32 49Z"/>
+<path data-layer="near belfry eaves" class="roof-shade" fill="#7b5e45" d="M68.54 54.86L57.12 47.8L57.12 48.8L68.54 55.86Z"/>
+<path data-layer="near belfry roof" class="roof-shade" fill="#7b5e45" d="M80.32 48L68.54 54.86L68.54 26.45Z"/>
+<path data-layer="near belfry roof" class="roof-lit" fill="#a07f5f" d="M68.54 54.86L57.12 47.8L68.54 26.45Z"/>
+</g>
+</svg>

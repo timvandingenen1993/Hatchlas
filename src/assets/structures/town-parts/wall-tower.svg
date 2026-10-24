@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="69.05" height="165.62" viewBox="0 0 23.02 55.21" data-footprint="1 1" data-origin="11.51 48.2" fill="none" stroke="#2a1e16" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round">
+<defs><filter id="hand" x="-4%" y="-4%" width="108%" height="108%"><feTurbulence type="fractalNoise" baseFrequency="0.07" numOctaves="2" seed="4" result="warp"/><feDisplacementMap in="SourceGraphic" in2="warp" scale="1.3" xChannelSelector="R" yChannelSelector="G" result="wobble"/><feTurbulence type="fractalNoise" baseFrequency="1.2" numOctaves="2" seed="9" result="grain"/><feColorMatrix in="grain" type="matrix" values="0 0 0 0 0.16 0 0 0 0 0.11 0 0 0 0 0.07 2.2 0 0 0 -1.18" result="specks"/><feComposite in="specks" in2="wobble" operator="in" result="speckled"/><feMerge><feMergeNode in="wobble"/><feMergeNode in="speckled"/></feMerge></filter></defs>
+<g class="part" filter="url(#hand)">
+<path data-layer="base" fill="#d3c4a3" d="M19.84 48.2L19.43 49.69L18.25 51.03L16.4 52.09L14.08 52.77L11.51 53.01L8.93 52.77L6.61 52.09L4.77 51.03L3.59 49.69L3.18 48.2L4.16 45.2L4.52 46.51L5.56 47.69L7.19 48.63L9.24 49.23L11.51 49.44L13.78 49.23L15.83 48.63L17.45 47.69L18.5 46.51L18.86 45.2Z"/>
+<path data-layer="base" fill="#b9a684" stroke="#b9a684" stroke-width="0.4" d="M19.84 48.2L19.43 49.69L18.5 46.51L18.86 45.2Z"/>
+<path data-layer="base" fill="#bca987" stroke="#bca987" stroke-width="0.4" d="M19.43 49.69L18.25 51.03L17.45 47.69L18.5 46.51Z"/>
+<path data-layer="base" fill="#c1af8d" stroke="#c1af8d" stroke-width="0.4" d="M18.25 51.03L16.4 52.09L15.83 48.63L17.45 47.69Z"/>
+<path data-layer="base" fill="#c7b695" stroke="#c7b695" stroke-width="0.4" d="M16.4 52.09L14.08 52.77L13.78 49.23L15.83 48.63Z"/>
+<path data-layer="base" fill="#cfbf9e" stroke="#cfbf9e" stroke-width="0.4" d="M14.08 52.77L11.51 53.01L11.51 49.44L13.78 49.23Z"/>
+<path data-layer="base" fill="#d6c7a7" stroke="#d6c7a7" stroke-width="0.4" d="M11.51 53.01L8.93 52.77L9.24 49.23L11.51 49.44Z"/>
+<path data-layer="base" fill="#dbcdaf" stroke="#dbcdaf" stroke-width="0.4" d="M8.93 52.77L6.61 52.09L7.19 48.63L9.24 49.23Z"/>
+<path data-layer="base" fill="#dfd2b5" stroke="#dfd2b5" stroke-width="0.4" d="M6.61 52.09L4.77 51.03L5.56 47.69L7.19 48.63Z"/>
+<path data-layer="base" fill="#e2d6ba" stroke="#e2d6ba" stroke-width="0.4" d="M4.77 51.03L3.59 49.69L4.52 46.51L5.56 47.69Z"/>
+<path data-layer="base" fill="#e4d8bd" stroke="#e4d8bd" stroke-width="0.4" d="M3.59 49.69L3.18 48.2L4.16 45.2L4.52 46.51Z"/>
+<path data-layer="base" d="M19.84 48.2L19.43 49.69L18.25 51.03L16.4 52.09L14.08 52.77L11.51 53.01L8.93 52.77L6.61 52.09L4.77 51.03L3.59 49.69L3.18 48.2L4.16 45.2L4.52 46.51L5.56 47.69L7.19 48.63L9.24 49.23L11.51 49.44L13.78 49.23L15.83 48.63L17.45 47.69L18.5 46.51L18.86 45.2Z"/>
+<path data-layer="walls" fill="#d3c4a3" d="M18.86 45.2L18.5 46.51L17.45 47.69L15.83 48.63L13.78 49.23L11.51 49.44L9.24 49.23L7.19 48.63L5.56 47.69L4.52 46.51L4.16 45.2L4.16 24L4.52 25.31L5.56 26.49L7.19 27.43L9.24 28.03L11.51 28.24L13.78 28.03L15.83 27.43L17.45 26.49L18.5 25.31L18.86 24Z"/>
+<path data-layer="walls" fill="#b9a684" stroke="#b9a684" stroke-width="0.4" d="M18.86 45.2L18.5 46.51L18.5 25.31L18.86 24Z"/>
+<path data-layer="walls" fill="#bca987" stroke="#bca987" stroke-width="0.4" d="M18.5 46.51L17.45 47.69L17.45 26.49L18.5 25.31Z"/>
+<path data-layer="walls" fill="#c1af8d" stroke="#c1af8d" stroke-width="0.4" d="M17.45 47.69L15.83 48.63L15.83 27.43L17.45 26.49Z"/>
+<path data-layer="walls" fill="#c7b695" stroke="#c7b695" stroke-width="0.4" d="M15.83 48.63L13.78 49.23L13.78 28.03L15.83 27.43Z"/>
+<path data-layer="walls" fill="#cfbf9e" stroke="#cfbf9e" stroke-width="0.4" d="M13.78 49.23L11.51 49.44L11.51 28.24L13.78 28.03Z"/>
+<path data-layer="walls" fill="#d6c7a7" stroke="#d6c7a7" stroke-width="0.4" d="M11.51 49.44L9.24 49.23L9.24 28.03L11.51 28.24Z"/>
+<path data-layer="walls" fill="#dbcdaf" stroke="#dbcdaf" stroke-width="0.4" d="M9.24 49.23L7.19 48.63L7.19 27.43L9.24 28.03Z"/>
+<path data-layer="walls" fill="#dfd2b5" stroke="#dfd2b5" stroke-width="0.4" d="M7.19 48.63L5.56 47.69L5.56 26.49L7.19 27.43Z"/>
+<path data-layer="walls" fill="#e2d6ba" stroke="#e2d6ba" stroke-width="0.4" d="M5.56 47.69L4.52 46.51L4.52 25.31L5.56 26.49Z"/>
+<path data-layer="walls" fill="#e4d8bd" stroke="#e4d8bd" stroke-width="0.4" d="M4.52 46.51L4.16 45.2L4.16 24L4.52 25.31Z"/>
+<path data-layer="walls" d="M18.86 45.2L18.5 46.51L17.45 47.69L15.83 48.63L13.78 49.23L11.51 49.44L9.24 49.23L7.19 48.63L5.56 47.69L4.52 46.51L4.16 45.2L4.16 24L4.52 25.31L5.56 26.49L7.19 27.43L9.24 28.03L11.51 28.24L13.78 28.03L15.83 27.43L17.45 26.49L18.5 25.31L18.86 24Z"/>
+<path data-layer="eave shadow" fill="#b1a387" d="M18.86 24L18.5 25.31L17.45 26.49L15.83 27.43L13.78 28.03L11.51 28.24L9.24 28.03L7.19 27.43L5.56 26.49L4.52 25.31L4.16 24L4.16 20.7L4.52 22.01L5.56 23.19L7.19 24.13L9.24 24.73L11.51 24.94L13.78 24.73L15.83 24.13L17.45 23.19L18.5 22.01L18.86 20.7Z"/>
+<path data-layer="eave shadow" fill="#9c8b6e" stroke="#9c8b6e" stroke-width="0.4" d="M18.86 24L18.5 25.31L18.5 22.01L18.86 20.7Z"/>
+<path data-layer="eave shadow" fill="#9f8d70" stroke="#9f8d70" stroke-width="0.4" d="M18.5 25.31L17.45 26.49L17.45 23.19L18.5 22.01Z"/>
+<path data-layer="eave shadow" fill="#a39275" stroke="#a39275" stroke-width="0.4" d="M17.45 26.49L15.83 27.43L15.83 24.13L17.45 23.19Z"/>
+<path data-layer="eave shadow" fill="#a8987c" stroke="#a8987c" stroke-width="0.4" d="M15.83 27.43L13.78 28.03L13.78 24.73L15.83 24.13Z"/>
+<path data-layer="eave shadow" fill="#ae9f83" stroke="#ae9f83" stroke-width="0.4" d="M13.78 28.03L11.51 28.24L11.51 24.94L13.78 24.73Z"/>
+<path data-layer="eave shadow" fill="#b4a58a" stroke="#b4a58a" stroke-width="0.4" d="M11.51 28.24L9.24 28.03L9.24 24.73L11.51 24.94Z"/>
+<path data-layer="eave shadow" fill="#b8aa90" stroke="#b8aa90" stroke-width="0.4" d="M9.24 28.03L7.19 27.43L7.19 24.13L9.24 24.73Z"/>
+<path data-layer="eave shadow" fill="#bbae95" stroke="#bbae95" stroke-width="0.4" d="M7.19 27.43L5.56 26.49L5.56 23.19L7.19 24.13Z"/>
+<path data-layer="eave shadow" fill="#bdb199" stroke="#bdb199" stroke-width="0.4" d="M5.56 26.49L4.52 25.31L4.52 22.01L5.56 23.19Z"/>
+<path data-layer="eave shadow" fill="#bfb39c" stroke="#bfb39c" stroke-width="0.4" d="M4.52 25.31L4.16 24L4.16 20.7L4.52 22.01Z"/>
+<path data-layer="eave shadow" d="M18.86 24L18.5 25.31L17.45 26.49L15.83 27.43L13.78 28.03L11.51 28.24L9.24 28.03L7.19 27.43L5.56 26.49L4.52 25.31L4.16 24L4.16 20.7L4.52 22.01L5.56 23.19L7.19 24.13L9.24 24.73L11.51 24.94L13.78 24.73L15.83 24.13L17.45 23.19L18.5 22.01L18.86 20.7Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M12.36 38.66L10.65 38.66L10.65 34.81L12.36 34.81Z"/>
+<path data-layer="roof" class="roof-mid" fill="#8e6f52" d="M20.82 21.2L20.36 22.86L19.04 24.36L16.98 25.55L14.38 26.31L11.51 26.57L8.63 26.31L6.04 25.55L3.98 24.36L2.66 22.86L2.2 21.2L3.03 20.12L4.26 18.5L6.06 16.07L8.36 12.83L11.51 7.7L14.66 12.83L16.96 16.07L18.76 18.5L19.99 20.12Z"/>
+<path data-layer="roof" class="roof-shade roof-seam" fill="#7b5e45" stroke="#7b5e45" stroke-width="0.4" d="M20.82 21.2L20.36 22.86L19.57 21.63L19.99 20.12Z"/>
+<path data-layer="roof" class="roof-shade roof-seam" fill="#7b5e45" stroke="#7b5e45" stroke-width="0.4" d="M20.36 22.86L19.04 24.36L18.37 23L19.57 21.63Z"/>
+<path data-layer="roof" class="roof-shade roof-seam" fill="#7b5e45" stroke="#7b5e45" stroke-width="0.4" d="M19.04 24.36L16.98 25.55L16.49 24.08L18.37 23Z"/>
+<path data-layer="roof" class="roof-ms roof-seam" fill="#84664c" stroke="#84664c" stroke-width="0.4" d="M16.98 25.55L14.38 26.31L14.13 24.78L16.49 24.08Z"/>
+<path data-layer="roof" class="roof-mid roof-seam" fill="#8e6f52" stroke="#8e6f52" stroke-width="0.4" d="M14.38 26.31L11.51 26.57L11.51 25.01L14.13 24.78Z"/>
+<path data-layer="roof" class="roof-mid roof-seam" fill="#8e6f52" stroke="#8e6f52" stroke-width="0.4" d="M11.51 26.57L8.63 26.31L8.89 24.78L11.51 25.01Z"/>
+<path data-layer="roof" class="roof-lm roof-seam" fill="#977759" stroke="#977759" stroke-width="0.4" d="M8.63 26.31L6.04 25.55L6.52 24.08L8.89 24.78Z"/>
+<path data-layer="roof" class="roof-lit roof-seam" fill="#a07f5f" stroke="#a07f5f" stroke-width="0.4" d="M6.04 25.55L3.98 24.36L4.65 23L6.52 24.08Z"/>
+<path data-layer="roof" class="roof-lit roof-seam" fill="#a07f5f" stroke="#a07f5f" stroke-width="0.4" d="M3.98 24.36L2.66 22.86L3.44 21.63L4.65 23Z"/>
+<path data-layer="roof" class="roof-lit roof-seam" fill="#a07f5f" stroke="#a07f5f" stroke-width="0.4" d="M2.66 22.86L2.2 21.2L3.03 20.12L3.44 21.63Z"/>
+<path data-layer="roof" class="roof-shade roof-seam" fill="#7b5e45" stroke="#7b5e45" stroke-width="0.4" d="M19.99 20.12L19.57 21.63L18.4 19.79L18.76 18.5Z"/>
+<path data-layer="roof" class="roof-shade roof-seam" fill="#7b5e45" stroke="#7b5e45" stroke-width="0.4" d="M19.57 21.63L18.37 23L17.37 20.96L18.4 19.79Z"/>
+<path data-layer="roof" class="roof-shade roof-seam" fill="#7b5e45" stroke="#7b5e45" stroke-width="0.4" d="M18.37 23L16.49 24.08L15.77 21.89L17.37 20.96Z"/>
+<path data-layer="roof" class="roof-ms roof-seam" fill="#84664c" stroke="#84664c" stroke-width="0.4" d="M16.49 24.08L14.13 24.78L13.75 22.48L15.77 21.89Z"/>
+<path data-layer="roof" class="roof-mid roof-seam" fill="#8e6f52" stroke="#8e6f52" stroke-width="0.4" d="M14.13 24.78L11.51 25.01L11.51 22.69L13.75 22.48Z"/>
+<path data-layer="roof" class="roof-mid roof-seam" fill="#8e6f52" stroke="#8e6f52" stroke-width="0.4" d="M11.51 25.01L8.89 24.78L9.27 22.48L11.51 22.69Z"/>
+<path data-layer="roof" class="roof-lm roof-seam" fill="#977759" stroke="#977759" stroke-width="0.4" d="M8.89 24.78L6.52 24.08L7.25 21.89L9.27 22.48Z"/>
+<path data-layer="roof" class="roof-lit roof-seam" fill="#a07f5f" stroke="#a07f5f" stroke-width="0.4" d="M6.52 24.08L4.65 23L5.64 20.96L7.25 21.89Z"/>
+<path data-layer="roof" class="roof-lit roof-seam" fill="#a07f5f" stroke="#a07f5f" stroke-width="0.4" d="M4.65 23L3.44 21.63L4.61 19.79L5.64 20.96Z"/>
+<path data-layer="roof" class="roof-lit roof-seam" fill="#a07f5f" stroke="#a07f5f" stroke-width="0.4" d="M3.44 21.63L3.03 20.12L4.26 18.5L4.61 19.79Z"/>
+<path data-layer="roof" class="roof-shade roof-seam" fill="#7b5e45" stroke="#7b5e45" stroke-width="0.4" d="M18.76 18.5L18.4 19.79L16.69 17.04L16.96 16.07Z"/>
+<path data-layer="roof" class="roof-shade roof-seam" fill="#7b5e45" stroke="#7b5e45" stroke-width="0.4" d="M18.4 19.79L17.37 20.96L15.92 17.92L16.69 17.04Z"/>
+<path data-layer="roof" class="roof-shade roof-seam" fill="#7b5e45" stroke="#7b5e45" stroke-width="0.4" d="M17.37 20.96L15.77 21.89L14.71 18.62L15.92 17.92Z"/>
+<path data-layer="roof" class="roof-ms roof-seam" fill="#84664c" stroke="#84664c" stroke-width="0.4" d="M15.77 21.89L13.75 22.48L13.19 19.06L14.71 18.62Z"/>
+<path data-layer="roof" class="roof-mid roof-seam" fill="#8e6f52" stroke="#8e6f52" stroke-width="0.4" d="M13.75 22.48L11.51 22.69L11.51 19.22L13.19 19.06Z"/>
+<path data-layer="roof" class="roof-mid roof-seam" fill="#8e6f52" stroke="#8e6f52" stroke-width="0.4" d="M11.51 22.69L9.27 22.48L9.82 19.06L11.51 19.22Z"/>
+<path data-layer="roof" class="roof-lm roof-seam" fill="#977759" stroke="#977759" stroke-width="0.4" d="M9.27 22.48L7.25 21.89L8.31 18.62L9.82 19.06Z"/>
+<path data-layer="roof" class="roof-lit roof-seam" fill="#a07f5f" stroke="#a07f5f" stroke-width="0.4" d="M7.25 21.89L5.64 20.96L7.1 17.92L8.31 18.62Z"/>
+<path data-layer="roof" class="roof-lit roof-seam" fill="#a07f5f" stroke="#a07f5f" stroke-width="0.4" d="M5.64 20.96L4.61 19.79L6.33 17.04L7.1 17.92Z"/>
+<path data-layer="roof" class="roof-lit roof-seam" fill="#a07f5f" stroke="#a07f5f" stroke-width="0.4" d="M4.61 19.79L4.26 18.5L6.06 16.07L6.33 17.04Z"/>
+<path data-layer="roof" class="roof-shade roof-seam" fill="#7b5e45" stroke="#7b5e45" stroke-width="0.4" d="M16.96 16.07L16.69 17.04L14.5 13.39L14.66 12.83Z"/>
+<path data-layer="roof" class="roof-shade roof-seam" fill="#7b5e45" stroke="#7b5e45" stroke-width="0.4" d="M16.69 17.04L15.92 17.92L14.06 13.9L14.5 13.39Z"/>
+<path data-layer="roof" class="roof-shade roof-seam" fill="#7b5e45" stroke="#7b5e45" stroke-width="0.4" d="M15.92 17.92L14.71 18.62L13.36 14.3L14.06 13.9Z"/>
+<path data-layer="roof" class="roof-ms roof-seam" fill="#84664c" stroke="#84664c" stroke-width="0.4" d="M14.71 18.62L13.19 19.06L12.48 14.56L13.36 14.3Z"/>
+<path data-layer="roof" class="roof-mid roof-seam" fill="#8e6f52" stroke="#8e6f52" stroke-width="0.4" d="M13.19 19.06L11.51 19.22L11.51 14.65L12.48 14.56Z"/>
+<path data-layer="roof" class="roof-mid roof-seam" fill="#8e6f52" stroke="#8e6f52" stroke-width="0.4" d="M11.51 19.22L9.82 19.06L10.53 14.56L11.51 14.65Z"/>
+<path data-layer="roof" class="roof-lm roof-seam" fill="#977759" stroke="#977759" stroke-width="0.4" d="M9.82 19.06L8.31 18.62L9.66 14.3L10.53 14.56Z"/>
+<path data-layer="roof" class="roof-lit roof-seam" fill="#a07f5f" stroke="#a07f5f" stroke-width="0.4" d="M8.31 18.62L7.1 17.92L8.96 13.9L9.66 14.3Z"/>
+<path data-layer="roof" class="roof-lit roof-seam" fill="#a07f5f" stroke="#a07f5f" stroke-width="0.4" d="M7.1 17.92L6.33 17.04L8.51 13.39L8.96 13.9Z"/>
+<path data-layer="roof" class="roof-lit roof-seam" fill="#a07f5f" stroke="#a07f5f" stroke-width="0.4" d="M6.33 17.04L6.06 16.07L8.36 12.83L8.51 13.39Z"/>
+<path data-layer="roof" class="roof-shade roof-seam" fill="#7b5e45" stroke="#7b5e45" stroke-width="0.4" d="M14.66 12.83L14.5 13.39L11.51 7.7Z"/>
+<path data-layer="roof" class="roof-shade roof-seam" fill="#7b5e45" stroke="#7b5e45" stroke-width="0.4" d="M14.5 13.39L14.06 13.9L11.51 7.7Z"/>
+<path data-layer="roof" class="roof-shade roof-seam" fill="#7b5e45" stroke="#7b5e45" stroke-width="0.4" d="M14.06 13.9L13.36 14.3L11.51 7.7Z"/>
+<path data-layer="roof" class="roof-ms roof-seam" fill="#84664c" stroke="#84664c" stroke-width="0.4" d="M13.36 14.3L12.48 14.56L11.51 7.7Z"/>
+<path data-layer="roof" class="roof-mid roof-seam" fill="#8e6f52" stroke="#8e6f52" stroke-width="0.4" d="M12.48 14.56L11.51 14.65L11.51 7.7Z"/>
+<path data-layer="roof" class="roof-mid roof-seam" fill="#8e6f52" stroke="#8e6f52" stroke-width="0.4" d="M11.51 14.65L10.53 14.56L11.51 7.7Z"/>
+<path data-layer="roof" class="roof-lm roof-seam" fill="#977759" stroke="#977759" stroke-width="0.4" d="M10.53 14.56L9.66 14.3L11.51 7.7Z"/>
+<path data-layer="roof" class="roof-lit roof-seam" fill="#a07f5f" stroke="#a07f5f" stroke-width="0.4" d="M9.66 14.3L8.96 13.9L11.51 7.7Z"/>
+<path data-layer="roof" class="roof-lit roof-seam" fill="#a07f5f" stroke="#a07f5f" stroke-width="0.4" d="M8.96 13.9L8.51 13.39L11.51 7.7Z"/>
+<path data-layer="roof" class="roof-lit roof-seam" fill="#a07f5f" stroke="#a07f5f" stroke-width="0.4" d="M8.51 13.39L8.36 12.83L11.51 7.7Z"/>
+<path data-layer="roof" d="M20.82 21.2L20.36 22.86L19.04 24.36L16.98 25.55L14.38 26.31L11.51 26.57L8.63 26.31L6.04 25.55L3.98 24.36L2.66 22.86L2.2 21.2L3.03 20.12L4.26 18.5L6.06 16.07L8.36 12.83L11.51 7.7L14.66 12.83L16.96 16.07L18.76 18.5L19.99 20.12Z"/>
+<path data-layer="finial" d="M11.51 7.7L11.51 2.2"/>
+<path data-layer="finial" fill="#2a1e16" d="M12.37 4.68L12.11 4.11L11.51 3.87L10.9 4.11L10.65 4.68L10.9 5.24L11.51 5.48L12.11 5.24Z"/>
+</g>
+</svg>

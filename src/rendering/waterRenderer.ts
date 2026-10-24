@@ -7,6 +7,7 @@ import {
   DEFAULT_RIVER_THRESHOLD_KM2,
   extractDeepOpenOceanMask,
   filterSmallOceanComponents,
+  RIVER_RADIUS_SUBCELLS,
   waterWidthCellScale,
 } from "../terrain/mountainBaseDEM";
 import { buildRiverSiltCreaseField, buildRiverSiltDepth } from "./riverSilt";
@@ -970,12 +971,16 @@ function buildRiverSplines(
     );
     const area = riverAreaAt(index);
     const widthCeiling = Math.max(2.5, 3 + Math.sqrt(Math.max(0, area)) * 1.2);
-    const storedRadius = dem.riverChannelRadius?.[index] ?? 0;
+    const storedRadius =
+      (dem.riverChannelRadius?.[index] ?? 0) / RIVER_RADIUS_SUBCELLS;
     centerX[index] = measured.x;
     centerY[index] = measured.y;
+    // The ceiling guards the measured width against flooded basins; the
+    // stored bank-full radius already carries the channel width control.
     radius[index] = Math.max(
       minimumRadius,
-      Math.min(widthCeiling, Math.max(measured.radius, storedRadius)),
+      Math.min(widthCeiling, measured.radius),
+      storedRadius,
     );
   }
 

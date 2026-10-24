@@ -32,6 +32,8 @@ import {
 } from "./mountainExportRenderer";
 import { compareExportSamples, ExportTileGpuSampler } from "./exportTileGpuSampler";
 import { terrainFlatShade, type MountainDetailImageData } from "./mountainDetailRenderer";
+import { blitTownStamps } from "../structures/townStamp";
+import { projectThroughMesh } from "../structures/viewProjection";
 import {
   prepareFullTerrainCameraProjection,
   prepareFullTerrainCameraBand,
@@ -1302,6 +1304,13 @@ async function runExport(request: MountainExportRequest): Promise<void> {
     cameraEnabled ? "projecting" : "rendering",
   );
   const rowBytes = outputRegionWidth * 4 + 1;
+  const townStamps = request.townStamps ?? [];
+  // Top-down anchors map straight onto the output; the camera path replaces
+  // them with projected positions once its mesh is ready.
+  let townPositions: { x: number; y: number }[] = townStamps.map((stamp) => ({
+    x: stamp.u * (request.outputWidth - 1),
+    y: stamp.v * (request.outputHeight - 1),
+  }));
   /**
    * Serve camera texture samples from a bounded 1024px source-tile LRU. The
    * tile renderer still receives global coordinates and halos, so the camera
@@ -1895,6 +1904,17 @@ async function runExport(request: MountainExportRequest): Promise<void> {
         bandStop?.();
         return;
       }
+      if (townStamps.length > 0) {
+        blitTownStamps({
+          data: band,
+          width: outputRegionWidth,
+          height: bandHeight,
+          rowBytes,
+          pixelOffset: 1,
+          rowStart: bandRowStart,
+          colStart,
+        }, townStamps, townPositions);
+      }
       reportProgress("rendering", "Rendering and encoding PNG tiles");
       bandStop?.();
       yield band;
@@ -1956,6 +1976,8 @@ async function runExport(request: MountainExportRequest): Promise<void> {
     const projectionStop = profiler?.begin("export camera projection preparation");
     const cameraProjection = prepareFullTerrainCameraProjection(dem, cameraSettingsBase);
     projectionStop?.();
+    // Towns stand upright on the draped terrain: project each anchor once.
+    townPositions = townStamps.map((stamp) => projectThroughMesh(cameraProjection, stamp));
     await execution.checkpoint(true);
     if (execution.cancelled()) {
       finishProfile("cancelled");
@@ -2110,6 +2132,17 @@ async function runExport(request: MountainExportRequest): Promise<void> {
         );
         const cameraBandData = new Uint8ClampedArray(request.outputWidth * bandHeight * 4);
         await renderVisibleCameraRows(y, y + bandHeight, cameraBandData, y);
+        if (townStamps.length > 0) {
+          blitTownStamps({
+            data: cameraBandData,
+            width: request.outputWidth,
+            height: bandHeight,
+            rowBytes: request.outputWidth * 4,
+            pixelOffset: 0,
+            rowStart: y,
+            colStart: 0,
+          }, townStamps, townPositions);
+        }
         cameraSource.retire(tilesLastNeededByBand.get(cameraBandNumber) ?? []);
         const cameraBand = {
           width: request.outputWidth,

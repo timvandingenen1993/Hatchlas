@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="106.73" height="118.2" viewBox="0 0 35.58 39.4" data-footprint="3 1" data-origin="4.8 20.7" fill="none" stroke="#2a1e16" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round">
+<defs><filter id="hand" x="-4%" y="-4%" width="108%" height="108%"><feTurbulence type="fractalNoise" baseFrequency="0.07" numOctaves="2" seed="4" result="warp"/><feDisplacementMap in="SourceGraphic" in2="warp" scale="1.3" xChannelSelector="R" yChannelSelector="G" result="wobble"/><feTurbulence type="fractalNoise" baseFrequency="1.2" numOctaves="2" seed="9" result="grain"/><feColorMatrix in="grain" type="matrix" values="0 0 0 0 0.16 0 0 0 0 0.11 0 0 0 0 0.07 2.2 0 0 0 -1.18" result="specks"/><feComposite in="specks" in2="wobble" operator="in" result="speckled"/><feMerge><feMergeNode in="wobble"/><feMergeNode in="speckled"/></feMerge></filter></defs>
+<g class="part" filter="url(#hand)">
+<path data-layer="walls" fill="#b9a684" d="M33.38 34.2L28.18 37.2L28.18 20.2L33.38 17.2Z"/>
+<path data-layer="walls" fill="#e4d8bd" d="M28.18 37.2L2.2 22.2L2.2 5.2L28.18 20.2Z"/>
+<path data-layer="walls" fill="#ddd0b3" d="M7.4 2.2L33.38 17.2L28.18 20.2L2.2 5.2Z"/>
+<path data-layer="plinth" fill="#c6baa2" stroke="#c6baa2" stroke-width="0.4" d="M2.85 21.83L27.53 36.07L27.53 34.32L2.85 20.08Z"/>
+</g>
+</svg>

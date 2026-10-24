@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="220.62" height="269.31" viewBox="0 -20.3 73.54 89.77" data-footprint="2 6" data-origin="54.24 28.96" fill="none" stroke="#2a1e16" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" data-edited="true">
+<defs><filter id="hand" x="-4%" y="-4%" width="108%" height="108%"><feTurbulence type="fractalNoise" baseFrequency="0.07" numOctaves="2" seed="4" result="warp"/><feDisplacementMap in="SourceGraphic" in2="warp" scale="1.3" xChannelSelector="R" yChannelSelector="G" result="wobble"/><feTurbulence type="fractalNoise" baseFrequency="1.2" numOctaves="2" seed="9" result="grain"/><feColorMatrix in="grain" type="matrix" values="0 0 0 0 0.16 0 0 0 0 0.11 0 0 0 0 0.07 2.2 0 0 0 -1.18" result="specks"/><feComposite in="specks" in2="wobble" operator="in" result="speckled"/><feMerge><feMergeNode in="wobble"/><feMergeNode in="speckled"/></feMerge></filter></defs>
+<g class="part" filter="url(#hand)">
+<path data-layer="tower walls" fill="#c4b393" d="M68.1 39.26L54.24 47.26L54.19 13.62L68.35 6.27Z"/>
+<path data-layer="tower walls" fill="#ece1c9" d="M54.24 47.26L40.38 39.26L42.24 6.14L54.19 13.62Z"/>
+<path data-layer="tower windows" fill="#2a1e16" d="M46.82 37.22L47.8 37.78L47.8 35.15L46.82 34.59Z"/>
+<path data-layer="tower windows" fill="#2a1e16" d="M46.82 30.61L47.8 31.17L47.8 28.54L46.82 27.98Z"/>
+<path data-layer="tower eaves" class="roof-shade" fill="#7b5e45" d="M68.35 6.27L54.19 13.62L54.19 13.62L68.35 6.27Z"/>
+<path data-layer="tower eaves" class="roof-shade" fill="#7b5e45" d="M54.19 13.62L42.24 6.14L42.24 6.14L54.19 13.62Z"/>
+<path data-layer="tower roof" class="roof-shade" fill="#7b5e45" d="M68.35 6.27L54.19 13.62L54.56 -18.09Z"/>
+<path data-layer="tower roof" class="roof-lit" fill="#a07f5f" d="M54.19 13.62L42.24 6.14L54.56 -18.09Z"/>
+<path data-layer="walls" fill="#c4b393" d="M54.24 47.26L19.6 67.26L19.36 52.58L54.45 27.31Z"/>
+<path data-layer="walls" fill="#ece1c9" d="M5.74 59.26L19.6 67.26L19.36 52.58L12.43 37.78L5.5 44.58Z"/>
+<path data-layer="eaves" class="roof-shade" fill="#7b5e45" d="M10.54 38.11L2.5 45.99L2.5 46.79L10.54 38.91Z"/>
+<path data-layer="eaves" class="roof-shade" fill="#7b5e45" d="M10.81 38.62L18.84 55.78L18.84 56.58L10.81 39.42Z"/>
+<path data-layer="eaves" class="roof-shade" fill="#7b5e45" d="M56.32 33.54L18.91 55.14L18.91 55.94L56.32 34.34Z"/>
+<path data-layer="roof" class="roof-shade" fill="#7b5e45" d="M47.81 16.39L10.4 37.99L18.44 55.16L55.85 33.56Z"/>
+<path data-layer="windows 5" fill="#2a1e16" d="M24.79 61.03L24.9 58.98L25.01 56.92L25.12 54.89L25.07 54.59L24.92 54.39L24.68 54.35L24.39 54.47L24.09 54.72L23.83 55.07L23.65 55.47L23.58 55.87L23.47 57.93L23.38 59.99L23.31 62.02Z"/>
+<path data-layer="windows 5" fill="#2a1e16" d="M10.79 48.48L10.76 46.2L10.82 45.89L10.97 45.7L11.21 45.65L11.48 45.75L11.76 46L11.99 46.34L12.15 46.74L12.2 47.11L12.26 48.99Z"/>
+<path data-layer="windows 5 copy 2" fill="#2a1e16" d="M31.71 57.28L31.81 55.23L31.92 53.17L32.03 51.14L31.99 50.83L31.83 50.64L31.59 50.6L31.3 50.72L31 50.97L30.75 51.32L30.56 51.72L30.49 52.11L30.39 54.18L30.29 56.23L30.22 58.27Z"/>
+<path data-layer="windows 5 copy 4" fill="#2a1e16" d="M38.15 53.68L38.25 51.63L38.36 49.57L38.47 47.54L38.43 47.23L38.27 47.04L38.03 47L37.74 47.12L37.44 47.37L37.19 47.72L37 48.12L36.93 48.51L36.83 50.58L36.73 52.63L36.66 54.67Z"/>
+<path data-layer="windows 5 copy 6" fill="#2a1e16" d="M44.98 49.85L45.08 47.79L45.19 45.74L45.31 43.71L45.26 43.4L45.11 43.21L44.87 43.17L44.57 43.29L44.27 43.54L44.02 43.89L43.83 44.29L43.76 44.68L43.66 46.75L43.56 48.8L43.49 50.83Z"/>
+<path data-layer="windows 5 copy" fill="#2a1e16" d="M50.85 46.87L50.95 44.82L51.07 42.76L51.18 40.73L51.13 40.43L50.98 40.23L50.74 40.19L50.44 40.31L50.15 40.56L49.89 40.91L49.71 41.31L49.63 41.71L49.53 43.77L49.43 45.83L49.36 47.86Z"/>
+<path data-layer="windows 5 copy copy" fill="#2a1e16" d="M61.87 19.06L61.98 17.43L62.09 15.81L62.2 14.21L62.15 13.97L62 13.84L61.76 13.84L61.47 13.97L61.17 14.2L60.91 14.51L60.73 14.85L60.66 15.16L60.55 16.79L60.46 18.41L60.39 20.01Z"/>
+<path data-layer="door" fill="#2a1e16" d="M10.64 61.41L10.64 57.09L10.74 56.59L11.01 56.28L11.41 56.21L11.89 56.37L12.37 56.75L12.77 57.3L13.04 57.93L13.14 58.53L13.14 62.85Z"/>
+</g>
+</svg>

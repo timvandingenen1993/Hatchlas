@@ -50,13 +50,17 @@ import {
   type MountainLightingMode,
 } from './mountainLighting';
 import {
+  prepareFullTerrainCameraProjection,
   renderFullTerrainCamera,
+  type FullTerrainCameraProjection,
   type FullTerrainCameraRenderStyle,
   type FullTerrainCameraTextureSource,
   type FullTerrainCameraType,
 } from './fullTerrainCameraRenderer';
 import { sampleScalarField } from './cartographicStrokeRenderer';
 import type { MountainProfiler } from './mountainProfiler';
+import { rasterizeRoadLayer, roadPropClearanceAt, type RoadLayer } from './roadRenderer';
+import type { StructureRenderOptions } from '../structures/types';
 import type { MountainGpuRenderMode } from './mountainGpuRenderer';
 import { forestRenderSettingsSignature } from './forestCanvasRenderer';
 import { mixPaintChannel } from './forestInkRenderer';
@@ -311,6 +315,8 @@ export interface MountainRenderOptions {
   textureCoordinateDomainHeight?: number;
   /** Precomputed mountain illustration pixels for tiled export compositing. */
   mountainIllustrationRGBA?: Uint8ClampedArray;
+  /** User roads, already routed, drawn on top of the composited map. */
+  structures?: StructureRenderOptions;
   /** Ink coverage (0..255) of `mountainIllustrationRGBA`; washes stay off it. */
   mountainIllustrationInkAlpha?: Uint8Array;
   /**
@@ -441,9 +447,12 @@ export function waterGeometryStageKey(options: MountainRenderOptions): string {
  * layer retained for the full-terrain camera pass. */
 export type MountainDetailImageData = ImageData & {
   foregroundPropsRGBA?: Uint8ClampedArray;
+  /** Camera mesh used for this frame, so editors can map clicks to the map. */
+  cameraProjection?: FullTerrainCameraProjection;
   /** 0..255 forest stand cover, where the camera's ridge ink gives way. */
   standCover?: Uint8Array;
 };
+
 
 /**
  * Controls the optional split between CPU stage preparation and GPU layer
@@ -831,10 +840,12 @@ function createForegroundPropRGBA(
   height: number,
   inkColor: RGB,
   terrainShade?: Float32Array,
+  roadLayer?: RoadLayer | null,
+  roadShade?: Float32Array,
 ): Uint8ClampedArray | undefined {
   const rasterPixels = overlay?.rasterPropRGBA;
   const charcoalAlpha = overlay?.rasterPropCharcoalAlpha;
-  if (!rasterPixels && !charcoalAlpha) return undefined;
+  if (!rasterPixels && !charcoalAlpha && !roadLayer) return undefined;
   const total = width * height;
   const foreground = new Uint8ClampedArray(total * 4);
   if (rasterPixels) foreground.set(rasterPixels);
@@ -870,6 +881,40 @@ function createForegroundPropRGBA(
           foreground[offset + 2] * destinationAlpha * (1 - sourceAlpha)) / outputAlpha,
       );
       foreground[offset + 3] = Math.round(outputAlpha * 255);
+    }
+  }
+  if (roadLayer) {
+    // Clear props off the road corridor, then paint the road itself here.
+    // The camera composites this layer after its ridge ink, so roads stay
+    // above the mountain lines while still hiding behind nearer terrain.
+    let shade = 1;
+    const over = (offset: number, color: readonly number[], sourceAlpha: number) => {
+      const destinationAlpha = foreground[offset + 3] / 255;
+      const outputAlpha = sourceAlpha + destinationAlpha * (1 - sourceAlpha);
+      if (outputAlpha <= 0) return;
+      for (let channel = 0; channel < 3; channel++) {
+        foreground[offset + channel] = Math.round(
+          (color[channel] * shade * sourceAlpha + foreground[offset + channel] * destinationAlpha * (1 - sourceAlpha)) / outputAlpha,
+        );
+      }
+      foreground[offset + 3] = Math.round(outputAlpha * 255);
+    };
+    for (let index = 0; index < total; index++) {
+      const coverage = roadPropClearanceAt(roadLayer, index);
+      const shadow = (roadLayer.shadow?.alpha[index] ?? 0) / 255 * roadLayer.opacity;
+      if (coverage <= 0 && shadow <= 0) continue;
+      const offset = index * 4;
+      shade = roadShade?.[index] ?? 1;
+      foreground[offset + 3] = Math.round(foreground[offset + 3] * (1 - coverage));
+      if (shadow > 0 && roadLayer.shadow) over(offset, roadLayer.shadow.colors[roadLayer.shadow.colorIndex[index]], shadow);
+      const outline = (roadLayer.outline?.[index] ?? 0) / 255 * roadLayer.opacity;
+      if (outline > 0) over(offset, roadLayer.outlineColors[roadLayer.outlineColorIndex![index]], outline);
+      const ink = roadLayer.ink[index] / 255 * roadLayer.opacity;
+      if (ink > 0) over(offset, roadLayer.inkColors[roadLayer.inkColorIndex[index]] ?? roadLayer.inkColors[0], ink);
+      const fill = roadLayer.fill[index] / 255 * roadLayer.opacity;
+      if (fill > 0) over(offset, roadLayer.bridgeColor, fill);
+      const bridgeOutline = (roadLayer.bridgeOutline?.[index] ?? 0) / 255 * roadLayer.opacity;
+      if (bridgeOutline > 0) over(offset, roadLayer.bridgeOutlineColor, bridgeOutline);
     }
   }
   return foreground;
@@ -2506,7 +2551,8 @@ export function renderMountainDetailDEMWithCache(
     options.waterTerrainShadeStrength ?? 0.7,
   ));
   const needsPropShade = propTerrainShadeStrength > 0 && !!vegetationOverlay?.rasterPropRGBA;
-  const needsTerrainDarkness = needsPropShade || waterTerrainShadeStrength > 0;
+  const hasRoads = !isPureHeightmapLayer && (options.structures?.roads.length ?? 0) > 0;
+  const needsTerrainDarkness = needsPropShade || waterTerrainShadeStrength > 0 || hasRoads;
   const flatShade = options.terrainFlatShadeOverride
     ?? (needsTerrainDarkness ? terrainFlatShade(dem, hillshadeStrength, aoStrength) : 1 - hillshadeStrength * 0.3);
   const showWaterDetails = (options.showWaterDetails ?? true) &&
@@ -2535,6 +2581,17 @@ export function renderMountainDetailDEMWithCache(
   const grainOffset = Math.floor(options.textureCoordinateOffsetY ?? 0) * grainStride
     + Math.floor(options.textureCoordinateOffsetX ?? 0);
   const siltLineOffsetY = options.textureCoordinateOffsetY ?? 0;
+  const roadLayer = !isPureHeightmapLayer && options.structures?.roads.length
+    ? rasterizeRoadLayer(options.structures.roads, {
+        width,
+        height,
+        offsetX: options.textureCoordinateOffsetX ?? 0,
+        offsetY: options.textureCoordinateOffsetY ?? 0,
+        domainWidth: options.textureCoordinateDomainWidth ?? width,
+        domainHeight: options.textureCoordinateDomainHeight ?? height,
+      }, options.structures.style)
+    : null;
+  const roadsInForeground = options.fullTerrainCameraElevationDeg !== undefined;
   const compositionWindow = options.compositionWindow;
   const x0 = Math.max(0, Math.floor(compositionWindow?.x0 ?? 0));
   const y0 = Math.max(0, Math.floor(compositionWindow?.y0 ?? 0));
@@ -2542,7 +2599,7 @@ export function renderMountainDetailDEMWithCache(
   const y1 = Math.min(height, Math.ceil(compositionWindow?.y1 ?? height));
 
   // The vegetation layer composes on the GPU unless a diagnostic overlay
-  // (kept on the CPU loop only) is on; null runs the CPU loop below.
+  // or a road (kept on the CPU loop only) is on; null runs the CPU loop below.
   const gpuPixels = layer === 'vegetation_patterns'
     && (options.vegetation?.gpuFields ?? true)
     && waterOverlay
@@ -2551,6 +2608,7 @@ export function renderMountainDetailDEMWithCache(
     && !options.vegetation?.showAlpineTreeSuitabilityOverlay
     && !(erosionOverlayOpacity > 0 && maxErosionDepthM > 0)
     && !(rainOpacity > 0)
+    && !roadLayer
     ? composeVegetationLayerGl({
         width,
         height,
@@ -2677,6 +2735,15 @@ export function renderMountainDetailDEMWithCache(
       for (let i = 0; i < totalCells; i++) {
         propTerrainShade[i] = 1 - propTerrainShadeStrength * terrainDarkness[i];
       }
+    }
+  }
+  // Roads take the terrain's hillshade like the props standing beside them:
+  // shadow-side slopes darken the ink, bridge decks and fills.
+  let roadShade: Float32Array | undefined;
+  if (roadLayer && terrainDarkness) {
+    roadShade = new Float32Array(totalCells);
+    for (let index = 0; index < totalCells; index++) {
+      roadShade[index] = 1 - propTerrainShadeStrength * terrainDarkness[index];
     }
   }
   if (gpuPixels) {
@@ -3525,9 +3592,10 @@ export function renderMountainDetailDEMWithCache(
     // watercolor/canvas pixels may cover the water wash and shoreline outline,
     // matching the intended prop-over-water order. Raster prop shadows are
     // currently disabled in the vegetation overlay.
+    const roadPropKeep = roadLayer ? 1 - roadPropClearanceAt(roadLayer, i) : 1;
     const rasterPropShadowAlpha =
       ((vegetationOverlay?.rasterPropShadowAlpha?.[i] ?? 0) / 255) *
-      (options.vegetation?.motifShadowStrength ?? 0);
+      (options.vegetation?.motifShadowStrength ?? 0) * roadPropKeep;
     if (rasterPropShadowAlpha > 0) {
       const shadow = [
         Math.max(0, Math.round(vegetationInkColor[0] * 0.62)),
@@ -3542,7 +3610,7 @@ export function renderMountainDetailDEMWithCache(
     const rasterPropPixelIndex = i * 4;
     const standShare = (vegetationOverlay?.rasterPropStandShare?.[i] ?? 0) / 255;
     const rasterPropAlpha =
-      (vegetationOverlay?.rasterPropRGBA?.[rasterPropPixelIndex + 3] ?? 0) / 255;
+      (vegetationOverlay?.rasterPropRGBA?.[rasterPropPixelIndex + 3] ?? 0) / 255 * roadPropKeep;
     if (rasterPropAlpha > 0) {
       const rasterPropPixels = vegetationOverlay!.rasterPropRGBA!;
       // Forest stands are lit per tree already; only the rest is shaded.
@@ -3568,11 +3636,53 @@ export function renderMountainDetailDEMWithCache(
     // vegetation linework, but remain in the topmost prop layer so a raised
     // mountain face cannot occlude their outline.
     const rasterPropCharcoalAlpha =
-      (vegetationOverlay?.rasterPropCharcoalAlpha?.[i] ?? 0) / 255;
+      (vegetationOverlay?.rasterPropCharcoalAlpha?.[i] ?? 0) / 255 * roadPropKeep;
     if (rasterPropCharcoalAlpha > 0) {
       r = blendContourColor(r, propOutlineColor[0], rasterPropCharcoalAlpha);
       g = blendContourColor(g, propOutlineColor[1], rasterPropCharcoalAlpha);
       b = blendContourColor(b, propOutlineColor[2], rasterPropCharcoalAlpha);
+    }
+
+    // User roads sit above props, whose corridor was cleared above. Under
+    // the terrain camera they are painted into the foreground layer instead,
+    // which the camera draws after its ridge ink.
+    if (roadLayer && !roadsInForeground) {
+      const shade = roadShade?.[i] ?? 1;
+      const roadShadow = (roadLayer.shadow?.alpha[i] ?? 0) / 255 * roadLayer.opacity;
+      if (roadShadow > 0 && roadLayer.shadow) {
+        const color = roadLayer.shadow.colors[roadLayer.shadow.colorIndex[i]];
+        r = blendContourColor(r, color[0] * shade, roadShadow);
+        g = blendContourColor(g, color[1] * shade, roadShadow);
+        b = blendContourColor(b, color[2] * shade, roadShadow);
+      }
+      const roadOutline = (roadLayer.outline?.[i] ?? 0) / 255 * roadLayer.opacity;
+      if (roadOutline > 0) {
+        const color = roadLayer.outlineColors[roadLayer.outlineColorIndex![i]];
+        r = blendContourColor(r, color[0] * shade, roadOutline);
+        g = blendContourColor(g, color[1] * shade, roadOutline);
+        b = blendContourColor(b, color[2] * shade, roadOutline);
+      }
+      const roadInk = roadLayer.ink[i] / 255 * roadLayer.opacity;
+      if (roadInk > 0) {
+        const roadColor = roadLayer.inkColors[roadLayer.inkColorIndex[i]] ?? roadLayer.inkColors[0];
+        r = blendContourColor(r, roadColor[0] * shade, roadInk);
+        g = blendContourColor(g, roadColor[1] * shade, roadInk);
+        b = blendContourColor(b, roadColor[2] * shade, roadInk);
+      }
+      const roadFill = roadLayer.fill[i] / 255 * roadLayer.opacity;
+      if (roadFill > 0) {
+        const fillColor = roadLayer.bridgeColor;
+        r = blendContourColor(r, fillColor[0] * shade, roadFill);
+        g = blendContourColor(g, fillColor[1] * shade, roadFill);
+        b = blendContourColor(b, fillColor[2] * shade, roadFill);
+      }
+      const roadBridgeOutline = (roadLayer.bridgeOutline?.[i] ?? 0) / 255 * roadLayer.opacity;
+      if (roadBridgeOutline > 0) {
+        const color = roadLayer.bridgeOutlineColor;
+        r = blendContourColor(r, color[0] * shade, roadBridgeOutline);
+        g = blendContourColor(g, color[1] * shade, roadBridgeOutline);
+        b = blendContourColor(b, color[2] * shade, roadBridgeOutline);
+      }
     }
 
     pixels[idx4 + 0] = r;
@@ -3588,7 +3698,7 @@ export function renderMountainDetailDEMWithCache(
     ? new ImageData(pixels, width, height)
     : { width, height, data: pixels } as unknown as ImageData;
   const foregroundPropsRGBA = options.fullTerrainCameraElevationDeg !== undefined
-    ? createForegroundPropRGBA(vegetationOverlay, width, height, propOutlineColor, propTerrainShade)
+    ? createForegroundPropRGBA(vegetationOverlay, width, height, propOutlineColor, propTerrainShade, roadLayer, roadShade)
     : undefined;
   if (foregroundPropsRGBA) {
     (image as MountainDetailImageData).foregroundPropsRGBA = foregroundPropsRGBA;
@@ -3632,14 +3742,14 @@ export function renderMountainDetailDEMWithCache(
       }
     : undefined;
 
-  const cameraImage = renderFullTerrainCamera(dem, image, {
+  const cameraSettings = {
     ridgePaths: mountainIllustration?.cameraRidgePaths,
     ridgeColor: options.mountainRidgeColor ?? options.vegetation?.inkColor,
     // Pattern path widths already contain the user's ridge thickness.
     ridgeThicknessScale: 0.75,
     charcoalRidges: true,
     ridgeCover: standCover
-      ? (x, y) => sampleScalarField(standCover, width, height, x, y) / 255
+      ? (x: number, y: number) => sampleScalarField(standCover, width, height, x, y) / 255
       : undefined,
     cameraType: options.fullTerrainCameraType ?? 'orthographic',
     elevationDeg: options.fullTerrainCameraElevationDeg,
@@ -3654,8 +3764,20 @@ export function renderMountainDetailDEMWithCache(
       cache?.mountainPattern?.surfaceElevation ??
       dem.elevation,
     background: FULL_TERRAIN_CAMERA_BACKGROUND,
-    foregroundSource,
+  };
+  // Prepare the projection here so it can travel with the frame; the camera
+  // reuses it because its output size matches the composited image.
+  const cameraProjection = prepareFullTerrainCameraProjection(dem, {
+    ...cameraSettings,
+    outputWidth: width,
+    outputHeight: height,
   });
+  const cameraImage = renderFullTerrainCamera(dem, image, {
+    ...cameraSettings,
+    projection: cameraProjection,
+    foregroundSource,
+  }) as MountainDetailImageData;
+  cameraImage.cameraProjection = cameraProjection;
   detailStop?.();
-  return cameraImage as MountainDetailImageData;
+  return cameraImage;
 }

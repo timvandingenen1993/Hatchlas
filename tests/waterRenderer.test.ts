@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { MountainDEMData } from '../src/terrain/mountainBaseDEM';
+import { RIVER_RADIUS_SUBCELLS, type MountainDEMData } from '../src/terrain/mountainBaseDEM';
 import {
   renderWaterOverlay,
   buildWaterOverlayGeometry,
@@ -808,7 +808,7 @@ describe('water renderer', () => {
         const index = y * width + x;
         dem.biomeType[index] = 6;
         dem.isRiverChannel[index] = 1;
-        dem.riverChannelRadius![index] = 2;
+        dem.riverChannelRadius![index] = 2 * RIVER_RADIUS_SUBCELLS;
         dem.drainageAreaKm2[index] = 20;
       }
     }

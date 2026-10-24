@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="187.83" height="172.23" viewBox="0 0 62.61 57.41" data-footprint="3 3" data-origin="31.3 25.2" fill="none" stroke="#2a1e16" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" data-edited="true" data-settlements="">
+<defs><filter id="hand" x="-4%" y="-4%" width="108%" height="108%"><feTurbulence type="fractalNoise" baseFrequency="0.07" numOctaves="2" seed="4" result="warp"/><feDisplacementMap in="SourceGraphic" in2="warp" scale="1.3" xChannelSelector="R" yChannelSelector="G" result="wobble"/><feTurbulence type="fractalNoise" baseFrequency="1.2" numOctaves="2" seed="9" result="grain"/><feColorMatrix in="grain" type="matrix" values="0 0 0 0 0.16 0 0 0 0 0.11 0 0 0 0 0.07 2.2 0 0 0 -1.18" result="specks"/><feComposite in="specks" in2="wobble" operator="in" result="speckled"/><feMerge><feMergeNode in="wobble"/><feMergeNode in="speckled"/></feMerge></filter></defs>
+<g class="part" filter="url(#hand)">
+<path data-layer="back roof" class="roof-lit" fill="#a07f5f" d="M42.32 7.9L19.54 21.12L4.2 29.96L33.12 12.47Z"/>
+<path data-layer="walls" fill="#c4b393" d="M57.28 40.2L31.3 55.2L31.3 40.2L57.28 25.2Z"/>
+<path data-layer="walls" fill="#ece1c9" d="M5.32 40.2L31.3 55.2L31.3 40.2L19.54 21.12L5.41 29.31Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M54.9 37.08L53.17 38.08L53.17 34.68L54.9 33.68Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M42.34 44.36L40.61 45.36L40.61 41.96L42.34 40.96Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M17.44 42.7L19.17 43.7L19.17 40.3L17.44 39.3Z"/>
+<path data-layer="windows" fill="#2a1e16" d="M17.86 30.1L19.24 30.9L19.24 28.5L17.86 27.7Z"/>
+<path data-layer="windows copy 2" transform="translate(2 2)" fill="#2a1e16" d="M22.48 45.22L24.21 46.22L24.21 42.82L22.48 41.82Z"/>
+<path data-layer="windows copy" transform="translate(2 2)" fill="#2a1e16" d="M34.26 45.75L32.53 46.75L32.53 43.35L34.26 42.35Z"/>
+<path data-layer="eaves" class="roof-shade" fill="#7b5e45" d="M13.81 24.25L4.2 29.96L4.2 29.96L13.81 24.25Z"/>
+<path data-layer="eaves" class="roof-shade" fill="#7b5e45" d="M19.54 21.12L30.95 43.55L30.95 44.55L19.54 21.12Z"/>
+<path data-layer="eaves" class="roof-shade" fill="#7b5e45" d="M60.4 26.55L30.95 43.55L30.95 44.55L60.4 27.55Z"/>
+<path data-layer="roof" class="roof-shade" fill="#7b5e45" d="M45.53 6.21L19.54 21.12L30.95 43.8L60.4 26.8Z"/>
+</g>
+</svg>

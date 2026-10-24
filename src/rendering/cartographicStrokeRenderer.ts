@@ -409,6 +409,9 @@ export function paintInkSegment(
   clipRect?: { minX: number; minY: number; maxX: number; maxY: number },
   depthBuffer?: Float32Array,
   depthValue = 0,
+  /** Optional palette ownership, written only where this segment deposits ink. */
+  paintTags?: Uint8Array,
+  paintTag = 0,
 ): void {
   const sx = x1 - x0;
   const sy = y1 - y0;
@@ -514,6 +517,7 @@ export function paintInkSegment(
         ) * 255,
       );
       alpha[index] = Math.max(alpha[index], paintedAlpha);
+      if (paintTags && paintedAlpha > 0) paintTags[index] = paintTag;
       if (depthBuffer && paintedAlpha > 0 && Number.isFinite(depthValue)) {
         depthBuffer[index] = Math.max(depthBuffer[index], depthValue);
       }

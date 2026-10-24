@@ -70,7 +70,7 @@ export interface MountainDEMData {
   strahlerOrder: Uint8Array; // Strahler stream order (0=none, 1=rill to 6=braided trunk)
   riverCenterlineMask: Uint8Array; // 1 = routed thalweg, including submerged mouth continuation
   isRiverChannel: Uint8Array; // 1 = river / submerged continuation / braided channel, 0 = dry land
-  riverChannelRadius?: Uint8Array; // Bank-full raster radius used by the water-stage calculation
+  riverChannelRadius?: Uint8Array; // Bank-full raster radius in 1/RIVER_RADIUS_SUBCELLS cells, used by the water-stage calculation
   riverMouthMask?: Uint8Array; // 1 = ocean cell belonging to a routed river mouth
   riverMouthAreaKm2?: Float32Array; // Inherited terrestrial catchment carried into the mouth
   waterDepthM: Float32Array; // Estimated water depth in channels
@@ -721,6 +721,12 @@ export const WATER_REFERENCE_CELL_M = 40;
 export function waterWidthCellScale(cellSizeM: number): number {
   return cellSizeM > 0 ? Math.min(1, WATER_REFERENCE_CELL_M / cellSizeM) : 1;
 }
+
+/**
+ * Fixed-point steps per cell in riverChannelRadius. Whole-cell radii left most
+ * rivers on the same radius across much of the channel width control.
+ */
+export const RIVER_RADIUS_SUBCELLS = 4;
 
 /**
  * Lee-side rainfall floor, as a fraction of the base precipitation. The linear
@@ -3343,7 +3349,11 @@ export function processMountainBaseDEM(
     12,
     Math.max(2, Math.min(dxMeters, dyMeters) * 0.035),
   );
-  const stageWidthScale = Math.sqrt(effectiveWaterStageScale);
+  // Width follows the stage linearly, so the channel width control scales
+  // every river class by its factor. The former square root, whole-cell
+  // rounding and per-class floors kept most rivers on one radius from 0.3x
+  // to about 0.9x.
+  const stageWidthScale = effectiveWaterStageScale;
   // Radius 0 keeps only the thalweg once a cell is wider than the channel.
   const channelRadiusCellScale = waterWidthCellScale(Math.min(dxMeters, dyMeters));
 
@@ -3355,34 +3365,39 @@ export function processMountainBaseDEM(
     if (isOcean[i] === 0 && area >= riverThresholdKm2) {
       let displayOrder = Math.max(1, Math.min(6, strahlerOrder[i]));
       let depth = 0.4 * effectiveWaterStageScale;
-      let radius = Math.min(3, Math.max(1, Math.round(0.5 * stageWidthScale)));
+      // Bank-full radius in cells at stage 1.
+      let baseRadius = 0.5;
 
       if (area >= 40.0) {
         displayOrder = Math.max(displayOrder, 6); // Grand trunk / delta channels
         depth = 4.2 * effectiveWaterStageScale;
-        radius = Math.min(9, Math.max(2, Math.round(3.5 * stageWidthScale)));
+        baseRadius = 3.5;
       } else if (area >= 15.0) {
         displayOrder = Math.max(displayOrder, 5); // Main river stem
         depth = 3.0 * effectiveWaterStageScale;
-        radius = Math.min(6, Math.max(2, Math.round(2.4 * stageWidthScale)));
+        baseRadius = 2.4;
       } else if (area >= 6.0) {
         displayOrder = Math.max(displayOrder, 4); // Canyon gorge river
         depth = 2.0 * effectiveWaterStageScale;
-        radius = Math.min(4, Math.max(1, Math.round(1.5 * stageWidthScale)));
+        baseRadius = 1.5;
       } else if (area >= 2.0) {
         displayOrder = Math.max(displayOrder, 3); // Mountain stream
         depth = 1.2 * effectiveWaterStageScale;
-        radius = Math.min(3, Math.max(1, Math.round(0.8 * stageWidthScale)));
+        baseRadius = 0.8;
       } else if (area >= 0.6) {
         displayOrder = Math.max(displayOrder, 2); // Brook
         depth = 0.7 * effectiveWaterStageScale;
-        radius = Math.min(2, Math.max(1, Math.round(0.65 * stageWidthScale)));
+        baseRadius = 0.65;
       }
+      const radius = baseRadius * stageWidthScale * channelRadiusCellScale;
 
       const waterSurfaceM = elevation[i] + depth + rasterStageAllowanceM;
       centerlineMask[i] = 1;
       distanceToCenterline[i] = 0;
-      inheritedChannelRadius[i] = Math.round(radius * channelRadiusCellScale);
+      inheritedChannelRadius[i] = Math.min(
+        255,
+        Math.round(radius * RIVER_RADIUS_SUBCELLS),
+      );
       inheritedChannelOrder[i] = displayOrder;
       inheritedWaterSurfaceM[i] = waterSurfaceM;
       isRiverChannel[i] = 1;
@@ -3407,7 +3422,7 @@ export function processMountainBaseDEM(
     const idx = bankFillQueue[bankQueueRead++];
     const currentDistance = distanceToCenterline[idx];
     const radius = inheritedChannelRadius[idx];
-    if (currentDistance >= radius) continue;
+    if ((currentDistance + 1) * RIVER_RADIUS_SUBCELLS > radius) continue;
 
     const x = idx % width;
     const y = Math.floor(idx / width);
@@ -4009,7 +4024,7 @@ function extendRoutedRiverMouth(
     centerlineMask[target] = 1;
     isRiverChannel[target] = 1;
     channelRadius[target] = Math.max(
-      1,
+      RIVER_RADIUS_SUBCELLS,
       targetIsOcean ? channelRadius[current] : channelRadius[target],
     );
     if (!targetIsOcean) {
@@ -4216,7 +4231,9 @@ function computeMountainFluvialIncision(
   );
   const radiusAtRiverCell = (index: number): number => {
     const storedRadius = dem.riverChannelRadius?.[index] ?? 0;
-    if (storedRadius > 0) return storedRadius;
+    if (storedRadius > 0) {
+      return Math.max(1, Math.round(storedRadius / RIVER_RADIUS_SUBCELLS));
+    }
     return Math.max(
       1,
       Math.min(

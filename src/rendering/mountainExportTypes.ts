@@ -1,5 +1,6 @@
 import type { BaseDEMOptions, MountainDEMData } from "../terrain/mountainBaseDEM";
 import type { MountainRenderOptions, VegetationWashGrid } from "./mountainDetailRenderer";
+import type { TownStampRaster } from "../structures/townStamp";
 import type { RiverSpline } from "./waterRenderer";
 import type { VegetationGeometry } from "./vegetationRenderer";
 import type { MountainProfiler } from "./mountainProfiler";
@@ -75,6 +76,8 @@ export interface MountainExportRequest extends MountainExportSettings {
   helperCount?: number;
   /** Internal diagnostic switch used to compare camera export scheduling. */
   debugForceSerialCameraTiles?: boolean;
+  /** Towns pre-rendered at export scale, drawn upright over the final image. */
+  townStamps?: TownStampRaster[];
   /**
    * `pixels` returns the raw RGBA image instead of a PNG, for the live 4K
    * preview, which draws it straight onto a canvas.
