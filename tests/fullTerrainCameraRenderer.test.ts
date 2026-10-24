@@ -641,7 +641,7 @@ describe('full terrain orthographic camera', () => {
       contourIntervalM: 100,
       structures: {
         roads: [{ points: [{ u: 0.1, v: 0.5 }, { u: 0.9, v: 0.5 }], kind: 'road' as const, bridges: [] }],
-        style: { ...DEFAULT_ROAD_STYLE, handDrawn: false, color: '#ff0000', widthScale: 20, clearance: 0 },
+        style: { ...DEFAULT_ROAD_STYLE, byKind: undefined, handDrawn: false, color: '#ff0000', widthScale: 20, clearance: 0 },
       },
     };
     const roadRow = Math.round(0.5 * (40 - 1));

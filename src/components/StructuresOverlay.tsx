@@ -6,7 +6,7 @@
  */
 import { useEffect, useRef, useState, type RefObject } from "react";
 import { loadIconImage, townIconUrl } from "../structures/iconStore";
-import { drawTownStamp, TOWN_REFERENCE_FRAME_WIDTH } from "../structures/townStamp";
+import { drawTownStamp, TOWN_REFERENCE_FRAME_WIDTH, townSymbolRadius } from "../structures/townStamp";
 import type { StructuresEditor } from "../structures/useStructuresEditor";
 import { sourceToScreen, type CameraGrid } from "../structures/viewProjection";
 import type { MapPoint } from "../structures/types";
@@ -32,10 +32,12 @@ export function StructuresOverlay({
 }: StructuresOverlayProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [images, setImages] = useState<ReadonlyMap<string, HTMLImageElement>>(new Map());
-  const { structures, routes, selection, icons, routingRoadIds, draggingRoadId } = editor;
+  const { structures, routes, selection, icons, routingRoadIds, draggingRoadId, townStyle } = editor;
+  const showIcons = townStyle.symbol === "icon";
 
-  // Decode icons used by towns.
+  // Decode icons used by towns; dots need none.
   useEffect(() => {
+    if (!showIcons) return;
     let cancelled = false;
     const urls = new Set(structures.towns.map((town) => townIconUrl(town, icons)));
     for (const url of urls) {
@@ -47,7 +49,7 @@ export function StructuresOverlay({
         .catch(() => {});
     }
     return () => { cancelled = true; };
-  }, [structures.towns, icons, images]);
+  }, [structures.towns, icons, images, showIcons]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -119,12 +121,12 @@ export function StructuresOverlay({
 
     const stampScale = Math.max(width, height) / TOWN_REFERENCE_FRAME_WIDTH;
     for (const town of structures.towns) {
-      const image = images.get(townIconUrl(town, icons)) ?? null;
+      const image = showIcons ? images.get(townIconUrl(town, icons)) ?? null : null;
       const point = toCanvas(town);
-      drawTownStamp(context, town, image, point.x, point.y, stampScale, editor.townStyle);
+      drawTownStamp(context, town, image, point.x, point.y, stampScale, townStyle);
       if (selection?.kind === "town" && selection.id === town.id) {
         context.beginPath();
-        context.arc(point.x, point.y, (town.size * stampScale) * 0.62 + 3 * pixelsPerCss, 0, Math.PI * 2);
+        context.arc(point.x, point.y, townSymbolRadius(town, stampScale, townStyle) + 3 * pixelsPerCss, 0, Math.PI * 2);
         context.setLineDash([4 * pixelsPerCss, 3 * pixelsPerCss]);
         context.strokeStyle = HANDLE_ACTIVE;
         context.lineWidth = 2 * pixelsPerCss;

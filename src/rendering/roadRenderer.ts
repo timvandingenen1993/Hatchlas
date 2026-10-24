@@ -232,6 +232,9 @@ function strokePolyline(points: readonly { x: number; y: number }[], paint: Segm
   }
 }
 
+/** Bridges have their own deck style; while off they are drawn as plain road. */
+export const BRIDGE_DECKS = false;
+
 export function rasterizeRoadLayer(
   roads: readonly RoadRenderPath[],
   target: RoadRasterTarget,
@@ -242,7 +245,7 @@ export function rasterizeRoadLayer(
   const total = width * height;
   const ink = new Uint8Array(total);
   const fill = new Uint8Array(total);
-  const bridgeOutline = roads.some((road) => road.bridges.some((span) => !span.ford)) ? new Uint8Array(total) : null;
+  const bridgeOutline = BRIDGE_DECKS && roads.some((road) => road.bridges.some((span) => !span.ford)) ? new Uint8Array(total) : null;
   const settings = roads.map((road) => roadKindStyle(style, road.kind));
   const outline = settings.some((value) => value.outline && value.outlineWidth > 0) ? new Uint8Array(total) : null;
   const clear = style.clearance > 0 ? new Uint8Array(total) : null;
@@ -320,8 +323,9 @@ export function rasterizeRoadLayer(
     // The cleared corridor follows the whole road, bridges included.
     if (clear) strokePolyline(local, paint(clear, clearRadius, true));
 
-    // Split the road into land runs and crossing spans.
-    const spans = [...road.bridges].sort((a, b) => a.from - b.from);
+    // Split the road into land runs and crossing spans. Without bridge decks a
+    // bridge stays part of its land run.
+    const spans = road.bridges.filter((span) => span.ford || BRIDGE_DECKS).sort((a, b) => a.from - b.from);
     const landRuns: { x: number; y: number }[][] = [];
     let cursor = 0;
     for (const span of spans) {

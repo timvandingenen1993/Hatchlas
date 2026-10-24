@@ -6,6 +6,7 @@ import { Eye, EyeOff, Loader2, Plus, RotateCcw, Shuffle, Trash2, Upload, X } fro
 import { InspectorColor, InspectorFold, InspectorNote, InspectorSection, InspectorSelect, InspectorToggle } from "./InspectorParts";
 import { NumericControl } from "./NumericControl";
 import { RoadStylePreview } from "./RoadStylePreview";
+import { BRIDGE_DECKS } from "../rendering/roadRenderer";
 import { generatePOIName } from "../utils/fantasyNames";
 import type { StructuresEditor } from "../structures/useStructuresEditor";
 import { settlementIconUrl, townIconUrl } from "../structures/iconStore";
@@ -29,6 +30,7 @@ import {
   type TownLabelPosition,
   type Town,
   type TownStyle,
+  type TownSymbol,
 } from "../structures/types";
 
 interface StructuresPanelProps {
@@ -105,7 +107,7 @@ function RoadTypeControls({ kind, value, style, onChange, onReset }: {
   kind: RoadKind; value: RoadKindStyle; style: RoadStyle;
   onChange: (patch: Partial<RoadKindStyle>) => void; onReset: () => void;
 }) {
-  const defaults = DEFAULT_ROAD_KIND_STYLE;
+  const defaults = { ...DEFAULT_ROAD_KIND_STYLE, ...DEFAULT_ROAD_STYLE.byKind?.[kind] };
   const setField = <K extends keyof RoadKindStyle>(key: K) => (next: RoadKindStyle[K]) => onChange({ [key]: next });
   return <InspectorFold title={ROAD_KIND_LABELS[kind]} defaultOpen={kind === "road"}>
     <button type="button" onClick={onReset} aria-label={`Reset ${ROAD_KIND_LABELS[kind].toLowerCase()} style`}
@@ -265,18 +267,20 @@ export function StructuresPanel({ editor, onStartRoad, onStartTown }: Structures
           byKind: { ...previous.byKind, [kind]: { ...previous.byKind?.[kind], ...patch } },
         }))}
         onReset={() => setRoadStyle((previous) => ({ ...previous,
-          byKind: { ...previous.byKind, [kind]: { ...DEFAULT_ROAD_KIND_STYLE } },
+          byKind: { ...previous.byKind, [kind]: { ...DEFAULT_ROAD_KIND_STYLE, ...DEFAULT_ROAD_STYLE.byKind?.[kind] } },
         }))} />)}
       <InspectorFold title="Shared settings">
         <NumericControl label="Opacity" value={roadStyle.opacity} min={0} max={1} step={0.01} unit="%"
           defaultValue={DEFAULT_ROAD_STYLE.opacity} onChange={setRoadField("opacity")} />
         <InspectorToggle label="Charcoal outline" checked={roadStyle.handDrawn} onChange={setRoadField("handDrawn")}
           title="Draw road outlines with the map's charcoal pen texture. Lines and dashes stay clean." />
-        <InspectorColor label="Bridge deck" value={roadStyle.bridgeColor} onChange={setRoadField("bridgeColor")} />
-        <InspectorColor label="Bridge outline" value={roadStyle.bridgeOutlineColor} onChange={setRoadField("bridgeOutlineColor")} />
-        <NumericControl label="Bridge outline width" value={roadStyle.bridgeOutlineWidth} min={0.2} max={4} step={0.1} unit="px"
-          defaultValue={DEFAULT_ROAD_STYLE.bridgeOutlineWidth} limits={[0.2, 8]} onChange={setRoadField("bridgeOutlineWidth")}
-          title="Thickness of the lines drawn around a bridge and along its side sections." />
+        {BRIDGE_DECKS && <>
+          <InspectorColor label="Bridge deck" value={roadStyle.bridgeColor} onChange={setRoadField("bridgeColor")} />
+          <InspectorColor label="Bridge outline" value={roadStyle.bridgeOutlineColor} onChange={setRoadField("bridgeOutlineColor")} />
+          <NumericControl label="Bridge outline width" value={roadStyle.bridgeOutlineWidth} min={0.2} max={4} step={0.1} unit="px"
+            defaultValue={DEFAULT_ROAD_STYLE.bridgeOutlineWidth} limits={[0.2, 8]} onChange={setRoadField("bridgeOutlineWidth")}
+            title="Thickness of the lines drawn around a bridge and along its side sections." />
+        </>}
         <NumericControl label="Tree clearance" value={roadStyle.clearance} min={0} max={20} step={0.5} unit="px"
           defaultValue={DEFAULT_ROAD_STYLE.clearance} limits={[0, 40]} onChange={setRoadField("clearance")}
           title="Corridor beside the road kept free of trees, shrubs and boulders." />
@@ -359,6 +363,24 @@ export function StructuresPanel({ editor, onStartRoad, onStartTown }: Structures
     <InspectorSection title="Label style" aside={
       <button type="button" className={iconButton} title="Reset label style" aria-label="Reset label style"
         onClick={() => setTownStyle({ ...DEFAULT_TOWN_STYLE })}><RotateCcw size={12} /></button>}>
+      <InspectorFold title="Symbol" defaultOpen>
+        <InspectorSelect<TownSymbol> label="Town symbol" value={townStyle.symbol} onChange={setLabelField("symbol")}
+          options={[["icon", "Settlement icon"], ["dot", "Dot"]]} />
+        {townStyle.symbol === "icon" ? <>
+          <InspectorColor label="Halo color" value={townStyle.iconHaloColor} onChange={setLabelField("iconHaloColor")} />
+          <NumericControl label="Halo width" value={townStyle.iconHaloWidth} min={0} max={8} step={0.25} unit="px"
+            defaultValue={DEFAULT_TOWN_STYLE.iconHaloWidth} limits={[0, 16]} onChange={setLabelField("iconHaloWidth")} />
+          <NumericControl label="Halo blur" value={townStyle.iconHaloBlur} min={0} max={6} step={0.25} unit="px"
+            defaultValue={DEFAULT_TOWN_STYLE.iconHaloBlur} limits={[0, 16]} onChange={setLabelField("iconHaloBlur")} />
+          <NumericControl label="Halo opacity" value={townStyle.iconHaloOpacity} min={0} max={1} step={0.01} unit="%"
+            defaultValue={DEFAULT_TOWN_STYLE.iconHaloOpacity} onChange={setLabelField("iconHaloOpacity")} />
+          <InspectorNote>The halo traces the buildings' outline. Pixels refer to a 2048px map.</InspectorNote>
+        </> : <>
+          <NumericControl label="Outline width" value={townStyle.dotOutlineWidth} min={0} max={6} step={0.25} unit="px"
+            defaultValue={DEFAULT_TOWN_STYLE.dotOutlineWidth} limits={[0, 12]} onChange={setLabelField("dotOutlineWidth")} />
+          <InspectorNote>Dot draws every town as a black dot with a white outline, sized by its settlement.</InspectorNote>
+        </>}
+      </InspectorFold>
       <InspectorFold title="Typography" defaultOpen>
         <InspectorSelect<TownFont> label="Font" value={townStyle.font} onChange={setLabelField("font")}
           options={(Object.keys(TOWN_FONT_STACKS) as TownFont[]).map((font) => [font, TOWN_FONT_STACKS[font].label] as const)} />

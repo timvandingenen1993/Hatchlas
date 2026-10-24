@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { drawTownStamp, rasterizeTownStamp } from '../src/structures/townStamp';
-import type { Town, TownLabelPosition } from '../src/structures/types';
+import { DEFAULT_TOWN_STYLE, type Town, type TownLabelPosition } from '../src/structures/types';
 
 const town: Town = {
   id: 'town_1', name: 'Highmere', subtitle: 'Market town', u: 0.4, v: 0.5,
@@ -75,8 +75,10 @@ describe('town label offset', () => {
         return canvas;
       },
     });
-    const original = rasterizeTownStamp({ ...town, labelPosition: position }, icon, 2)!;
-    const shifted = rasterizeTownStamp({ ...town, labelPosition: position, labelOffset: 24 }, icon, 2)!;
+    // The stubbed canvas cannot paint the icon halo.
+    const style = { ...DEFAULT_TOWN_STYLE, iconHaloWidth: 0 };
+    const original = rasterizeTownStamp({ ...town, labelPosition: position }, icon, 2, style)!;
+    const shifted = rasterizeTownStamp({ ...town, labelPosition: position, labelOffset: 24 }, icon, 2, style)!;
     if (position === 'right') {
       expect(shifted.width - original.width).toBe(48);
       expect(shifted.height).toBe(original.height);

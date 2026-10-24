@@ -349,7 +349,9 @@ export function useStructuresEditor({
     const scale = longEdge / TOWN_REFERENCE_FRAME_WIDTH;
     const stamps: TownStampRaster[] = [];
     for (const town of structures.towns) {
-      const image = await loadIconImage(townIconUrl(town, icons)).catch(() => null);
+      const image = townStyle.symbol === "icon"
+        ? await loadIconImage(townIconUrl(town, icons)).catch(() => null)
+        : null;
       const stamp = rasterizeTownStamp(town, image, scale, townStyle);
       if (stamp) stamps.push(stamp);
     }

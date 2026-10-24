@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { rasterizeRoadLayer, roadPropClearanceAt } from '../src/rendering/roadRenderer';
+import { BRIDGE_DECKS, rasterizeRoadLayer, roadPropClearanceAt } from '../src/rendering/roadRenderer';
 import { DEFAULT_ROAD_STYLE, type RoadRenderPath, type RoadStyle } from '../src/structures/types';
 
 const SIZE = 256;
 const target = { width: SIZE, height: SIZE, offsetX: 0, offsetY: 0, domainWidth: SIZE * 8, domainHeight: SIZE * 8 };
-const CLEAN = { ...DEFAULT_ROAD_STYLE, handDrawn: false };
+// Shared fields only: the default per-type styling would differ between types.
+const PLAIN: RoadStyle = { ...DEFAULT_ROAD_STYLE, byKind: undefined };
+const CLEAN = { ...PLAIN, handDrawn: false };
 
 function road(overrides: Partial<RoadRenderPath> = {}, y = 64): RoadRenderPath {
   return { points: [{ u: 0, v: y / 2047 }, { u: 255 / 2047, v: y / 2047 }], kind: 'road', bridges: [], ...overrides };
@@ -16,7 +18,7 @@ const emptyColumns = (alpha: Uint8Array) => Array.from({ length: 224 }, (_, x) =
 
 describe('road renderer', () => {
   it.each([false, true])('uses identical line geometry for all types (hand-drawn: %s)', (handDrawn) => {
-    const style = { ...DEFAULT_ROAD_STYLE, handDrawn };
+    const style = { ...PLAIN, handDrawn };
     const base = rasterizeRoadLayer([road()], target, style)!;
     for (const kind of ['track', 'road', 'highway'] as const) {
       const layer = rasterizeRoadLayer([road({ kind })], target, style)!;
@@ -99,7 +101,7 @@ describe('road renderer', () => {
   });
 
   it.each([false, true])('zero spacing is continuous; positive spacing opens gaps (hand-drawn: %s)', (handDrawn) => {
-    const style = { ...DEFAULT_ROAD_STYLE, handDrawn };
+    const style = { ...PLAIN, handDrawn };
     const continuous = rasterizeRoadLayer([road()], target, { ...style, byKind: { road: { dashSpacing: 0 } } })!;
     const dashed = rasterizeRoadLayer([road()], target, { ...style, byKind: { road: { dashSpacing: 12 } } })!;
     const spaced = rasterizeRoadLayer([road()], target, { ...style, byKind: { road: { dashSpacing: 30 } } })!;
@@ -146,8 +148,8 @@ describe('road renderer', () => {
 
   it('keeps the line and dashes clean; only the outline takes the charcoal texture', () => {
     const byKind = { road: { width: 6, dashSpacing: 12, dashLength: 20, outline: true, outlineWidth: 2 } };
-    const clean = rasterizeRoadLayer([road()], target, { ...DEFAULT_ROAD_STYLE, handDrawn: false, byKind })!;
-    const charcoal = rasterizeRoadLayer([road()], target, { ...DEFAULT_ROAD_STYLE, handDrawn: true, byKind })!;
+    const clean = rasterizeRoadLayer([road()], target, { ...PLAIN, handDrawn: false, byKind })!;
+    const charcoal = rasterizeRoadLayer([road()], target, { ...PLAIN, handDrawn: true, byKind })!;
     expect(charcoal.ink).toEqual(clean.ink);
     expect(charcoal.outline).not.toEqual(clean.outline);
     expect(Array.from(charcoal.ink).filter((value) => value === 255).length).toBeGreaterThan(100);
@@ -237,7 +239,7 @@ describe('road renderer', () => {
     }
   });
 
-  it('keeps bridge decks and rails with the same type settings', () => {
+  it.skipIf(!BRIDGE_DECKS)('keeps bridge decks and rails with the same type settings', () => {
     const layer = rasterizeRoadLayer([road({
       points: [{ u: 20 / 2047, v: 64 / 2047 }, { u: 200 / 2047, v: 64 / 2047 }],
       bridges: [{ from: 0, to: 1, ford: false }],
@@ -247,7 +249,7 @@ describe('road renderer', () => {
     expect(layer.shadow!.alpha.some((value) => value > 0)).toBe(true);
   });
 
-  it('draws a bridge over the water as a main deck with an outlined section down each side', () => {
+  it.skipIf(!BRIDGE_DECKS)('draws a bridge over the water as a main deck with an outlined section down each side', () => {
     const bridge = (extra: Partial<RoadStyle> = {}) => rasterizeRoadLayer([road({
       points: [{ u: 20 / 2047, v: 64 / 2047 }, { u: 200 / 2047, v: 64 / 2047 }],
       bridges: [{ from: 0, to: 1, ford: false }],
@@ -274,7 +276,7 @@ describe('road renderer', () => {
     expect(layer.ink[(64 + 10) * SIZE + 110]).toBe(0);
   });
 
-  it('sets the bridge outline thickness with the width setting', () => {
+  it.skipIf(!BRIDGE_DECKS)('sets the bridge outline thickness with the width setting', () => {
     const thickness = (bridgeOutlineWidth: number) => {
       const layer = rasterizeRoadLayer([road({
         points: [{ u: 20 / 2047, v: 64 / 2047 }, { u: 200 / 2047, v: 64 / 2047 }],

@@ -2,7 +2,8 @@
  * Town stamp: the settlement icon plus its name label with a halo. The same
  * drawing code serves the editor overlay and the export, so a town looks the
  * same in both. Sizes are authored against a 2048px wide frame and scaled
- * with the frame; fonts, colors and halo come from the map-wide TownStyle.
+ * with the frame; fonts, colors, halo and the icon-or-dot symbol come from
+ * the map-wide TownStyle.
  */
 import { DEFAULT_TOWN_STYLE, TOWN_FONT_STACKS, type Town, type TownStyle } from "./types";
 
@@ -11,6 +12,100 @@ export const TOWN_REFERENCE_FRAME_WIDTH = 2048;
 function rgba(hex: string, alpha: number): string {
   const value = parseInt(hex.slice(1), 16);
   return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, ${alpha})`;
+}
+
+const DOT_FILL = "#000000";
+const DOT_OUTLINE = "#ffffff";
+
+/** Dot symbol: diameter of the black fill and width of its white ring, in output pixels. */
+function townDot(town: Town, scale: number, style: TownStyle): { diameter: number; outline: number } {
+  return { diameter: Math.max(5, town.size * 0.22) * scale, outline: style.dotOutlineWidth * scale };
+}
+
+/** Radius of the drawn symbol, for selection rings. */
+export function townSymbolRadius(town: Town, scale: number, style: TownStyle = DEFAULT_TOWN_STYLE): number {
+  if (style.symbol !== "dot") return town.size * scale * 0.62 + style.iconHaloWidth * scale;
+  const dot = townDot(town, scale, style);
+  return dot.diameter / 2 + dot.outline;
+}
+
+type ScratchCanvas = HTMLCanvasElement | OffscreenCanvas;
+
+function scratchCanvas(width: number, height: number): ScratchCanvas | null {
+  if (typeof OffscreenCanvas !== "undefined") return new OffscreenCanvas(width, height);
+  if (typeof document === "undefined") return null;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  return canvas;
+}
+
+/** Space the halo needs around the icon: its width plus the reach of the blur. */
+function haloPad(radius: number, blur: number): number {
+  return radius > 0 || blur > 0 ? Math.ceil(radius + blur * 3) + 1 : 0;
+}
+
+const HALO_CACHE_LIMIT = 8;
+const haloCache = new WeakMap<object, Map<string, ScratchCanvas>>();
+
+/**
+ * The icon's silhouette in the halo color, grown by `radius` and softened by
+ * `blur` (output pixels), on a canvas `haloPad` larger than the icon on each
+ * side. Kept per icon, so the overlay can redraw every frame.
+ */
+function iconHalo(
+  icon: CanvasImageSource & { width: number; height: number },
+  width: number,
+  height: number,
+  radius: number,
+  blur: number,
+  color: string,
+): ScratchCanvas | null {
+  const key = `${width.toFixed(2)}|${height.toFixed(2)}|${radius.toFixed(2)}|${blur.toFixed(2)}|${color}`;
+  let entries = haloCache.get(icon);
+  const cached = entries?.get(key);
+  if (cached) return cached;
+  const pad = haloPad(radius, blur);
+  const canvasWidth = Math.ceil(width) + pad * 2;
+  const canvasHeight = Math.ceil(height) + pad * 2;
+  const silhouette = scratchCanvas(canvasWidth, canvasHeight);
+  const grown = scratchCanvas(canvasWidth, canvasHeight);
+  const silhouetteContext = silhouette?.getContext("2d") as CanvasRenderingContext2D | null | undefined;
+  const grownContext = grown?.getContext("2d") as CanvasRenderingContext2D | null | undefined;
+  if (!silhouette || !grown || !silhouetteContext || !grownContext) return null;
+  silhouetteContext.drawImage(icon, pad, pad, width, height);
+  silhouetteContext.globalCompositeOperation = "source-in";
+  silhouetteContext.fillStyle = color;
+  silhouetteContext.fillRect(0, 0, canvasWidth, canvasHeight);
+  // Dilate by stamping the silhouette around concentric rings; the inner
+  // rings fill gaps a single ring leaves around small details.
+  grownContext.drawImage(silhouette, 0, 0);
+  const rings = Math.ceil(radius / 1.5);
+  for (let ring = 1; ring <= rings; ring++) {
+    const distance = (radius * ring) / rings;
+    const steps = Math.max(8, Math.ceil((Math.PI * 2 * distance) / 1.5));
+    for (let step = 0; step < steps; step++) {
+      const angle = (step / steps) * Math.PI * 2;
+      grownContext.drawImage(silhouette, Math.cos(angle) * distance, Math.sin(angle) * distance);
+    }
+  }
+  let halo = grown;
+  if (blur > 0) {
+    const blurred = scratchCanvas(canvasWidth, canvasHeight);
+    const blurredContext = blurred?.getContext("2d") as CanvasRenderingContext2D | null | undefined;
+    if (blurred && blurredContext) {
+      blurredContext.filter = `blur(${blur.toFixed(2)}px)`;
+      blurredContext.drawImage(grown, 0, 0);
+      halo = blurred;
+    }
+  }
+  if (!entries) {
+    entries = new Map();
+    haloCache.set(icon, entries);
+  }
+  if (entries.size >= HALO_CACHE_LIMIT) entries.delete(entries.keys().next().value!);
+  entries.set(key, halo);
+  return halo;
 }
 
 export interface StampBounds {
@@ -42,10 +137,21 @@ function layoutTownStamp(
   scale: number,
   style: TownStyle,
 ): StampLayout {
-  const iconEdge = town.size * scale;
-  const aspect = icon && icon.width > 0 && icon.height > 0 ? icon.width / icon.height : 1;
-  const iconWidth = aspect >= 1 ? iconEdge : iconEdge * aspect;
-  const iconHeight = aspect >= 1 ? iconEdge / aspect : iconEdge;
+  let iconWidth: number;
+  let iconHeight: number;
+  let haloWidth = 0;
+  let haloReach = 0;
+  if (style.symbol === "dot") {
+    const dot = townDot(town, scale, style);
+    iconWidth = iconHeight = dot.diameter + dot.outline * 2;
+  } else {
+    haloWidth = style.iconHaloWidth * scale;
+    haloReach = haloPad(haloWidth, style.iconHaloBlur * scale);
+    const iconEdge = town.size * scale;
+    const aspect = icon && icon.width > 0 && icon.height > 0 ? icon.width / icon.height : 1;
+    iconWidth = aspect >= 1 ? iconEdge : iconEdge * aspect;
+    iconHeight = aspect >= 1 ? iconEdge / aspect : iconEdge;
+  }
   const family = TOWN_FONT_STACKS[style.font]?.css ?? TOWN_FONT_STACKS.serif.css;
   const nameSize = Math.max(9, town.size * 0.42) * style.labelScale * scale;
   const subtitleSize = nameSize * style.subtitleScale;
@@ -55,10 +161,10 @@ function layoutTownStamp(
   const letterSpacing = style.letterSpacing;
   const transform = (text: string) => style.uppercase ? text.toLocaleUpperCase() : text;
   const bounds: StampBounds = {
-    left: -iconWidth / 2,
-    top: -iconHeight / 2,
-    right: iconWidth / 2,
-    bottom: iconHeight / 2,
+    left: -iconWidth / 2 - haloReach,
+    top: -iconHeight / 2 - haloReach,
+    right: iconWidth / 2 + haloReach,
+    bottom: iconHeight / 2 + haloReach,
   };
   const lines: StampLayout["lines"] = [];
   if (town.showLabel && (town.name || town.subtitle)) {
@@ -79,13 +185,14 @@ function layoutTownStamp(
     let x: number;
     let align: CanvasTextAlign;
     if (town.labelPosition === "right") {
-      x = iconWidth / 2 + gap;
+      x = iconWidth / 2 + haloWidth + gap;
       align = "left";
       top = -blockHeight / 2;
     } else {
       x = 0;
       align = "center";
-      top = town.labelPosition === "above" ? -iconHeight / 2 - gap - blockHeight : iconHeight / 2 + gap;
+      const edge = iconHeight / 2 + haloWidth + gap;
+      top = town.labelPosition === "above" ? -edge - blockHeight : edge;
     }
     let cursor = top;
     for (const entry of entries) {
@@ -114,7 +221,29 @@ export function drawTownStamp(
 ): StampBounds {
   const layout = layoutTownStamp(context, town, icon, scale, style);
   context.save();
-  if (icon) {
+  if (style.symbol === "dot") {
+    const dot = townDot(town, scale, style);
+    context.beginPath();
+    context.arc(x, y, dot.diameter / 2 + dot.outline / 2, 0, Math.PI * 2);
+    context.fillStyle = DOT_FILL;
+    context.fill();
+    if (dot.outline > 0) {
+      context.lineWidth = dot.outline;
+      context.strokeStyle = DOT_OUTLINE;
+      context.stroke();
+    }
+  } else if (icon) {
+    const haloWidth = style.iconHaloWidth * scale;
+    const haloBlur = style.iconHaloBlur * scale;
+    const halo = (haloWidth > 0 || haloBlur > 0) && style.iconHaloOpacity > 0
+      ? iconHalo(icon, layout.iconWidth, layout.iconHeight, haloWidth, haloBlur, style.iconHaloColor)
+      : null;
+    if (halo) {
+      const pad = haloPad(haloWidth, haloBlur);
+      context.globalAlpha = style.iconHaloOpacity;
+      context.drawImage(halo, x - layout.iconWidth / 2 - pad, y - layout.iconHeight / 2 - pad);
+      context.globalAlpha = 1;
+    }
     context.drawImage(icon, x - layout.iconWidth / 2, y - layout.iconHeight / 2, layout.iconWidth, layout.iconHeight);
   } else {
     context.fillStyle = style.textColor;

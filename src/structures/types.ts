@@ -44,7 +44,7 @@ export interface RoadRoute {
 }
 
 /** Default icon size, in pixels of a 2048px wide frame. */
-export const DEFAULT_TOWN_SIZE = 56;
+export const DEFAULT_TOWN_SIZE = 19;
 
 export type TownLabelPosition = "below" | "right" | "above";
 
@@ -59,12 +59,12 @@ export interface SettlementInfo {
 }
 
 export const SETTLEMENT_KINDS: readonly SettlementInfo[] = [
-  { kind: "hamlet", label: "Hamlet", defaultSize: 34 },
-  { kind: "village", label: "Village", defaultSize: 46 },
-  { kind: "keep", label: "Keep", defaultSize: 38 },
-  { kind: "walled-town", label: "Walled town", defaultSize: 60 },
-  { kind: "castle", label: "Castle", defaultSize: 56 },
-  { kind: "city", label: "City", defaultSize: 88 },
+  { kind: "hamlet", label: "Hamlet", defaultSize: 14.5 },
+  { kind: "village", label: "Village", defaultSize: 19 },
+  { kind: "keep", label: "Keep", defaultSize: 19 },
+  { kind: "walled-town", label: "Walled town", defaultSize: 30 },
+  { kind: "castle", label: "Castle", defaultSize: 30 },
+  { kind: "city", label: "City", defaultSize: 35 },
 ];
 
 /** Icon ids of settlement kinds are this prefix plus the kind. */
@@ -190,9 +190,23 @@ export const DEFAULT_ROAD_STYLE: RoadStyle = {
   outlineColor: "#f4ecd6",
   outlineWidth: 1.2,
   bridgeColor: "#eee2c4",
-  bridgeOutlineColor: "#563a26",
-  bridgeOutlineWidth: 1.2,
+  bridgeOutlineColor: "#000000",
+  bridgeOutlineWidth: 0.2,
   clearance: 2,
+  byKind: {
+    road: { color: "#e7d3c6", outline: true, outlineColor: "#5f5b4e", outlineWidth: 0.2, width: 1.5 },
+    highway: {
+      color: "#850000",
+      width: 3,
+      dashSpacing: 1,
+      dashLength: 2,
+      shadowColor: "#ffffff",
+      shadowOpacity: 0.51,
+      shadowOffset: 0,
+      shadowBlur: 5,
+    },
+    track: { color: "#d0c7af", width: 0.8 },
+  },
 };
 
 /** Shared defaults and per-type settings, with no geometry inferred from the road kind. */
@@ -220,8 +234,20 @@ export const TOWN_FONT_STACKS: Record<TownFont, { label: string; css: string }> 
   blackletter: { label: "Blackletter", css: '"Old English Text MT", "UnifrakturMaguntia", "Times New Roman", serif' },
 };
 
+export type TownSymbol = "icon" | "dot";
+export const TOWN_SYMBOLS: readonly TownSymbol[] = ["icon", "dot"];
+
 /** Map-wide town label appearance. */
 export interface TownStyle {
+  /** Draw each town's own icon, or a plain black dot with a white outline. */
+  symbol: TownSymbol;
+  /** Halo traced around the icon's silhouette; width and blur in 2048px frame pixels. 0 width and blur remove it. */
+  iconHaloColor: string;
+  iconHaloWidth: number;
+  iconHaloBlur: number;
+  iconHaloOpacity: number;
+  /** White ring around the dot symbol, in 2048px frame pixels. */
+  dotOutlineWidth: number;
   font: TownFont;
   bold: boolean;
   textColor: string;
@@ -240,13 +266,19 @@ export interface TownStyle {
 }
 
 export const DEFAULT_TOWN_STYLE: TownStyle = {
+  symbol: "icon",
+  iconHaloColor: "#ffffff",
+  iconHaloWidth: 2,
+  iconHaloBlur: 0,
+  iconHaloOpacity: 1,
+  dotOutlineWidth: 2,
   font: "serif",
   bold: true,
   textColor: "#2b2a26",
   haloColor: "#f7f4e8",
   haloWidth: 1,
   haloOpacity: 0.92,
-  labelScale: 1,
+  labelScale: 1.65,
   subtitleScale: 0.72,
   letterSpacing: 0,
   uppercase: false,

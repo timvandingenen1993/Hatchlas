@@ -13,6 +13,7 @@ import {
   DEFAULT_TOWN_STYLE,
   SETTLEMENT_ICON_PREFIX,
   TOWN_FONT_STACKS,
+  TOWN_SYMBOLS,
   type MapStructures,
   type Road,
   type RoadKind,
@@ -205,6 +206,12 @@ export function parseTownStyle(value: unknown): TownStyle {
   const source = isRecord(value) ? value : {};
   const fallback = DEFAULT_TOWN_STYLE;
   return {
+    symbol: oneOf(source.symbol, TOWN_SYMBOLS, fallback.symbol),
+    iconHaloColor: hexColor(source.iconHaloColor, fallback.iconHaloColor),
+    iconHaloWidth: finite(source.iconHaloWidth, fallback.iconHaloWidth, 0, 16),
+    iconHaloBlur: finite(source.iconHaloBlur, fallback.iconHaloBlur, 0, 16),
+    iconHaloOpacity: finite(source.iconHaloOpacity, fallback.iconHaloOpacity, 0, 1),
+    dotOutlineWidth: finite(source.dotOutlineWidth, fallback.dotOutlineWidth, 0, 12),
     font: oneOf(source.font, TOWN_FONTS, fallback.font),
     bold: flag(source.bold, fallback.bold),
     textColor: hexColor(source.textColor, fallback.textColor),
